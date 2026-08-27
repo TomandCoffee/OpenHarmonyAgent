@@ -1,5 +1,19 @@
 # OpenHarmony Agent - 鸿蒙原生智能多模态个人助理
 
+<div align="center">
+
+[![GitHub stars](https://img.shields.io/badge/GitHub-OpenHarmonyAgent-blue?logo=github)](https://github.com/Tom1224134426/OpenHarmonyAgent)
+[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-API%2010+-orange)](https://developer.harmonyos.com/)
+
+🤖 基于鸿蒙原生智能的多模态个人助理 | AI 时代的人机交互新范式
+
+[项目文档](./GET_STARTED.md) • [架构设计](./ARCHITECTURE.md) • [演示脚本](./DEMO_SCRIPT.md)
+
+</div>
+
+---
+
 ## 项目概述
 
 OpenHarmony Agent 是一款基于鸿蒙原生智能的多模态个人助理应用，深度集成 AI 能力到操作系统层面，提供语音、文本、图像三种交互方式，支持端侧 RAG 知识库和跨设备协同。
@@ -117,10 +131,23 @@ OpenHarmonyAgent/
 
 ## 快速开始
 
-1. 使用 DevEco Studio 打开项目
-2. 配置签名信息
-3. 连接设备或启动模拟器
+### 📥 获取代码
+```bash
+git clone https://github.com/Tom1224134426/OpenHarmonyAgent.git
+cd OpenHarmonyAgent
+```
+
+### 🚀 运行应用
+1. 使用 DevEco Studio 4.0+ 打开项目
+2. File > Project Structure > 配置签名信息
+3. 连接鸿蒙设备（手机/平板）或启动模拟器
 4. 点击 Run 运行应用
+
+### 📚 查看更多
+- 📘 [快速启动指南](./GET_STARTED.md)
+- 🏗️ [架构设计文档](./ARCHITECTURE.md)
+- 📱 [设备连接指南](./DEVICE_GUIDE.md)
+- 🎬 [演示脚本](./DEMO_SCRIPT.md)
 
 ## 参考资料
 
@@ -130,6 +157,32 @@ OpenHarmonyAgent/
 
 ## 参赛信息
 
-- 命题企业：华为技术有限公司
-- 命题组别：国产操作系统软件组
-- 比赛名称：创新大赛 2026
+| 项目 | 信息 |
+|------|------|
+| 命题企业 | 华为技术有限公司 |
+| 命题组别 | 国产操作系统软件组 |
+| 比赛名称 | 创新大赛 2026 |
+| GitHub | [Tom1224134426/OpenHarmonyAgent](https://github.com/Tom1224134426/OpenHarmonyAgent) |
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE) 协议开源。
+
+## 贡献指南
+
+欢迎提交 Issue 和 Pull Request！
+
+## 联系方式
+
+- GitHub: [@Tom1224134426](https://github.com/Tom1224134426)
+- 仓库：https://github.com/Tom1224134426/OpenHarmonyAgent
+
+---
+
+<div align="center">
+
+**如果这个项目对你有帮助，请给一个 ⭐️ Star！**
+
+[OpenHarmony Agent](https://github.com/Tom1224134426/OpenHarmonyAgent) © 2024
+
+</div>
