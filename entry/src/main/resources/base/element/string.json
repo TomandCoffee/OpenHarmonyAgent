@@ -1,0 +1,68 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "OpenHarmony Agent 模块描述"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "OpenHarmony Agent 个人智能助理"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "OpenHarmony Agent"
+    },
+    {
+      "name": "permission_mic_reason",
+      "value": "用于语音输入和语音交互"
+    },
+    {
+      "name": "permission_camera_reason",
+      "value": "用于拍照和图像识别"
+    },
+    {
+      "name": "permission_read_media_reason",
+      "value": "用于访问相册图片进行智能分析"
+    },
+    {
+      "name": "permission_distributed_reason",
+      "value": "用于跨设备协同和任务流转"
+    },
+    {
+      "name": "tab_home",
+      "value": "首页"
+    },
+    {
+      "name": "tab_knowledge",
+      "value": "知识库"
+    },
+    {
+      "name": "tab_agents",
+      "value": "智能体"
+    },
+    {
+      "name": "tab_settings",
+      "value": "设置"
+    },
+    {
+      "name": "voice_input_hint",
+      "value": "点击说话..."
+    },
+    {
+      "name": "text_input_hint",
+      "value": "输入消息..."
+    },
+    {
+      "name": "agent_learning",
+      "value": "学习助手"
+    },
+    {
+      "name": "agent_schedule",
+      "value": "日程管家"
+    },
+    {
+      "name": "agent_document",
+      "value": "文档处理"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "module": {
+    "name": "common",
+    "type": "feature",
+    "description": "$string:common_module_desc",
+    "mainElement": "CommonElement",
+    "deviceTypes": [
+      "phone",
+      "tablet"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false
+  }
+}

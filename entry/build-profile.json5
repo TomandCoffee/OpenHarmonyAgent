@@ -1,0 +1,13 @@
+{
+  "app": {
+    "signingConfigs": [],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  }
+}

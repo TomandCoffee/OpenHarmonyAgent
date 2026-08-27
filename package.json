@@ -1,0 +1,28 @@
+{
+  "name": "openharmony-agent",
+  "version": "1.0.0",
+  "description": "OpenHarmony Agent - 鸿蒙原生智能多模态个人助理",
+  "scripts": {
+    "dev": "echo 'Open DevEco Studio to run the project'",
+    "build": "echo 'Build using DevEco Studio'",
+    "lint": "echo 'Lint using DevEco Studio'"
+  },
+  "keywords": [
+    "OpenHarmony",
+    "HarmonyOS",
+    "AI",
+    "Agent",
+    "RAG",
+    "多模态",
+    "智能助理"
+  ],
+  "author": "Tom1224134426",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tom1224134426/OpenHarmonyAgent.git"
+  },
+  "devDependencies": {
+    "@ohos/hvigor-ohos-plugin": "^4.0.0"
+  }
+}
