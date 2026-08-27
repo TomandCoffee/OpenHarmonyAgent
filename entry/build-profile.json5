@@ -1,6 +1,14 @@
 {
   "app": {
     "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": null,
+        "compatibleSdkVersion": "4.0.0(10)",
+        "runtimeOS": "HarmonyOS"
+      }
+    ],
     "buildModeSet": [
       {
         "name": "debug"

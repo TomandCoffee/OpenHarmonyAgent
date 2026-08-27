@@ -1,10 +1,21 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "openharmony_agent",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "",
+          "storeFile": "D:\\OpenHarmonyAgent\\debug\\openharmony_agent.p12",
+          "keyAlias": "openharmony_agent",
+          "signAlg": "SHA256withECDSA"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
-        "signingConfig": "default",
+        "signingConfig": "openharmony_agent",
         "compatibleSdkVersion": "4.0.0(10)",
         "runtimeOS": "HarmonyOS"
       }
