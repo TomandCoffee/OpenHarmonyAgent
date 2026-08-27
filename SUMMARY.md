@@ -224,5 +224,9 @@ OpenHarmonyAgent/
 ---
 
 **团队**: [你的团队名称]
-**参赛组别**: 国产操作系统软件组
-**命题企业**: 华为技术有限公司
+
+**参赛信息**:
+- 比赛名称：**中国国际大学生创新大赛** (China International College Students' Innovation Competition)
+- 参赛组别：国产操作系统软件组
+- 命题企业：华为技术有限公司
+- 项目类型：鸿蒙原生智能应用

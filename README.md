@@ -159,9 +159,10 @@ cd OpenHarmonyAgent
 
 | 项目 | 信息 |
 |------|------|
+| 比赛名称 | **中国国际大学生创新大赛** |
+| 英文名称 | China International College Students' Innovation Competition |
 | 命题企业 | 华为技术有限公司 |
 | 命题组别 | 国产操作系统软件组 |
-| 比赛名称 | 创新大赛 2026 |
 | GitHub | [Tom1224134426/OpenHarmonyAgent](https://github.com/Tom1224134426/OpenHarmonyAgent) |
 
 ## 开源协议
