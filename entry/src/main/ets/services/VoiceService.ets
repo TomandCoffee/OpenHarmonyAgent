@@ -57,6 +57,8 @@ export class VoiceService {
 
   /** 累积的音频字节，凑够 WRITE_CHUNK_BYTES 才发一包 */
   private pending: Uint8Array = new Uint8Array(0);
+  /** 已发出的音频包数，用于诊断 */
+  private sentChunks: number = 0;
 
   private partialText: string = '';
   private finalText: string = '';
@@ -189,6 +191,8 @@ export class VoiceService {
         hilog.debug(0x0000, TAG, 'onEvent %{public}d: %{public}s', eventCode, eventMessage);
       },
       onResult: (sessionId: string, result: speechRecognizer.SpeechRecognitionResult) => {
+        hilog.info(0x0000, TAG, 'onResult final=%{public}s text=%{public}s',
+          result.isFinal.toString(), result.result);
         if (result.isFinal) {
           this.finalText = result.result;
         } else {
@@ -233,6 +237,7 @@ export class VoiceService {
       this.partialText = '';
       this.finalText = '';
       this.pending = new Uint8Array(0);
+      this.sentChunks = 0;
       this.onPartial = onPartial;
       this.sessionId = `session_${Date.now()}`;
 
@@ -246,15 +251,20 @@ export class VoiceService {
         sessionId: this.sessionId,
         audioInfo: audioInfo
       };
-      this.engine.startListening(startParams);
 
-      await this.startCapture();
+      // 必须在启动采集循环之前置位 —— readLoop 的 while 条件读的就是它，
+      // 置晚了循环会一次都不进就退出，音频一个字节都喂不进去
       this.recording = true;
+
+      this.engine.startListening(startParams);
+      await this.startCapture();
+      hilog.info(0x0000, TAG, 'Recording started');
       return true;
     } catch (error) {
       const err = error as BusinessError;
       hilog.error(0x0000, TAG, 'startRecording failed: code=%{public}d, msg=%{public}s',
         err.code, err.message);
+      this.recording = false;
       await this.releaseCapture();
       return false;
     }
@@ -311,6 +321,11 @@ export class VoiceService {
       if (this.engine !== null) {
         try {
           this.engine.writeAudio(this.sessionId, piece);
+          this.sentChunks++;
+          // 每约 1 秒（16kHz 单声道下 640 字节 ≈ 20ms）打一条，确认音频确实在流动
+          if (this.sentChunks % 50 === 0) {
+            hilog.info(0x0000, TAG, 'audio flowing: %{public}d chunks sent', this.sentChunks);
+          }
         } catch (error) {
           const err = error as BusinessError;
           hilog.error(0x0000, TAG, 'writeAudio failed: code=%{public}d', err.code);
@@ -344,7 +359,10 @@ export class VoiceService {
       }
     }
 
-    return this.finalText.length > 0 ? this.finalText : this.partialText;
+    const text: string = this.finalText.length > 0 ? this.finalText : this.partialText;
+    hilog.info(0x0000, TAG, 'stopRecording done: chunks=%{public}d, len=%{public}d',
+      this.sentChunks, text.length);
+    return text;
   }
 
   /**

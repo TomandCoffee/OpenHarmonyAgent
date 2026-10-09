@@ -21,6 +21,8 @@ export struct VoiceInput {
   // 回调函数不能用 @Prop 装饰（ArkTS 限制），直接作为普通成员传入
   onResult: (text: string) => void = () => {};
   onStatusChange?: (isRecording: boolean) => void;
+  /** 录音过程中的实时文字，交给父组件显示 */
+  onPartialText?: (text: string) => void;
   
   @State isRecording: boolean = false;
   @State recognizedText: string = '';
@@ -117,8 +119,11 @@ export struct VoiceInput {
 
     try {
       const success = await this.voiceService.startRecording((text: string, isFinal: boolean) => {
-        // 中间结果也实时上屏，说话的时候就能看到字往外冒
         this.recognizedText = text;
+        // 中间结果实时交给父组件展示，说话时就能看到字往外冒
+        if (this.onPartialText) {
+          this.onPartialText(text);
+        }
       });
 
       if (success) {
@@ -162,14 +167,18 @@ export struct VoiceInput {
       const result = await this.voiceService.stopRecording();
 
       this.isRecording = false;
-      
-      // 回调识别结果
-      if (result && this.onResult) {
-        this.onResult(result);
-      }
 
       if (this.onStatusChange) {
         this.onStatusChange(false);
+      }
+      // 识别结束，清掉实时文字（没识别出内容时界面上不该留着上一次的）
+      if (this.onPartialText) {
+        this.onPartialText('');
+      }
+
+      // 回调识别结果
+      if (result && this.onResult) {
+        this.onResult(result);
       }
 
       hilog.info(0x0000, TAG, 'Recording stopped');

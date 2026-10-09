@@ -21,6 +21,8 @@ struct Index {
   @State currentInput: string = '';
   @State selectedImage: string = '';
   @State showInputMethods: boolean = false;
+  /** 语音识别过程中的实时文字 */
+  @State voicePartial: string = '';
 
   private agentService: AgentService = new AgentService();
   private ragService: RAGService = RAGService.getInstance();
@@ -151,6 +153,19 @@ struct Index {
         this.ImagePreview()
       }
 
+      // 语音识别中的实时文字
+      if (this.voicePartial.length > 0) {
+        Row() {
+          Text(this.voicePartial)
+            .fontSize(15)
+            .fontColor('#007DFF')
+            .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+        .backgroundColor('#E6F4FF')
+      }
+
       // 输入方法选择
       if (this.showInputMethods) {
         this.InputMethodSelector()
@@ -187,6 +202,9 @@ struct Index {
           onResult: (text: string) => {
             this.currentInput = text;
             this.sendMessage();
+          },
+          onPartialText: (text: string) => {
+            this.voicePartial = text;
           }
         })
 
