@@ -31,7 +31,7 @@
 #### 推送代码到 GitHub
 ```powershell
 # 方式一：使用命令行
-cd C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent
+cd D:\OpenHarmonyAgent
 
 # 添加远程仓库
 git remote add origin https://github.com/Tom1224134426/OpenHarmonyAgent.git
@@ -55,7 +55,7 @@ git push -u origin master
 #### 打开项目
 1. 启动 DevEco Studio 4.0+
 2. File > Open
-3. 选择 `C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent`
+3. 选择 `D:\OpenHarmonyAgent`
 4. 等待项目索引完成
 
 #### 配置签名

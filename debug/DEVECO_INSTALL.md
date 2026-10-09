@@ -153,7 +153,7 @@
 
 ### 1. 打开项目
 ```
-File > Open > C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent
+File > Open > D:\OpenHarmonyAgent
 ```
 
 ### 2. 配置签名

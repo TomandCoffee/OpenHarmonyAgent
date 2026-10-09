@@ -14,7 +14,7 @@ USB 连接电脑 > 允许 USB 调试
 
 ```
 1. 打开 DevEco Studio
-2. File > Open > C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent
+2. File > Open > D:\OpenHarmonyAgent
 3. File > Project Structure > SigningConfigs > Create
 4. 顶部工具栏选择设备
 ```
