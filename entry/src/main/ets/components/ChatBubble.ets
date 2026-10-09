@@ -46,17 +46,13 @@ export struct ChatBubble {
   }
 
   /**
-   * 消息上的喇叭：单击朗读这条；如果这条正在念，单击即停。
+   * 消息上的喇叭：单击即从头朗读这条。
    *
-   * 静音是全局开关（在首页右上角），这里只做提示，不改变全局状态。
+   * 刻意不做成「正在念就停」的切换 —— 停止与静音统一由首页右上角的开关负责，
+   * 这里的语义只有一个：读这条。正在念别的（或念的就是这条）都会被打断重来。
    */
-  private toggleSpeak(): void {
+  private readAloud(): void {
     const tts: TTSService = TTSService.getInstance();
-
-    if (this.isSpeaking) {
-      tts.stop();
-      return;
-    }
 
     if (tts.isMuted()) {
       promptAction.showToast({ message: '已静音，可在右上角开启' });
@@ -148,9 +144,9 @@ export struct ChatBubble {
           // 念出来必然和最终结果对不上
           if (this.canSpeak()) {
             Button() {
-              Image(this.isSpeaking
-                ? $r('sys.media.ohos_ic_public_sound_off')
-                : $r('sys.media.ohos_ic_public_sound'))
+              // 图标不换成 sound_off —— 这个按钮没有「停止」语义，
+              // 播报中只是把图标染蓝作为反馈
+              Image($r('sys.media.ohos_ic_public_sound'))
                 .width(16)
                 .height(16)
                 .fillColor(this.isSpeaking ? '#007DFF' : '#999999')
@@ -160,7 +156,7 @@ export struct ChatBubble {
             .padding(0)
             .margin({ left: 10 })
             .onClick(() => {
-              this.toggleSpeak();
+              this.readAloud();
             })
           }
         }

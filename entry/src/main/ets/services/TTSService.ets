@@ -45,6 +45,15 @@ export class TTSService {
   private queue: string[] = [];
   /** 当前播报到第几段 */
   private cursor: number = 0;
+  /**
+   * 播报会话代号。
+   *
+   * 分段播报是靠引擎的 onComplete 驱动下一段的，而打断重来时旧段落的
+   * onComplete 还在路上 —— 直接响应它会把新队列提前推进（实测日志里能看到
+   * 旧 requestId 的 onComplete 紧跟着新队列的入队）。所以每次 speak/stop 都
+   * 递增代号，回调里先核对代号，对不上就丢弃。
+   */
+  private epoch: number = 0;
 
   /** 当前正在播报的内容标识（通常是消息 id），用于让对应的气泡显示播放状态 */
   private currentTag: string = '';
@@ -161,6 +170,10 @@ export class TTSService {
         hilog.info(0x0000, TAG, 'onStart: %{public}s', requestId);
       },
       onComplete: (requestId: string, response: textToSpeech.CompleteResponse) => {
+        if (!this.isCurrent(requestId)) {
+          hilog.info(0x0000, TAG, 'drop stale onComplete: %{public}s', requestId);
+          return;
+        }
         hilog.info(0x0000, TAG, 'onComplete: %{public}s', requestId);
         this.speakNext();
       },
@@ -169,6 +182,9 @@ export class TTSService {
       },
       onError: (requestId: string, errorCode: number, errorMessage: string) => {
         hilog.error(0x0000, TAG, 'onError %{public}d: %{public}s', errorCode, errorMessage);
+        if (!this.isCurrent(requestId)) {
+          return;
+        }
         // 单段出错就继续下一段，别让整条回答卡住
         this.speakNext();
       }
@@ -213,6 +229,13 @@ export class TTSService {
   /**
    * 播报下一段；队列空了就收尾
    */
+  /**
+   * 判断这个回调是否属于当前播报会话
+   */
+  private isCurrent(requestId: string): boolean {
+    return requestId.startsWith(`e${this.epoch}_`);
+  }
+
   private speakNext(): void {
     if (this.cursor >= this.queue.length || this.engine === null) {
       this.setSpeaking(false);
@@ -226,7 +249,7 @@ export class TTSService {
 
     try {
       const params: textToSpeech.SpeakParams = {
-        requestId: `tts_${Date.now()}_${this.cursor}`
+        requestId: `e${this.epoch}_${this.cursor}`
       };
       this.engine.speak(segment, params);
     } catch (error) {
@@ -237,6 +260,9 @@ export class TTSService {
   }
 
   stop(): void {
+    // 先递增代号：让在途的 onComplete 立刻失效
+    this.epoch++;
+
     if (this.engine !== null && this.speaking) {
       try {
         this.engine.stop();
