@@ -7,6 +7,9 @@
 export function stripMarkdown(content: string): string {
   return content
     .replace(/\*\*(.*?)\*\*/g, '$1')   // 粗体 **文字**
+    // 流式输出时 ** 可能只到了一半（比如刚打完 "**Soft"），
+    // 上面的成对替换处理不了，这里再兜一道，避免界面上闪出星号
+    .replace(/\*\*/g, '')
     .replace(/^#{1,6}\s+/gm, '')       // 标题符号 # ##
     .replace(/^[-*]\s+/gm, '• ')       // 无序列表 - / *
     .replace(/^>\s?/gm, '')            // 引用 >

@@ -73,22 +73,20 @@ export struct ChatBubble {
             .margin({ bottom: 4 })
         }
 
-        // 消息文本（流式中在末尾显示光标）
-        Row() {
-          Text(this.formatContent(this.message.content))
-            .fontSize(15)
-            .fontColor('#333333')
-            .lineHeight(22)
-            .layoutWeight(1)
-
-          if (this.message.isStreaming) {
-            Text('▍')
-              .fontSize(15)
-              .fontColor('#007DFF')
-          }
+        // 消息文本（流式时末尾跟一个光标）
+        //
+        // 光标用 Span 而不是外面再包一层 Row —— 包 Row 就得给 Row 设
+        // width('100%')，而百分比是相对外层容器算的，会直接撑破
+        // Column 上的 constraintSize({maxWidth:'70%'})，表现为文字溢出气泡背景。
+        // 放进同一个 Text 里，换行和宽度都由 Text 自己算，不会出这个问题。
+        Text() {
+          Span(this.formatContent(this.message.content))
+          Span(this.message.isStreaming ? '▍' : '')
+            .fontColor('#007DFF')
         }
-        .width('100%')
-        .alignItems(VerticalAlign.Top)
+        .fontSize(15)
+        .fontColor('#333333')
+        .lineHeight(22)
 
         // 图片（如果有）
         if (this.message.imageUrl) {
