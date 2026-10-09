@@ -86,28 +86,20 @@ export struct ChatBubble {
   @Builder
   AgentBubble() {
     Row() {
-      // 头像
+      // 头像：去掉智能体之后统一用一个中性图标
       Column() {
-        Text(this.getAgentIcon())
+        Text('🤖')
           .fontSize(24)
       }
       .width(36)
       .height(36)
-      .backgroundColor(this.getAgentColor())
+      .backgroundColor('#F0F0F0')
       .borderRadius(18)
       .justifyContent(FlexAlign.Center)
       .margin({ right: 8 })
 
       // 消息内容
       Column() {
-        // 发送者名称
-        if (this.message.agentName) {
-          Text(this.message.agentName)
-            .fontSize(12)
-            .fontColor('#999999')
-            .margin({ bottom: 4 })
-        }
-
         // 消息文本（流式时末尾跟一个光标）
         //
         // 光标用 Span 而不是外面再包一层 Row —— 包 Row 就得给 Row 设
@@ -166,49 +158,6 @@ export struct ChatBubble {
       .borderRadius({ topLeft: 4, topRight: 16, bottomLeft: 16, bottomRight: 16 })
       .constraintSize({ maxWidth: '70%' })
       .alignItems(HorizontalAlign.Start)
-    }
-  }
-
-  /**
-   * 获取智能体图标
-   *
-   * 注意：这里判的是 relatedAgent（类型标识 learning/schedule/...），
-   * 不是 agentName。显示名是要本地化的，拿它当逻辑键一改语言就全乱。
-   */
-  private getAgentIcon(): string {
-    switch (this.message.relatedAgent) {
-      case 'learning':
-        return '📚';
-      case 'schedule':
-        return '📅';
-      case 'document':
-        return '📄';
-      case 'translate':
-        return '🌐';
-      case 'multi':
-        return '🤝';
-      default:
-        return '🤖';
-    }
-  }
-
-  /**
-   * 获取智能体配色
-   */
-  private getAgentColor(): string {
-    switch (this.message.relatedAgent) {
-      case 'learning':
-        return '#E6F4FF';
-      case 'schedule':
-        return '#E6F7E6';
-      case 'document':
-        return '#F3E5F5';
-      case 'translate':
-        return '#E6FFFB';
-      case 'multi':
-        return '#FFF7E6';
-      default:
-        return '#F0F0F0';
     }
   }
 

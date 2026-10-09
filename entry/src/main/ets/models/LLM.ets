@@ -101,9 +101,9 @@ export interface APIErrorBody {
 }
 
 /**
- * 一次智能体调用需要的全部输入
+ * 一次对话请求需要的全部输入
  */
-export interface AgentRequest {
+export interface ChatRequest {
   /** 用户这轮说的话 */
   text: string;
   /** 用户选的图片（本地路径或 data URL），目前链路未打通 */

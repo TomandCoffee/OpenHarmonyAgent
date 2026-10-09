@@ -1,5 +1,8 @@
 /**
  * 消息类型枚举
+ *
+ * SYSTEM 用于错误气泡和系统提示 —— 它们会被 buildHistory 过滤掉，
+ * 不会作为对话历史喂给模型。
  */
 export enum MessageType {
   USER = 'user',
@@ -21,46 +24,19 @@ export class Message {
   content: string;
   timestamp: number;
   imageUrl?: string;
-  agentName?: string;
-  relatedAgent?: string;
   /** 是否正在流式接收中（用于在气泡末尾显示光标） */
   isStreaming: boolean = false;
+  /** 是否已经持久化到本地库（避免重复写入） */
+  persisted: boolean = false;
 
   constructor(id: string, type: MessageType, content: string, timestamp: number,
-              imageUrl?: string, agentName?: string, relatedAgent?: string) {
+              imageUrl?: string) {
     this.id = id;
     this.type = type;
     this.content = content;
     this.timestamp = timestamp;
     this.imageUrl = imageUrl;
-    this.agentName = agentName;
-    this.relatedAgent = relatedAgent;
   }
-}
-
-/**
- * 智能体类型枚举
- */
-export enum AgentType {
-  LEARNING = 'learning',
-  SCHEDULE = 'schedule',
-  DOCUMENT = 'document',
-  TRANSLATE = 'translate',
-  MAIN = 'main'
-}
-
-/**
- * 智能体模型
- */
-export interface Agent {
-  id: string;
-  name: string;
-  type: AgentType;
-  description: string;
-  icon: string;
-  color: string;
-  capabilities: string[];
-  isActive: boolean;
 }
 
 /**
@@ -71,43 +47,15 @@ export interface KnowledgeItem {
   content: string;
   type: string;
   tags: string[];
-  embedding?: number[];
   timestamp: number;
-  source?: string;
 }
 
 /**
- * 请求处理结果
+ * 会话模型
  */
-export interface ProcessResult {
-  content: string;
-  agentName: string;
-  /**
-   * 智能体的类型标识（learning / schedule / document / main / multi）。
-   *
-   * 界面判断图标、配色这类逻辑必须用它，不能用 agentName ——
-   * 显示名是要被本地化的，拿它当逻辑键，一改语言图标就全丢了。
-   */
-  agentType: string;
-  needsKnowledgeUpdate: boolean;
-  suggestedActions?: string[];
-}
-
-/**
- * 语音识别结果
- */
-export interface VoiceResult {
-  text: string;
-  confidence: number;
-  isFinal: boolean;
-}
-
-/**
- * 图像分析结果
- */
-export interface ImageAnalysisResult {
-  description: string;
-  tags: string[];
-  text?: string; // OCR 结果
-  objects?: string[];
+export interface Conversation {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
 }

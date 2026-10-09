@@ -2,10 +2,9 @@ import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VoiceInput } from '../components/VoiceInput';
 import { ChatTextInput } from '../components/TextInput';
-import { ImageInput } from '../components/ImageInput';
 import { ChatBubble } from '../components/ChatBubble';
-import { Message, MessageType, ProcessResult } from '../models/Message';
-import { AgentService } from '../services/AgentService';
+import { Message, MessageType } from '../models/Message';
+import { chat, ChatReply } from '../services/ChatEngine';
 import { RAGService } from '../services/RAGService';
 
 const TAG = 'Index';
@@ -24,7 +23,6 @@ struct Index {
   /** 语音识别过程中的实时文字 */
   @State voicePartial: string = '';
 
-  private agentService: AgentService = new AgentService();
   private ragService: RAGService = RAGService.getInstance();
   private listScroller: Scroller = new Scroller();
 
@@ -36,18 +34,13 @@ struct Index {
 
   aboutToAppear(): void {
     hilog.info(0x0000, TAG, 'Index aboutToAppear');
-    // 初始化服务
-    this.agentService.initialize();
     this.ragService.initialize();
 
-    // 添加欢迎消息
     this.messages.push(new Message(
       'welcome',
       MessageType.AGENT,
-      '你好！我是 OpenHarmony Agent，你的智能个人助理。我可以帮你：\n\n📚 整理学习资料、解答问题\n📅 管理日程安排、设置提醒\n📄 处理文档、总结重点\n\n你可以语音、文字或图片与我交流，试试说"帮我总结这份文档"吧！',
-      Date.now(),
-      undefined,
-      '主助理'
+      '你好，我是你的 AI 助手。\n\n直接输入问题，或长按右下角麦克风说话；回答右下角的喇叭可以把内容念出来。',
+      Date.now()
     ));
   }
 
@@ -98,9 +91,9 @@ struct Index {
       })
       .margin({ right: 12 })
 
-      // 智能体入口
+      // 新对话（清空当前上下文）
       Button() {
-        Image($r('sys.media.ohos_ic_public_more'))
+        Image($r('sys.media.ohos_ic_public_add'))
           .width(24)
           .height(24)
           .fillColor('#666666')
@@ -108,7 +101,7 @@ struct Index {
       .type(ButtonType.Circle)
       .backgroundColor('transparent')
       .onClick(() => {
-        router.pushUrl({ url: 'pages/Agents' });
+        this.startNewChat();
       })
       .margin({ right: 12 })
 
@@ -134,15 +127,43 @@ struct Index {
   MessageList() {
     Scroll(this.listScroller) {
       Column() {
-        ForEach(this.messages, (message: Message) => {
-          ChatBubble({ message: message })
-        }, (message: Message) => message.id)
+        if (this.messages.length === 0) {
+          this.EmptyState()
+        } else {
+          ForEach(this.messages, (message: Message) => {
+            ChatBubble({ message: message })
+          }, (message: Message) => message.id)
+        }
       }
       .width('100%')
       .padding(12)
     }
     .layoutWeight(1)
     .scrollBar(BarState.Off)
+  }
+
+  /**
+   * 空会话的引导态
+   */
+  @Builder
+  EmptyState() {
+    Column() {
+      Text('💬')
+        .fontSize(56)
+        .margin({ bottom: 20 })
+
+      Text('开始一段新对话')
+        .fontSize(16)
+        .fontColor('#333333')
+
+      Text('直接输入问题，或长按右下角麦克风说话')
+        .fontSize(13)
+        .fontColor('#999999')
+        .margin({ top: 10 })
+    }
+    .width('100%')
+    .padding({ top: 140, bottom: 60 })
+    .justifyContent(FlexAlign.Center)
   }
 
   @Builder
@@ -372,15 +393,12 @@ struct Index {
     this.currentInput = '';
     this.selectedImage = '';
 
-    // 先放一个空气泡占位，流式的增量往它身上填；
-    // 模型首字可能要等一两秒，所以署名先写"思考中…"
+    // 先放一个空气泡占位，流式的增量往它身上填
     const placeholder: Message = new Message(
       `agent_${Date.now()}`,
       MessageType.AGENT,
       '',
-      Date.now(),
-      undefined,
-      '思考中…'
+      Date.now()
     );
     placeholder.isStreaming = true;
     this.messages.push(placeholder);
@@ -391,38 +409,36 @@ struct Index {
     this.scrollToBottom();
 
     try {
-      const response: ProcessResult = await this.agentService.processRequest({
+      // 先查本地知识库（纯本地字符串匹配，微秒级），命中的内容会注入到本轮提问
+      const hit = await this.ragService.retrieve(inputText, 3);
+
+      const reply: ChatReply = await chat({
         text: inputText,
         imageUrl: inputImage.length > 0 ? inputImage : undefined,
         context: history,
+        knowledge: hit,
         onDelta: (delta: string) => {
           this.onStreamDelta(delta);
-        },
-        onAgentResolved: (name: string, agentType: string) => {
-          placeholder.agentName = name;
-          placeholder.relatedAgent = agentType;
         }
       });
 
       // 收尾：把攒着的尾巴刷出去，再用权威全文覆盖一次（顺带补上可能的差异）
       this.finishStream();
-      placeholder.content = response.content;
-      placeholder.agentName = response.agentName;
-      placeholder.relatedAgent = response.agentType;
+      placeholder.content = reply.content;
       placeholder.isStreaming = false;
 
-      if (response.needsKnowledgeUpdate && inputText.length > 6) {
+      if (reply.remember) {
         // 存「问 + 答摘要」而不是只存问题 —— 只存问题的话，检索出来是一条
         // 没有信息量的疑问句，拼进 prompt 反而干扰模型
-        let answer: string = response.content.trim();
+        let answer: string = reply.content.trim();
         if (answer.length > 300) {
           answer = answer.substring(0, 300);
         }
         await this.ragService.addKnowledge({
           id: `kb_${Date.now()}`,
           content: `问：${inputText}\n答：${answer}`,
-          type: response.agentName,
-          tags: ['对话', response.agentName],
+          type: '对话',
+          tags: ['对话'],
           timestamp: Date.now()
         });
       }
@@ -430,7 +446,8 @@ struct Index {
       const err = error as Error;
       hilog.error(0x0000, TAG, 'sendMessage failed: %{public}s', err.message);
       this.finishStream();
-      placeholder.agentName = '系统';
+      // 标成 SYSTEM：buildHistory 会把它过滤掉，不会作为历史喂给模型
+      placeholder.type = MessageType.SYSTEM;
       placeholder.content = `⚠️ 处理请求时出错了：${err.message}`;
       placeholder.isStreaming = false;
     } finally {
@@ -438,6 +455,22 @@ struct Index {
       this.isProcessing = false;
       this.scrollToBottom();
     }
+  }
+
+  /**
+   * 开一段新对话：清空消息与上下文。
+   * 已经沉淀进本地知识库的内容不受影响。
+   */
+  private startNewChat(): void {
+    if (this.isProcessing) {
+      return;
+    }
+    this.finishStream();
+    this.streamTarget = null;
+    this.messages = [];
+    this.currentInput = '';
+    this.selectedImage = '';
+    this.voicePartial = '';
   }
 
   /**
