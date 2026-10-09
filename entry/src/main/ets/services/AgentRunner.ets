@@ -2,6 +2,7 @@ import { AgentRequest, ChatMessage } from '../models/LLM';
 import { KnowledgeItem, ProcessResult } from '../models/Message';
 import { LLMService, StreamOutcome } from './LLMService';
 import { buildHistory, buildUserContent, KNOWLEDGE_RULE } from './AgentPrompts';
+import { SettingsStore } from './SettingsStore';
 
 const TAG = 'AgentRunner';
 
@@ -16,15 +17,20 @@ const MAX_CONTEXT = 10;
  *
  * @param needsKnowledgeUpdate 这轮对话的内容是否值得沉淀进知识库
  */
-export async function runAgent(systemPrompt: string, agentName: string,
+export async function runAgent(agentType: string, agentName: string, systemPrompt: string,
                                req: AgentRequest, needsKnowledgeUpdate: boolean): Promise<ProcessResult> {
   const knowledge: KnowledgeItem[] = req.knowledge !== undefined ? req.knowledge : [];
   const history: ChatMessage[] = buildHistory(req.context !== undefined ? req.context : [], MAX_CONTEXT);
 
   const messages: ChatMessage[] = [];
   // KNOWLEDGE_RULE 无条件拼上，保证 system 前缀恒定 —— 前缀不变才能命中
-  // DeepSeek 的上下文硬盘缓存（省钱 + 首字更快）
-  const system: ChatMessage = { role: 'system', content: systemPrompt + KNOWLEDGE_RULE };
+  // DeepSeek 的上下文硬盘缓存（省钱 + 首字更快）。
+  // 注意：语言指令**不在这里**，它放在本轮 user 消息的末尾（见 buildUserContent），
+  // 因为实测放在 system 里会被中文历史压过去。
+  const system: ChatMessage = {
+    role: 'system',
+    content: systemPrompt + KNOWLEDGE_RULE
+  };
   messages.push(system);
 
   for (const turn of history) {
@@ -55,6 +61,7 @@ export async function runAgent(systemPrompt: string, agentName: string,
   return {
     content: content,
     agentName: agentName,
+    agentType: agentType,
     needsKnowledgeUpdate: needsKnowledgeUpdate
   };
 }

@@ -3,6 +3,7 @@ import { audio } from '@kit.AudioKit';
 import { abilityAccessCtrl, common, PermissionRequestResult, Permissions } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { SettingsStore } from './SettingsStore';
 
 const TAG = 'VoiceService';
 
@@ -116,7 +117,7 @@ export class VoiceService {
   private async tryCreateEngine(online: number): Promise<boolean> {
     try {
       const params: speechRecognizer.CreateEngineParams = {
-        language: 'zh-CN',
+        language: this.currentLanguage(),
         online: online
       };
       const engine: speechRecognizer.SpeechRecognitionEngine =
@@ -140,6 +141,11 @@ export class VoiceService {
    * ASR 服务直接报 "start listening failed, no preceding init"。
    */
   async initialize(): Promise<boolean> {
+    // 语言设置变了就重建引擎，否则还在用旧语言识别
+    if (this.engine !== null && this.engineLanguage !== this.currentLanguage()) {
+      hilog.info(0x0000, TAG, 'language changed, rebuilding engine');
+      this.invalidateEngine();
+    }
     if (this.engine !== null) {
       return true;
     }
@@ -163,8 +169,9 @@ export class VoiceService {
 
   private async createWithMode(online: number): Promise<boolean> {
     try {
+      const language: string = this.currentLanguage();
       const params: speechRecognizer.CreateEngineParams = {
-        language: 'zh-CN',
+        language: language,
         online: online
       };
       const engine: speechRecognizer.SpeechRecognitionEngine =
@@ -172,7 +179,8 @@ export class VoiceService {
       this.attachListener(engine);
       this.engine = engine;
       this.shutdown = false;
-      hilog.info(0x0000, TAG, 'engine ready, online=%{public}d', online);
+      this.engineLanguage = language;
+      hilog.info(0x0000, TAG, 'engine ready, language=%{public}s online=%{public}d', language, online);
       return true;
     } catch (error) {
       const err = error as BusinessError;
@@ -180,6 +188,23 @@ export class VoiceService {
         err.code, err.message);
       return false;
     }
+  }
+
+  /**
+   * 识别语言从设置里读，改动后下次初始化生效
+   */
+  private currentLanguage(): string {
+    return SettingsStore.getInstance().getRecognizeLanguage();
+  }
+
+  /**
+   * 语言设置变了要让引擎重建，否则还是用旧语言识别
+   */
+  private engineLanguage: string = '';
+
+  invalidateEngine(): void {
+    this.release();
+    this.engineLanguage = '';
   }
 
   private attachListener(engine: speechRecognizer.SpeechRecognitionEngine): void {

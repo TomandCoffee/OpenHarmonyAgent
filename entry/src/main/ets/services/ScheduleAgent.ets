@@ -1,6 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AgentRequest } from '../models/LLM';
-import { ProcessResult } from '../models/Message';
+import { AgentType, ProcessResult } from '../models/Message';
 import { SCHEDULE_SYSTEM } from './AgentPrompts';
 import { runAgent } from './AgentRunner';
 
@@ -30,7 +30,8 @@ export class ScheduleAgent {
   async handle(req: AgentRequest): Promise<ProcessResult> {
     hilog.info(0x0000, TAG, 'handling: %{public}s', req.text);
 
-    const result: ProcessResult = await runAgent(SCHEDULE_SYSTEM, '日程管家', req, false);
+    const result: ProcessResult =
+      await runAgent(AgentType.SCHEDULE, '日程管家', SCHEDULE_SYSTEM, req, false);
 
     // 尾注也要走一遍流式回调，否则界面显示的文本会和最终结果对不上
     if (req.onDelta !== undefined) {

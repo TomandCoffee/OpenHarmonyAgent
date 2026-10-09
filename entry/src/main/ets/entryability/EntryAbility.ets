@@ -4,6 +4,7 @@ import { window } from '@kit.ArkUI';
 import { distributedDataObject } from '@kit.ArkData';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { ApiKeyStore } from '../services/ApiKeyStore';
+import { SettingsStore } from '../services/SettingsStore';
 
 const TAG = 'EntryAbility';
 
@@ -27,9 +28,12 @@ export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, '%{public}s', 'Ability onCreate');
 
-    // 注入 Context 给 API Key 存储（服务层拿不到组件上下文）
+    // 注入 Context 给本地存储（服务层拿不到组件上下文）
     ApiKeyStore.getInstance().init(this.context).catch((err: Error) => {
       hilog.error(0x0000, TAG, 'ApiKeyStore init failed: %{public}s', err.message);
+    });
+    SettingsStore.getInstance().init(this.context).catch((err: Error) => {
+      hilog.error(0x0000, TAG, 'SettingsStore init failed: %{public}s', err.message);
     });
 
     // 初始化分布式数据对象

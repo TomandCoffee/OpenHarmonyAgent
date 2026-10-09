@@ -398,8 +398,9 @@ struct Index {
         onDelta: (delta: string) => {
           this.onStreamDelta(delta);
         },
-        onAgentName: (name: string) => {
+        onAgentResolved: (name: string, agentType: string) => {
           placeholder.agentName = name;
+          placeholder.relatedAgent = agentType;
         }
       });
 
@@ -407,6 +408,7 @@ struct Index {
       this.finishStream();
       placeholder.content = response.content;
       placeholder.agentName = response.agentName;
+      placeholder.relatedAgent = response.agentType;
       placeholder.isStreaming = false;
 
       if (response.needsKnowledgeUpdate && inputText.length > 6) {

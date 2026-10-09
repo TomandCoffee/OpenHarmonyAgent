@@ -3,6 +3,9 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LLMService } from '../services/LLMService';
 import { ApiKeyStore } from '../services/ApiKeyStore';
 import { VoiceService, VoiceProbeResult } from '../services/VoiceService';
+import { TTSService, TtsProbeResult } from '../services/TTSService';
+import { SettingsStore, LANGUAGE_OPTIONS, LanguageOption } from '../services/SettingsStore';
+import { Capability } from '../utils/Capability';
 
 const TAG = 'Settings';
 
@@ -38,9 +41,26 @@ struct Settings {
   @State voiceProbeOk: boolean = false;
   @State isProbingVoice: boolean = false;
 
+  // 语言设置
+  @State recognizeLang: string = 'zh-CN';
+  @State speakLang: string = 'zh-CN';
+  @State replyLang: string = 'zh-CN';
+  @State ttsProbeResult: string = '';
+  @State isProbingTts: boolean = false;
+  @State capabilitySummary: string = '';
+
   aboutToAppear(): void {
     const store: ApiKeyStore = ApiKeyStore.getInstance();
     this.savedKeyMask = store.hasKey() ? store.maskKey() : '';
+
+    const settings: SettingsStore = SettingsStore.getInstance();
+    this.recognizeLang = settings.getRecognizeLanguage();
+    this.speakLang = settings.getSpeakLanguage();
+    this.replyLang = settings.getReplyLanguage();
+    this.capabilitySummary = Capability.summary();
+
+    // 把设置同步给 TTS 引擎（它内部会在语言变化时重建引擎）
+    TTSService.getInstance().setVoice(this.speakLang, settings.getSpeakPerson());
   }
 
   build() {
@@ -56,6 +76,9 @@ struct Settings {
 
           // 语音能力自检
           this.VoiceCheckSection()
+
+          // 语言设置
+          this.LanguageSection()
 
           // 功能设置
           this.SettingSection('功能设置', [
@@ -253,6 +276,155 @@ struct Settings {
     .padding(16)
     .backgroundColor('#FFFFFF')
     .borderRadius(12)
+  }
+
+  /**
+   * 语言设置：识别语言 / 播报语言 / 回复语言
+   *
+   * 三者分开而不是合成一个「界面语言」开关 —— 实际使用中组合很常见，
+   * 比如「用英文听、用中文答」，或者一边练听力一边要中文解释。
+   */
+  @Builder
+  LanguageSection() {
+    Column() {
+      Text('语言')
+        .fontSize(14)
+        .fontColor('#999999')
+        .margin({ bottom: 8, left: 16 })
+
+      Column() {
+        // 语音识别语言
+        this.LanguageRow('语音识别', this.recognizeLang, 'recognize')
+
+        Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
+
+        // 播报语言
+        this.LanguageRow('语音播报', this.speakLang, 'speak')
+
+        Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
+
+        // 回复语言
+        this.LanguageRow('回复语言', this.replyLang, 'reply')
+
+        // 播报自检
+        Row() {
+          Text('播报自检')
+            .fontSize(15)
+            .fontColor('#333333')
+          Blank()
+          Button(this.isProbingTts ? '检测中…' : '检测')
+            .fontSize(13)
+            .height(32)
+            .enabled(!this.isProbingTts)
+            .onClick(() => {
+              this.runTtsProbe();
+            })
+        }
+        .width('100%')
+        .margin({ top: 12 })
+
+        if (this.ttsProbeResult.length > 0) {
+          Text(this.ttsProbeResult)
+            .fontSize(12)
+            .fontColor('#666666')
+            .width('100%')
+            .margin({ top: 6 })
+        }
+
+        // 设备能力汇总
+        if (this.capabilitySummary.length > 0) {
+          Text(this.capabilitySummary)
+            .fontSize(11)
+            .fontColor('#999999')
+            .width('100%')
+            .margin({ top: 12 })
+        }
+      }
+      .padding(16)
+      .backgroundColor('#FFFFFF')
+      .borderRadius(12)
+    }
+    .width('100%')
+    .margin({ bottom: 24 })
+  }
+
+  /**
+   * 一行语言选择：标签 + 若干可点的选项胶囊
+   *
+   * 刻意只传字符串不传回调函数 —— ArkUI V1 的 @Builder 按值传参对函数类型
+   * 支持不稳（实测传进去的 onPick 不一定被调用），改成传一个标识，
+   * 由 pickLanguage() 内部派发。
+   */
+  @Builder
+  LanguageRow(label: string, current: string, which: string) {
+    Column() {
+      Text(label)
+        .fontSize(15)
+        .fontColor('#333333')
+        .width('100%')
+
+      Row() {
+        ForEach(LANGUAGE_OPTIONS, (option: LanguageOption) => {
+          Text(option.label)
+            .fontSize(13)
+            .fontColor(current === option.code ? '#FFFFFF' : '#007DFF')
+            .backgroundColor(current === option.code ? '#007DFF' : '#E6F4FF')
+            .borderRadius(14)
+            .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+            .margin({ right: 8 })
+            .onClick(() => {
+              this.pickLanguage(which, option.code);
+            })
+        }, (option: LanguageOption) => `${which}_${option.code}`)
+      }
+      .width('100%')
+      .margin({ top: 8 })
+    }
+    .width('100%')
+    .padding({ top: 8, bottom: 8 })
+  }
+
+  private pickLanguage(which: string, code: string): void {
+    const store: SettingsStore = SettingsStore.getInstance();
+
+    if (which === 'recognize') {
+      this.recognizeLang = code;
+      store.setRecognizeLanguage(code);
+      // 识别语言变了要让 ASR 引擎重建，否则还在用旧语言识别
+      VoiceService.getInstance().invalidateEngine();
+      return;
+    }
+
+    if (which === 'speak') {
+      this.speakLang = code;
+      store.setSpeakVoice(code, store.getSpeakPerson());
+      TTSService.getInstance().setVoice(code, store.getSpeakPerson());
+      return;
+    }
+
+    if (which === 'reply') {
+      this.replyLang = code;
+      store.setReplyLanguage(code);
+    }
+  }
+
+  private async runTtsProbe(): Promise<void> {
+    this.isProbingTts = true;
+    this.ttsProbeResult = '';
+    try {
+      const probe: TtsProbeResult = await TTSService.getInstance().probe();
+      if (probe.available) {
+        this.ttsProbeResult = probe.voices.length > 0
+          ? `可用。${probe.detail}：\n${probe.voices.slice(0, 6).join('\n')}`
+          : `可用。${probe.detail}`;
+      } else {
+        this.ttsProbeResult = `不可用：${probe.detail}`;
+      }
+    } catch (error) {
+      const err = error as Error;
+      this.ttsProbeResult = `检测失败：${err.message}`;
+    }
+    this.isProbingTts = false;
   }
 
   /**

@@ -1,6 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AgentRequest } from '../models/LLM';
-import { ProcessResult } from '../models/Message';
+import { AgentType, ProcessResult } from '../models/Message';
 import { DOCUMENT_SYSTEM } from './AgentPrompts';
 import { runAgent } from './AgentRunner';
 
@@ -39,6 +39,6 @@ export class DocumentAgent {
       onDelta: req.onDelta
     };
 
-    return runAgent(DOCUMENT_SYSTEM, '文档处理', effective, false);
+    return runAgent(AgentType.DOCUMENT, '文档处理', DOCUMENT_SYSTEM, effective, false);
   }
 }

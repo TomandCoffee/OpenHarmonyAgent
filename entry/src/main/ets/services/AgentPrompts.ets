@@ -1,5 +1,6 @@
 import { ChatMessage } from '../models/LLM';
 import { KnowledgeItem, Message, MessageType } from '../models/Message';
+import { SettingsStore } from './SettingsStore';
 
 /**
  * 所有智能体共用的输出约束。
@@ -66,6 +67,31 @@ export const MAIN_SYSTEM = `你是「OpenHarmony Agent」的主助理，运行�
 如果用户的需求明显属于学习、日程或文档领域，简短给出方向即可，不要长篇大论。` + OUTPUT_RULES;
 
 /**
+ * 翻译
+ *
+ * 刻意不拼 OUTPUT_RULES —— 那套规则里的「默认 300 字以内」和 Markdown 约束
+ * 都会干扰翻译：译文该多长就多长，格式要跟原文走，不该被裁剪。
+ */
+export const TRANSLATE_SYSTEM = `你是「翻译」，负责在中英文之间互译。
+
+【铁律】
+1. 只输出译文本身。不要解释、不要寒暄、不要写"翻译如下""以下是译文"这类引导语。
+2. 不要添加原文没有的内容，也不要省略原文有的内容。
+3. 保持原文的段落结构。
+
+【专业处理】
+- 专有名词、人名、地名、代码、公式、数字、单位：保持原样或采用通行译名，不要生造。
+- 术语优先用行业通用译法。
+- 原文有歧义时挑最自然的一种译法，不要罗列多个备选。
+
+【方向】
+用户明确指定方向（中译英 / 英译中 / 译成日语等）时按他说的做；
+没指定时：中文输入译成英文，英文输入译成中文。
+
+【其他语言】
+用户要求翻译成中英以外的语言时，也照做，同样遵守上面的铁律。`;
+
+/**
  * 把界面上的历史消息转成模型能吃的对话历史。
  *
  * 必须清洗：过滤系统消息、错误气泡、空的流式占位气泡，
@@ -112,10 +138,15 @@ export function formatNow(date: Date): string {
 
 /**
  * 组装本轮发给模型的 user 消息内容：
- * 知识库检索结果 + 当前时间 + 用户原话。
+ * 知识库检索结果 + 当前时间 + 用户原话 + 回复语言指令。
  *
  * 动态内容全部放这里而不是 system，是为了保护 system 前缀的缓存命中。
  * 没有检索到东西时不注入空的 <knowledge> 块。
+ *
+ * 语言指令必须放在这里（本轮 user 消息的末尾），不能只放 system ——
+ * 实测：system 末尾写「Always answer in English」时，只要历史消息是中文，
+ * 模型就会跟着历史用中文回答；把同一句放到本轮 user 尾部才会立刻切英文。
+ * 离生成点越近的指令权重越高。
  */
 export function buildUserContent(text: string, knowledge: KnowledgeItem[]): string {
   let head: string = '';
@@ -133,7 +164,7 @@ export function buildUserContent(text: string, knowledge: KnowledgeItem[]): stri
   }
 
   head += `<current_time>${formatNow(new Date())}</current_time>\n\n`;
-  return head + text;
+  return head + text + SettingsStore.getInstance().getReplyLanguageDirective();
 }
 
 /**

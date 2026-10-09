@@ -1,5 +1,7 @@
 import { Message, MessageType } from '../models/Message';
 import { stripMarkdown } from '../utils/TextFormat';
+import { TTSService } from '../services/TTSService';
+import { Capability } from '../utils/Capability';
 
 /**
  * 对话气泡组件属性
@@ -17,6 +19,39 @@ export struct ChatBubble {
   // @ObjectLink 配合 Message 的 @Observed：流式时只改 message.content
   // 就能让这一个气泡重绘，列表其他部分不参与 diff
   @ObjectLink message: Message;
+  /** 本条消息是否正在被朗读 */
+  @State isSpeaking: boolean = false;
+
+  private ttsListener = (speaking: boolean, tag: string): void => {
+    this.isSpeaking = speaking && tag === this.message.id;
+  };
+
+  aboutToAppear(): void {
+    TTSService.getInstance().addStateListener(this.ttsListener);
+  }
+
+  aboutToDisappear(): void {
+    TTSService.getInstance().removeStateListener(this.ttsListener);
+  }
+
+  /**
+   * 朗读入口的显示条件：设备支持 + 消息已生成完 + 有内容 + 不是用户自己发的
+   */
+  private canSpeak(): boolean {
+    return Capability.canUseTts()
+      && this.message.type === MessageType.AGENT
+      && !this.message.isStreaming
+      && this.message.content.trim().length > 0;
+  }
+
+  private toggleSpeak(): void {
+    const tts: TTSService = TTSService.getInstance();
+    if (this.isSpeaking) {
+      tts.stop();
+      return;
+    }
+    tts.speak(this.message.content, this.message.id);
+  }
 
   build() {
     Row() {
@@ -98,11 +133,33 @@ export struct ChatBubble {
             .margin({ top: 8 })
         }
 
-        // 时间戳
-        Text(this.formatTime(this.message.timestamp))
-          .fontSize(11)
-          .fontColor('#999999')
-          .margin({ top: 4 })
+        // 时间戳 + 朗读按钮
+        Row() {
+          Text(this.formatTime(this.message.timestamp))
+            .fontSize(11)
+            .fontColor('#999999')
+
+          // 朗读只对已生成完的助手消息开放：流式进行中内容还在变，
+          // 念出来必然和最终结果对不上
+          if (this.canSpeak()) {
+            Button() {
+              Image(this.isSpeaking
+                ? $r('sys.media.ohos_ic_public_sound_off')
+                : $r('sys.media.ohos_ic_public_sound'))
+                .width(16)
+                .height(16)
+                .fillColor(this.isSpeaking ? '#007DFF' : '#999999')
+            }
+            .type(ButtonType.Circle)
+            .backgroundColor('transparent')
+            .padding(0)
+            .margin({ left: 10 })
+            .onClick(() => {
+              this.toggleSpeak();
+            })
+          }
+        }
+        .margin({ top: 4 })
       }
       .padding(12)
       .backgroundColor('#FFFFFF')
@@ -114,31 +171,42 @@ export struct ChatBubble {
 
   /**
    * 获取智能体图标
+   *
+   * 注意：这里判的是 relatedAgent（类型标识 learning/schedule/...），
+   * 不是 agentName。显示名是要本地化的，拿它当逻辑键一改语言就全乱。
    */
   private getAgentIcon(): string {
-    switch (this.message.agentName) {
-      case '学习助手':
+    switch (this.message.relatedAgent) {
+      case 'learning':
         return '📚';
-      case '日程管家':
+      case 'schedule':
         return '📅';
-      case '文档处理':
+      case 'document':
         return '📄';
+      case 'translate':
+        return '🌐';
+      case 'multi':
+        return '🤝';
       default:
         return '🤖';
     }
   }
 
   /**
-   * 获取智能体颜色
+   * 获取智能体配色
    */
   private getAgentColor(): string {
-    switch (this.message.agentName) {
-      case '学习助手':
+    switch (this.message.relatedAgent) {
+      case 'learning':
         return '#E6F4FF';
-      case '日程管家':
+      case 'schedule':
         return '#E6F7E6';
-      case '文档处理':
+      case 'document':
         return '#F3E5F5';
+      case 'translate':
+        return '#E6FFFB';
+      case 'multi':
+        return '#FFF7E6';
       default:
         return '#F0F0F0';
     }

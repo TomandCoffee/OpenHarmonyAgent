@@ -4,11 +4,15 @@ import { Agent, AgentType, KnowledgeItem, Message, ProcessResult } from '../mode
 import { LearningAgent } from './LearningAgent';
 import { ScheduleAgent } from './ScheduleAgent';
 import { DocumentAgent } from './DocumentAgent';
+import { TranslateAgent } from './TranslateAgent';
 import { RAGService } from './RAGService';
 import { MAIN_SYSTEM } from './AgentPrompts';
 import { runAgent } from './AgentRunner';
 
 const TAG = 'AgentService';
+
+/** 复合任务不是某个智能体，单独给个类型标识 */
+export const MULTI_AGENT_TYPE = 'multi';
 
 /**
  * 请求参数
@@ -19,8 +23,8 @@ interface RequestParams {
   context?: Message[];
   /** 流式增量回调，透传给具体智能体 */
   onDelta?: (delta: string) => void;
-  /** 意图路由确定后立刻回调，让界面先把气泡的署名填上 */
-  onAgentName?: (name: string) => void;
+  /** 意图路由确定后立刻回调，让界面先把气泡的署名和图标填上 */
+  onAgentResolved?: (name: string, agentType: string) => void;
 }
 
 /**
@@ -31,12 +35,14 @@ export class AgentService {
   private learningAgent: LearningAgent;
   private scheduleAgent: ScheduleAgent;
   private documentAgent: DocumentAgent;
+  private translateAgent: TranslateAgent;
   private isInitialized: boolean = false;
 
   constructor() {
     this.learningAgent = new LearningAgent();
     this.scheduleAgent = new ScheduleAgent();
     this.documentAgent = new DocumentAgent();
+    this.translateAgent = new TranslateAgent();
   }
 
   /**
@@ -50,6 +56,7 @@ export class AgentService {
     this.learningAgent.initialize();
     this.scheduleAgent.initialize();
     this.documentAgent.initialize();
+    this.translateAgent.initialize();
     this.isInitialized = true;
 
     hilog.info(0x0000, TAG, 'AgentService initialized');
@@ -70,15 +77,15 @@ export class AgentService {
 
     // 2. 需要同时处理文档和日程的复合请求
     if (this.needsTwoAgents(text, imageUrl)) {
-      if (params.onAgentName !== undefined) {
-        params.onAgentName('多智能体协作');
+      if (params.onAgentResolved !== undefined) {
+        params.onAgentResolved('多智能体协作', MULTI_AGENT_TYPE);
       }
       return await this.handleComplexTask(params);
     }
 
     // 3. 路由已定，先把署名告诉界面（模型首字可能还要等一两秒）
-    if (params.onAgentName !== undefined) {
-      params.onAgentName(AgentService.displayName(intent));
+    if (params.onAgentResolved !== undefined) {
+      params.onAgentResolved(AgentService.displayName(intent), intent);
     }
 
     // 3. 检索本地知识库（只在学习类和兜底场景做，日程/文档用不上）
@@ -103,8 +110,10 @@ export class AgentService {
         return await this.scheduleAgent.handle(req);
       case AgentType.DOCUMENT:
         return await this.documentAgent.handle(req);
+      case AgentType.TRANSLATE:
+        return await this.translateAgent.handle(req);
       default:
-        return await runAgent(MAIN_SYSTEM, '主助理', req, false);
+        return await runAgent(AgentType.MAIN, '主助理', MAIN_SYSTEM, req, false);
     }
   }
 
@@ -116,6 +125,7 @@ export class AgentService {
       case AgentType.LEARNING: return '学习助手';
       case AgentType.SCHEDULE: return '日程管家';
       case AgentType.DOCUMENT: return '文档处理';
+      case AgentType.TRANSLATE: return '翻译';
       default: return '主助理';
     }
   }
@@ -125,6 +135,15 @@ export class AgentService {
    */
   private identifyIntent(text: string, imageUrl?: string): AgentType {
     const lowerText: string = text.toLowerCase();
+
+    // 翻译必须最先判：「帮我翻译这段文档」里也含「文档」，
+    // 放在后面会被文档智能体截走
+    if (lowerText.includes('翻译') || lowerText.includes('译成') || lowerText.includes('译为')
+      || lowerText.includes('中译英') || lowerText.includes('英译中')
+      || lowerText.includes('translate') || lowerText.includes('translation')
+      || lowerText.includes('用英语怎么说') || lowerText.includes('用英文怎么说')) {
+      return AgentType.TRANSLATE;
+    }
 
     // 文档相关关键词
     if (imageUrl !== undefined && imageUrl.length > 0) {
@@ -207,6 +226,7 @@ export class AgentService {
     return {
       content: `${docHeader}${docResult.content}${scheduleHeader}${scheduleResult.content}`,
       agentName: '多智能体协作',
+      agentType: MULTI_AGENT_TYPE,
       needsKnowledgeUpdate: false
     };
   }

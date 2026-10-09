@@ -45,6 +45,7 @@ export enum AgentType {
   LEARNING = 'learning',
   SCHEDULE = 'schedule',
   DOCUMENT = 'document',
+  TRANSLATE = 'translate',
   MAIN = 'main'
 }
 
@@ -81,6 +82,13 @@ export interface KnowledgeItem {
 export interface ProcessResult {
   content: string;
   agentName: string;
+  /**
+   * 智能体的类型标识（learning / schedule / document / main / multi）。
+   *
+   * 界面判断图标、配色这类逻辑必须用它，不能用 agentName ——
+   * 显示名是要被本地化的，拿它当逻辑键，一改语言图标就全丢了。
+   */
+  agentType: string;
   needsKnowledgeUpdate: boolean;
   suggestedActions?: string[];
 }
