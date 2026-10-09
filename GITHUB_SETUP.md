@@ -18,7 +18,7 @@
 
 #### 2. 关联远程仓库
 ```bash
-cd C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent
+cd D:\OpenHarmonyAgent
 
 # 添加远程仓库（替换为你的仓库地址）
 git remote add origin https://github.com/Tom1224134426/OpenHarmonyAgent.git

@@ -72,7 +72,7 @@
 ### Step 1: 打开项目
 
 ```
-File > Open > C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent
+File > Open > D:\OpenHarmonyAgent
 ```
 
 ### Step 2: 选择设备

@@ -50,7 +50,7 @@
 
 ### 问题 1：项目路径包含中文
 **现象：** DevEco Studio 无法打开项目  
-**原因：** 路径 `C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent` 包含中文字符  
+**原因：** 路径 `D:\OpenHarmonyAgent` 包含中文字符  
 **解决：** 移动到英文路径 `D:\OpenHarmonyAgent`  
 **状态：** ✅ 已解决
 

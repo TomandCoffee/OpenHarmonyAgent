@@ -59,7 +59,7 @@ adb devices
 ### 导入步骤
 1. 打开 DevEco Studio
 2. File > Open
-3. 选择 `C:\Users\17999\Desktop\创新大赛\OpenHarmonyAgent`
+3. 选择 `D:\OpenHarmonyAgent`
 4. 等待项目索引完成
 
 ### 签名配置
