@@ -204,13 +204,32 @@ export class VoiceService {
       },
       onComplete: (sessionId: string, eventMessage: string) => {
         hilog.info(0x0000, TAG, 'onComplete');
+        this.stopFeeding();
         this.notifyComplete();
       },
       onError: (sessionId: string, errorCode: number, errorMessage: string) => {
         hilog.error(0x0000, TAG, 'onError %{public}d: %{public}s', errorCode, errorMessage);
+        this.stopFeeding();
         this.notifyComplete();
       }
     });
+  }
+
+  /**
+   * 停止向引擎喂音频，但保留已识别出的文本。
+   *
+   * 必须做这件事：引擎靠 VAD 判断说话结束，会在用户松手之前就自己 onComplete。
+   * 如果采集循环还继续 writeAudio，会一路报 1002200010
+   * （Write audio failed because the start listening is failed），
+   * 采集器最后还会 read 失败（6800301 system error）。
+   */
+  private stopFeeding(): void {
+    if (!this.recording) {
+      return;
+    }
+    hilog.info(0x0000, TAG, 'engine finished, stopping capture after %{public}d chunks', this.sentChunks);
+    this.recording = false;
+    this.releaseCapture();
   }
 
   /**
