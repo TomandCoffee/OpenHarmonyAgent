@@ -6,6 +6,7 @@ import { ChatBubble } from '../components/ChatBubble';
 import { Message, MessageType } from '../models/Message';
 import { chat, ChatReply } from '../services/ChatEngine';
 import { RAGService } from '../services/RAGService';
+import { TTSService } from '../services/TTSService';
 
 const TAG = 'Index';
 
@@ -22,9 +23,16 @@ struct Index {
   @State showInputMethods: boolean = false;
   /** 语音识别过程中的实时文字 */
   @State voicePartial: string = '';
+  /** 是否正在朗读回答 */
+  @State isSpeaking: boolean = false;
 
   private ragService: RAGService = RAGService.getInstance();
   private listScroller: Scroller = new Scroller();
+
+  /** TTS 状态监听：用于显示全局的「停止朗读」条 */
+  private ttsListener = (speaking: boolean, tag: string): void => {
+    this.isSpeaking = speaking;
+  };
 
   // 流式渲染的中间状态（刻意不用 @State —— 攒够一批再一次性触发重绘）
   private streamTarget: Message | null = null;
@@ -35,6 +43,7 @@ struct Index {
   aboutToAppear(): void {
     hilog.info(0x0000, TAG, 'Index aboutToAppear');
     this.ragService.initialize();
+    TTSService.getInstance().addStateListener(this.ttsListener);
 
     this.messages.push(new Message(
       'welcome',
@@ -49,6 +58,7 @@ struct Index {
       clearTimeout(this.flushTimerId);
       this.flushTimerId = -1;
     }
+    TTSService.getInstance().removeStateListener(this.ttsListener);
   }
 
   build() {
@@ -184,6 +194,48 @@ struct Index {
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+        .backgroundColor('#E6F4FF')
+      }
+
+      // 朗读控制条
+      //
+      // 每条消息右下角虽然有个小喇叭，但要停下来得先找到那条消息，
+      // 长回答播报时很别扭 —— 所以这里给一个始终可见的全局停止入口。
+      if (this.isSpeaking) {
+        Row() {
+          Image($r('sys.media.ohos_ic_public_sound'))
+            .width(18)
+            .height(18)
+            .fillColor('#007DFF')
+
+          Text('正在朗读回答')
+            .fontSize(14)
+            .fontColor('#007DFF')
+            .margin({ left: 8 })
+
+          Blank()
+
+          Button() {
+            Row() {
+              Image($r('sys.media.ohos_ic_public_pause'))
+                .width(16)
+                .height(16)
+                .fillColor('#007DFF')
+
+              Text('停止')
+                .fontSize(13)
+                .fontColor('#007DFF')
+                .margin({ left: 6 })
+            }
+          }
+          .backgroundColor('transparent')
+          .padding({ left: 12, right: 8, top: 4, bottom: 4 })
+          .onClick(() => {
+            TTSService.getInstance().stop();
+          })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 8, top: 8, bottom: 8 })
         .backgroundColor('#E6F4FF')
       }
 
