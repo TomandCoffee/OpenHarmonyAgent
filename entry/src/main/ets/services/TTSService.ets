@@ -101,7 +101,9 @@ export class TTSService {
       return;
     }
     this.muted = value;
-    if (value && this.speaking) {
+    // 无条件停：speaking 只反映「合成」，不反映「播放」（见 stop() 的注释），
+    // 靠它判断会让「播到一半点静音」掐不掉声音
+    if (value) {
       this.stop();
     }
     hilog.info(0x0000, TAG, 'muted: %{public}s', value.toString());
@@ -257,18 +259,19 @@ export class TTSService {
       return false;
     }
 
-    // 正在播就直接打断重来，符合"点一下换个内容念"的直觉
-    if (this.speaking) {
-      this.stop();
-    }
-
-    // 无论如何都要推进会话代号。
+    // 无论当前状态如何，先把引擎清干净再开始 —— 用户的心智模型是
+    // 「点一下就从头念这条」，正在念别的（或念的就是这条）都该被打断重来。
     //
-    // 引擎会拒绝重复的 requestId（错误码 40003 "requestId is empty or repeated"），
-    // 而上一条播完时 speaking 已经是 false、不会走 stop()，代号不变的话
-    // 这次就会发出和上一轮完全相同的 requestId —— 表现为「第一遍能念，
-    // 之后再点就没声音」。所以推进动作必须在这里，不能只放在 stop() 里。
-    this.epoch++;
+    // 不能写成「只在 speaking 为真时调 stop()」：speaking 只跟到合成结束，
+    // 音频还在放的 9 秒里它是 false，第二次点击不但停不掉旧的，还会被引擎
+    // 当新任务排到队尾（日志里的 busyStatus: true, excute in next turn），
+    // 变成「先听完旧的再从头念」。
+    //
+    // stop() 里那次 epoch++ 顺带解决了 requestId 重复：引擎会拒绝重复的
+    // requestId（40003 "requestId is empty or repeated"），播完之后再点一次时
+    // 若代号不变就会发出和上一轮相同的 requestId，表现为「第一遍能念，
+    // 之后再点就没声音」。
+    this.stop();
 
     this.currentTag = tag;
     this.queue = TTSService.split(plain, MAX_SEGMENT_CHARS);
@@ -311,11 +314,19 @@ export class TTSService {
     }
   }
 
+  /**
+   * 停止当前播报。
+   *
+   * 无条件调 engine.stop()，不看 this.speaking —— 引擎的 onComplete 是
+   * 「合成完成」而不是「播放完成」：实测 52 个字合成只要 0.5 秒，音频却要放
+   * 10 秒，这中间 this.speaking 早就被 onComplete 清成 false 了。只看这个标志
+   * 的话，正在出声时被打断/静音都掐不掉，引擎还会把新任务排到队尾接着放。
+   */
   stop(): void {
     // 先递增代号：让在途的 onComplete 立刻失效
     this.epoch++;
 
-    if (this.engine !== null && this.speaking) {
+    if (this.engine !== null) {
       try {
         this.engine.stop();
       } catch (error) {
@@ -408,7 +419,9 @@ export class TTSService {
   release(): void {
     const engine: textToSpeech.TextToSpeechEngine | null = this.engine;
     this.engine = null;
-    this.speaking = false;
+    // 走 setSpeaking 而不是直接赋值：直接写 this.speaking 不会通知监听者，
+    // 气泡上的喇叭图标会一直停在"正在播"的蓝色状态
+    this.setSpeaking(false);
     this.queue = [];
     this.cursor = 0;
     if (engine !== null) {
