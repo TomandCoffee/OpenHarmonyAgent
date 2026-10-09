@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![GitHub stars](https://img.shields.io/badge/GitHub-OpenHarmonyAgent-blue?logo=github)](https://github.com/Tom1224134426/OpenHarmonyAgent)
+[![GitHub stars](https://img.shields.io/badge/GitHub-OpenHarmonyAgent-blue?logo=github)](https://github.com/TomandCoffee/OpenHarmonyAgent)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 [![HarmonyOS](https://img.shields.io/badge/HarmonyOS-API%2010+-orange)](https://developer.harmonyos.com/)
 
@@ -133,7 +133,7 @@ OpenHarmonyAgent/
 
 ### 📥 获取代码
 ```bash
-git clone https://github.com/Tom1224134426/OpenHarmonyAgent.git
+git clone https://github.com/TomandCoffee/OpenHarmonyAgent.git
 cd OpenHarmonyAgent
 ```
 
@@ -163,7 +163,7 @@ cd OpenHarmonyAgent
 | 英文名称 | China International College Students' Innovation Competition |
 | 命题企业 | 华为技术有限公司 |
 | 命题组别 | 国产操作系统软件组 |
-| GitHub | [Tom1224134426/OpenHarmonyAgent](https://github.com/Tom1224134426/OpenHarmonyAgent) |
+| GitHub | [TomandCoffee/OpenHarmonyAgent](https://github.com/TomandCoffee/OpenHarmonyAgent) |
 
 ## 开源协议
 
@@ -175,8 +175,8 @@ cd OpenHarmonyAgent
 
 ## 联系方式
 
-- GitHub: [@Tom1224134426](https://github.com/Tom1224134426)
-- 仓库：https://github.com/Tom1224134426/OpenHarmonyAgent
+- GitHub: [@TomandCoffee](https://github.com/TomandCoffee)
+- 仓库：https://github.com/TomandCoffee/OpenHarmonyAgent
 
 ---
 
@@ -184,6 +184,6 @@ cd OpenHarmonyAgent
 
 **如果这个项目对你有帮助，请给一个 ⭐️ Star！**
 
-[OpenHarmony Agent](https://github.com/Tom1224134426/OpenHarmonyAgent) © 2024
+[OpenHarmony Agent](https://github.com/TomandCoffee/OpenHarmonyAgent) © 2024
 
 </div>

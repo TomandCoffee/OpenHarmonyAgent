@@ -8,7 +8,7 @@ echo "========================================"
 echo ""
 
 # 配置仓库地址
-REPO_URL="https://github.com/Tom1224134426/OpenHarmonyAgent.git"
+REPO_URL="https://github.com/TomandCoffee/OpenHarmonyAgent.git"
 
 echo "1. 请在 GitHub 上创建仓库："
 echo "   访问：https://github.com/new"
@@ -45,7 +45,7 @@ if [ $? -eq 0 ]; then
     echo "  ✅ 推送成功！"
     echo "========================================"
     echo ""
-    echo "仓库地址：https://github.com/Tom1224134426/OpenHarmonyAgent"
+    echo "仓库地址：https://github.com/TomandCoffee/OpenHarmonyAgent"
     echo ""
     echo "下一步："
     echo "1. 访问仓库页面查看代码"

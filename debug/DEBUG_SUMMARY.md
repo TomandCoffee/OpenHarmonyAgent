@@ -9,9 +9,9 @@
 | 英文名称 | China International College Students' Innovation Competition |
 | 参赛组别 | 国产操作系统软件组 |
 | 命题企业 | 华为技术有限公司 |
-| GitHub 仓库 | https://github.com/Tom1224134426/OpenHarmonyAgent |
+| GitHub 仓库 | https://github.com/TomandCoffee/OpenHarmonyAgent |
 | 调试日期 | 2024-01-XX |
-| 调试人 | Tom1224134426 |
+| 调试人 | TomandCoffee |
 
 ---
 

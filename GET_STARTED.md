@@ -34,7 +34,7 @@
 cd D:\OpenHarmonyAgent
 
 # 添加远程仓库
-git remote add origin https://github.com/Tom1224134426/OpenHarmonyAgent.git
+git remote add origin https://github.com/TomandCoffee/OpenHarmonyAgent.git
 
 # 推送（需要 GitHub Token）
 git push -u origin master
