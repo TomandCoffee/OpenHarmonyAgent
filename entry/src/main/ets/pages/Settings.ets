@@ -6,6 +6,8 @@ import { VoiceService, VoiceProbeResult } from '../services/VoiceService';
 import { TTSService, TtsProbeResult } from '../services/TTSService';
 import { SettingsStore, LANGUAGE_OPTIONS, LanguageOption } from '../services/SettingsStore';
 import { Capability } from '../utils/Capability';
+import { textToSpeech } from '@kit.CoreSpeechKit';
+import { promptAction } from '@kit.ArkUI';
 
 const TAG = 'Settings';
 
@@ -17,6 +19,33 @@ interface SettingItemConfig {
   subtitle?: string;
   type: string;
   key?: string;
+}
+
+/** 音色选项（从设备查询而来） */
+interface VoiceOption {
+  person: number;
+  label: string;
+}
+
+/**
+ * 语言码归一化比对：引擎返回的是 zh_CN，设置里存的是 zh-CN
+ */
+function sameLanguage(a: string, b: string): boolean {
+  return a.replace(/_/g, '-').toLowerCase() === b.replace(/_/g, '-').toLowerCase();
+}
+
+/**
+ * 音色的显示名：优先用性别，拿不到就退回编号
+ */
+function voiceLabel(gender: string, person: number): string {
+  const g: string = gender.length > 0 ? gender.toLowerCase() : '';
+  if (g === 'female') {
+    return '女声';
+  }
+  if (g === 'male') {
+    return '男声';
+  }
+  return `音色${person}`;
 }
 
 @Entry
@@ -44,7 +73,10 @@ struct Settings {
   // 语言设置
   @State recognizeLang: string = 'zh-CN';
   @State speakLang: string = 'zh-CN';
+  @State speakPerson: number = 0;
   @State replyLang: string = 'zh-CN';
+  /** 当前播报语言下可用的音色 */
+  @State voiceOptions: VoiceOption[] = [];
   @State ttsProbeResult: string = '';
   @State isProbingTts: boolean = false;
   @State capabilitySummary: string = '';
@@ -56,11 +88,60 @@ struct Settings {
     const settings: SettingsStore = SettingsStore.getInstance();
     this.recognizeLang = settings.getRecognizeLanguage();
     this.speakLang = settings.getSpeakLanguage();
+    this.speakPerson = settings.getSpeakPerson();
     this.replyLang = settings.getReplyLanguage();
     this.capabilitySummary = Capability.summary();
 
     // 把设置同步给 TTS 引擎（它内部会在语言变化时重建引擎）
-    TTSService.getInstance().setVoice(this.speakLang, settings.getSpeakPerson());
+    TTSService.getInstance().setVoice(this.speakLang, this.speakPerson);
+
+    // 查当前语言下有哪些音色可选
+    this.loadVoices();
+  }
+
+  /**
+   * 查询当前播报语言下的可用音色。
+   * 如果当前选中的音色在这个语言下不存在（比如从中文切到英文），自动落到第一个。
+   */
+  private async loadVoices(): Promise<void> {
+    const all: textToSpeech.VoiceInfo[] =
+      await TTSService.getInstance().listVoicesFor(this.speakLang);
+
+    const opts: VoiceOption[] = [];
+    for (const v of all) {
+      if (sameLanguage(v.language, this.speakLang)) {
+        opts.push({ person: v.person, label: voiceLabel(v.gender, v.person) });
+      }
+    }
+    this.voiceOptions = opts;
+
+    let currentStillValid: boolean = false;
+    for (const o of opts) {
+      if (o.person === this.speakPerson) {
+        currentStillValid = true;
+        break;
+      }
+    }
+    if (!currentStillValid && opts.length > 0) {
+      await this.pickVoice(opts[0].person);
+    }
+    hilog.info(0x0000, TAG, 'voices for %{public}s: %{public}d 个', this.speakLang, opts.length);
+  }
+
+  private async pickVoice(person: number): Promise<void> {
+    this.speakPerson = person;
+    const store: SettingsStore = SettingsStore.getInstance();
+    await store.setSpeakVoice(this.speakLang, person);
+
+    const tts: TTSService = TTSService.getInstance();
+    tts.setVoice(this.speakLang, person);
+
+    // 音色在列表里不代表资源装了 —— 实际建一次引擎才知道能不能用。
+    // 建不起来时 TTSService 会回退到默认音色，这里据此提示用户。
+    const ok: boolean = await tts.initialize(this.speakLang, person);
+    if (!ok || tts.getEffectivePerson() !== person) {
+      promptAction.showToast({ message: '这个音色在本机不可用，已用默认音色' });
+    }
   }
 
   build() {
@@ -287,7 +368,7 @@ struct Settings {
   @Builder
   LanguageSection() {
     Column() {
-      Text('语言')
+      Text('语言与音色')
         .fontSize(14)
         .fontColor('#999999')
         .margin({ bottom: 8, left: 16 })
@@ -298,8 +379,12 @@ struct Settings {
 
         Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
 
-        // 播报语言
+        // 播报语言 + 音色
         this.LanguageRow('语音播报', this.speakLang, 'speak')
+
+        Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
+
+        this.VoiceRow()
 
         Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
 
@@ -384,6 +469,54 @@ struct Settings {
     .padding({ top: 8, bottom: 8 })
   }
 
+  /**
+   * 播报音色选择。
+   *
+   * 音色列表不是写死的 —— 数量和性别都由设备决定（实测这台平板是
+   * 中文女声/中文男声/英文女声三个），所以从 TTSService.listVoicesFor() 现查。
+   * 列表按当前播报语言过滤，切语言时会自动重查。
+   */
+  @Builder
+  VoiceRow() {
+    Column() {
+      Row() {
+        Text('播报音色')
+          .fontSize(15)
+          .fontColor('#333333')
+
+        Blank()
+
+        if (this.voiceOptions.length === 0) {
+          Text('未查到')
+            .fontSize(13)
+            .fontColor('#999999')
+        }
+      }
+      .width('100%')
+
+      if (this.voiceOptions.length > 0) {
+        Row() {
+          ForEach(this.voiceOptions, (option: VoiceOption) => {
+            Text(option.label)
+              .fontSize(13)
+              .fontColor(this.speakPerson === option.person ? '#FFFFFF' : '#007DFF')
+              .backgroundColor(this.speakPerson === option.person ? '#007DFF' : '#E6F4FF')
+              .borderRadius(14)
+              .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+              .margin({ right: 8 })
+              .onClick(() => {
+                this.pickVoice(option.person);
+              })
+          }, (option: VoiceOption) => `${option.person}`)
+        }
+        .width('100%')
+        .margin({ top: 8 })
+      }
+    }
+    .width('100%')
+    .padding({ top: 8, bottom: 8 })
+  }
+
   private pickLanguage(which: string, code: string): void {
     const store: SettingsStore = SettingsStore.getInstance();
 
@@ -397,8 +530,10 @@ struct Settings {
 
     if (which === 'speak') {
       this.speakLang = code;
-      store.setSpeakVoice(code, store.getSpeakPerson());
-      TTSService.getInstance().setVoice(code, store.getSpeakPerson());
+      store.setSpeakVoice(code, this.speakPerson);
+      TTSService.getInstance().setVoice(code, this.speakPerson);
+      // 音色是按语言分的，切换语言后要重新查；当前音色在新语言下不存在会自动落到第一个
+      this.loadVoices();
       return;
     }
 

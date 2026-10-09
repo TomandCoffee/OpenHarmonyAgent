@@ -9,6 +9,9 @@ const TAG = 'TTSService';
 /** 单次播报的文本上限。引擎对长度有限制（错误码 1002300001），超过就分段落 */
 const MAX_SEGMENT_CHARS = 180;
 
+/** 默认音色：传 0 让引擎自己选，实测这个一定能建起来 */
+const DEFAULT_PERSON = 0;
+
 /**
  * 语音播报自检结果
  */
@@ -40,6 +43,10 @@ export class TTSService {
   private speaking: boolean = false;
   /** 全局静音 */
   private muted: boolean = false;
+  /** 引擎实际生效的音色（用户选的音色不可用时会回退到默认） */
+  private effectivePerson: number = 0;
+  /** 实测建不起引擎的音色，记住避免每次重试 */
+  private unavailablePersons: number[] = [];
 
   /** 待播报的文本分段队列 */
   private queue: string[] = [];
@@ -126,7 +133,9 @@ export class TTSService {
       hilog.warn(0x0000, TAG, 'TTS syscap not available on this device');
       return false;
     }
-    if (this.engine !== null && this.language === language && this.person === person) {
+    // 语言一致，且要么音色就是当前生效的、要么这个音色已知不可用 —— 都不必重建
+    if (this.engine !== null && this.language === language
+      && (this.effectivePerson === person || this.unavailablePersons.indexOf(person) >= 0)) {
       return true;
     }
 
@@ -134,13 +143,48 @@ export class TTSService {
     this.release();
     this.language = language;
     this.person = person;
+    return await this.createBestEngine(language, person);
+  }
 
-    // 优先离线（不依赖网络），失败退回在线
-    if (await this.createWithMode(language, person, 1)) {
-      return true;
+  /**
+   * 建引擎：先按用户选的音色试，建不起来就退回默认音色。
+   *
+   * 为什么必须回退：设备的 listVoices() 会列出**资源还没下载**的音色。
+   * 用这种音色 createEngine 直接失败（1002300005，底层报 "Invalid relative path"）。
+   * 实测选中中文男声后引擎完全建不起来，朗读彻底不能用 —— 所以列表能查到
+   * 不等于能用，必须容错。
+   */
+  private async createBestEngine(language: string, person: number): Promise<boolean> {
+    if (this.unavailablePersons.indexOf(person) < 0) {
+      // 优先离线（不依赖网络），失败退回在线
+      if (await this.createWithMode(language, person, 1)
+        || await this.createWithMode(language, person, 0)) {
+        this.effectivePerson = person;
+        return true;
+      }
+      if (person !== DEFAULT_PERSON) {
+        this.unavailablePersons.push(person);
+        hilog.warn(0x0000, TAG, 'voice %{public}d unusable (resource missing?), remembered', person);
+      }
     }
-    hilog.warn(0x0000, TAG, 'offline TTS unavailable, falling back to online');
-    return await this.createWithMode(language, person, 0);
+
+    if (person !== DEFAULT_PERSON) {
+      if (await this.createWithMode(language, DEFAULT_PERSON, 1)
+        || await this.createWithMode(language, DEFAULT_PERSON, 0)) {
+        this.effectivePerson = DEFAULT_PERSON;
+        hilog.info(0x0000, TAG, 'fell back to default voice');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 引擎实际生效的音色。可能是回退后的默认值，
+   * 设置页用它判断用户选的音色有没有真的生效。
+   */
+  getEffectivePerson(): number {
+    return this.effectivePerson;
   }
 
   private async createWithMode(language: string, person: number, online: number): Promise<boolean> {
@@ -287,6 +331,21 @@ export class TTSService {
     for (const listener of this.listeners) {
       listener(this.speaking, this.currentTag);
     }
+  }
+
+  /**
+   * 查指定语言下可用的音色。
+   *
+   * 先确保引擎按这个语言建起来再查 —— 否则 listVoices 返回空
+   * （引擎没初始化时会直接抛，这里也不会有结果）。
+   */
+  async listVoicesFor(language: string): Promise<textToSpeech.VoiceInfo[]> {
+    const ok: boolean = await this.initialize(language, this.person);
+    if (!ok) {
+      hilog.warn(0x0000, TAG, 'cannot list voices: engine not ready');
+      return [];
+    }
+    return await this.listVoices();
   }
 
   /**
