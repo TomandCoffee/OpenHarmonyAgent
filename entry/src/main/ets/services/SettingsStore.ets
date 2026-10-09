@@ -11,6 +11,7 @@ const KEY_RECOGNIZE_LANG = 'language.recognize';
 const KEY_SPEAK_LANG = 'language.speak';
 const KEY_SPEAK_PERSON = 'language.speakPerson';
 const KEY_REPLY_LANG = 'language.reply';
+const KEY_MUTED = 'audio.muted';
 
 /** 支持的语言。加语言只要在这里补一行，各处下拉和 prompt 选择会自动跟上 */
 export interface LanguageOption {
@@ -49,6 +50,7 @@ export class SettingsStore {
   private speakLang: string = 'zh-CN';
   private speakPerson: number = 0;
   private replyLang: string = 'zh-CN';
+  private muted: boolean = false;
 
   async init(context: common.Context): Promise<void> {
     if (this.prefs !== null) {
@@ -62,9 +64,10 @@ export class SettingsStore {
       this.speakLang = await this.readString(KEY_SPEAK_LANG, 'zh-CN');
       this.speakPerson = await this.readNumber(KEY_SPEAK_PERSON, 0);
       this.replyLang = await this.readString(KEY_REPLY_LANG, 'zh-CN');
+      this.muted = await this.readBoolean(KEY_MUTED, false);
 
-      hilog.info(0x0000, TAG, 'loaded: recognize=%{public}s speak=%{public}s reply=%{public}s',
-        this.recognizeLang, this.speakLang, this.replyLang);
+      hilog.info(0x0000, TAG, 'loaded: recognize=%{public}s speak=%{public}s reply=%{public}s muted=%{public}s',
+        this.recognizeLang, this.speakLang, this.replyLang, this.muted.toString());
     } catch (error) {
       const err = error as Error;
       hilog.error(0x0000, TAG, 'init failed: %{public}s', err.message);
@@ -85,6 +88,14 @@ export class SettingsStore {
     }
     const raw: preferences.ValueType = await this.prefs.get(key, def);
     return typeof raw === 'number' ? raw as number : def;
+  }
+
+  private async readBoolean(key: string, def: boolean): Promise<boolean> {
+    if (this.prefs === null) {
+      return def;
+    }
+    const raw: preferences.ValueType = await this.prefs.get(key, def);
+    return typeof raw === 'boolean' ? raw as boolean : def;
   }
 
   private async write(key: string, value: preferences.ValueType): Promise<void> {
@@ -149,6 +160,18 @@ export class SettingsStore {
       return '\n\n【Answer in English】';
     }
     return '';
+  }
+
+  /**
+   * 全局静音偏好。TTSService 启动时读它，切换时写它。
+   */
+  isMuted(): boolean {
+    return this.muted;
+  }
+
+  async setMuted(value: boolean): Promise<void> {
+    this.muted = value;
+    await this.write(KEY_MUTED, value);
   }
 
   /**

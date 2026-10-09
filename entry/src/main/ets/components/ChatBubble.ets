@@ -2,6 +2,7 @@ import { Message, MessageType } from '../models/Message';
 import { stripMarkdown } from '../utils/TextFormat';
 import { TTSService } from '../services/TTSService';
 import { Capability } from '../utils/Capability';
+import { promptAction } from '@kit.ArkUI';
 
 /**
  * 对话气泡组件属性
@@ -44,12 +45,24 @@ export struct ChatBubble {
       && this.message.content.trim().length > 0;
   }
 
+  /**
+   * 消息上的喇叭：单击朗读这条；如果这条正在念，单击即停。
+   *
+   * 静音是全局开关（在首页右上角），这里只做提示，不改变全局状态。
+   */
   private toggleSpeak(): void {
     const tts: TTSService = TTSService.getInstance();
+
     if (this.isSpeaking) {
       tts.stop();
       return;
     }
+
+    if (tts.isMuted()) {
+      promptAction.showToast({ message: '已静音，可在右上角开启' });
+      return;
+    }
+
     tts.speak(this.message.content, this.message.id);
   }
 

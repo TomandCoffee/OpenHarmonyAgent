@@ -38,6 +38,8 @@ export class TTSService {
   private language: string = 'zh-CN';
   private person: number = 0;
   private speaking: boolean = false;
+  /** 全局静音 */
+  private muted: boolean = false;
 
   /** 待播报的文本分段队列 */
   private queue: string[] = [];
@@ -70,6 +72,27 @@ export class TTSService {
 
   isSpeaking(): boolean {
     return this.speaking;
+  }
+
+  /**
+   * 全局静音开关。
+   *
+   * 语义：静音时不接受任何新的朗读请求，并且立刻停掉正在播的内容。
+   * 这是「总开关」，消息上的喇叭只是「读这条」——两者职责分开。
+   */
+  setMuted(value: boolean): void {
+    if (this.muted === value) {
+      return;
+    }
+    this.muted = value;
+    if (value && this.speaking) {
+      this.stop();
+    }
+    hilog.info(0x0000, TAG, 'muted: %{public}s', value.toString());
+  }
+
+  isMuted(): boolean {
+    return this.muted;
   }
 
   /**
@@ -158,6 +181,11 @@ export class TTSService {
    * @param tag 内容标识（传消息 id），用于让对应的气泡显示播放状态
    */
   async speak(text: string, tag: string): Promise<boolean> {
+    if (this.muted) {
+      hilog.info(0x0000, TAG, 'muted, ignore speak request');
+      return false;
+    }
+
     const plain: string = stripMarkdown(text).trim();
     if (plain.length === 0) {
       return false;
