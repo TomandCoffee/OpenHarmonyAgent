@@ -2,10 +2,10 @@
   "modelVersion": "5.0.0",
   "name": "openharmonyagent",
   "version": "1.0.0",
-  "description": "OpenHarmony Agent - 鸿蒙原生智能多模态个人助理",
+  "description": "鸿蒙原生的大模型对话客户端（平板 / 手机）",
   "main": "",
-  "author": "",
-  "license": "Apache-2.0",
+  "author": "TomandCoffee",
+  "license": "MIT",
   "dependencies": {
   },
   "devDependencies": {

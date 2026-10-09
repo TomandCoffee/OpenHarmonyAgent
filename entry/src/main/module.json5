@@ -4,6 +4,14 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
+    // 适用机型声明。改这里等于改「应用能装到哪些设备上」，需要同步 README 的「适用机型」一节。
+    //
+    // 只有 phone 和 tablet：
+    //   - tablet 是主要目标机型，已在 MatePad 11.5"S / HarmonyOS 6.x 上真机验证
+    //   - phone 未做真机验证，但代码里没有平板独有逻辑，且本项目用到的系统能力
+    //     （AI.SpeechRecognizer / AI.TextToSpeech）在 phone 和 tablet 上支持情况完全一致，
+    //     所以保留 —— 构建时会对所有已声明的形态取 syscap 交集，两者相同就不会互相削弱
+    //   - 不加 2in1：界面未做 PC 布局适配，加了等于宣称一个没做过的形态
     "deviceTypes": [
       "phone",
       "tablet"
@@ -56,14 +64,6 @@
         "usedScene": {
           "abilities": ["EntryAbility"],
           "when": "inuse"
-        }
-      },
-      {
-        "name": "ohos.permission.DISTRIBUTED_DATASYNC",
-        "reason": "$string:permission_distributed_reason",
-        "usedScene": {
-          "abilities": ["EntryAbility"],
-          "when": "always"
         }
       },
       {

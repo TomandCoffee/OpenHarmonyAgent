@@ -2,11 +2,11 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "OpenHarmony Agent 模块描述"
+      "value": "鸿蒙原生的大模型对话客户端"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "OpenHarmony Agent 个人智能助理"
+      "value": "鸿蒙原生的大模型对话客户端"
     },
     {
       "name": "EntryAbility_label",
@@ -25,20 +25,12 @@
       "value": "用于访问相册图片进行智能分析"
     },
     {
-      "name": "permission_distributed_reason",
-      "value": "用于跨设备协同和任务流转"
-    },
-    {
       "name": "tab_home",
       "value": "首页"
     },
     {
       "name": "tab_knowledge",
       "value": "知识库"
-    },
-    {
-      "name": "tab_agents",
-      "value": "智能体"
     },
     {
       "name": "tab_settings",
@@ -51,18 +43,6 @@
     {
       "name": "text_input_hint",
       "value": "输入消息..."
-    },
-    {
-      "name": "agent_learning",
-      "value": "学习助手"
-    },
-    {
-      "name": "agent_schedule",
-      "value": "日程管家"
-    },
-    {
-      "name": "agent_document",
-      "value": "文档处理"
     }
   ]
 }
