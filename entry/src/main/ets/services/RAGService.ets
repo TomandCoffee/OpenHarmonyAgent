@@ -26,8 +26,22 @@ export interface KnowledgeStats {
  *   所以平板上的"回答"这一步需要自行接入大模型。
  */
 export class RAGService {
+  private static instance: RAGService | null = null;
   private isInitialized: boolean = false;
   private knowledgeIndex: Map<string, KnowledgeItem> = new Map();
+
+  /**
+   * 全局单例。
+   *
+   * 之前是每个页面各 new 一份，导致首页加的知识在知识库页面看不到、
+   * 检索也检索不到 —— 接进提问流程之前必须先统一成一个实例。
+   */
+  static getInstance(): RAGService {
+    if (RAGService.instance === null) {
+      RAGService.instance = new RAGService();
+    }
+    return RAGService.instance;
+  }
 
   /**
    * 初始化 RAG 引擎

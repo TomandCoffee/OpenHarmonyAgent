@@ -1,5 +1,7 @@
 import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { LLMService } from '../services/LLMService';
+import { ApiKeyStore } from '../services/ApiKeyStore';
 
 const TAG = 'Settings';
 
@@ -23,6 +25,18 @@ struct Settings {
   @State darkMode: boolean = false;
   @State notificationEnabled: boolean = true;
 
+  // 模型设置
+  @State apiKeyInput: string = '';
+  @State savedKeyMask: string = '';
+  @State keyTestResult: string = '';
+  @State keyTestOk: boolean = false;
+  @State isTestingKey: boolean = false;
+
+  aboutToAppear(): void {
+    const store: ApiKeyStore = ApiKeyStore.getInstance();
+    this.savedKeyMask = store.hasKey() ? store.maskKey() : '';
+  }
+
   build() {
     Column() {
       // 顶部导航栏
@@ -31,6 +45,9 @@ struct Settings {
       // 设置列表
       Scroll() {
         Column() {
+          // 模型设置（放最前，这是整个应用能否工作的前提）
+          this.ModelSettingsSection()
+
           // 功能设置
           this.SettingSection('功能设置', [
             {
@@ -227,6 +244,131 @@ struct Settings {
     .padding(16)
     .backgroundColor('#FFFFFF')
     .borderRadius(12)
+  }
+
+  /**
+   * 模型设置：DeepSeek API Key
+   */
+  @Builder
+  ModelSettingsSection() {
+    Column() {
+      Text('AI 模型')
+        .fontSize(14)
+        .fontColor('#999999')
+        .margin({ bottom: 8, left: 16 })
+
+      Column() {
+        Row() {
+          Text('DeepSeek API Key')
+            .fontSize(16)
+            .fontColor('#333333')
+
+          Blank()
+
+          Text(this.savedKeyMask.length > 0 ? `已保存 ${this.savedKeyMask}` : '未配置')
+            .fontSize(13)
+            .fontColor(this.savedKeyMask.length > 0 ? '#52C41A' : '#FF4D4F')
+        }
+        .width('100%')
+
+        TextInput({ placeholder: 'sk-...', text: this.apiKeyInput })
+          .type(InputType.Password)
+          .height(44)
+          .width('100%')
+          .margin({ top: 8 })
+          .onChange((value: string) => {
+            this.apiKeyInput = value;
+            this.keyTestResult = '';
+          })
+
+        Row() {
+          Button('保存')
+            .fontSize(14)
+            .onClick(() => {
+              this.saveApiKey();
+            })
+            .margin({ right: 8 })
+
+          Button(this.isTestingKey ? '测试中…' : '测试连接')
+            .fontSize(14)
+            .enabled(!this.isTestingKey)
+            .onClick(() => {
+              this.testApiKey();
+            })
+            .margin({ right: 8 })
+
+          Button('清除')
+            .fontSize(14)
+            .backgroundColor('#FFF0F0')
+            .fontColor('#FF4D4F')
+            .onClick(() => {
+              this.clearApiKey();
+            })
+        }
+        .margin({ top: 12 })
+
+        if (this.keyTestResult.length > 0) {
+          Text(this.keyTestResult)
+            .fontSize(13)
+            .fontColor(this.keyTestOk ? '#52C41A' : '#FF4D4F')
+            .width('100%')
+            .margin({ top: 8 })
+        }
+      }
+      .padding(16)
+      .backgroundColor('#FFFFFF')
+      .borderRadius(12)
+    }
+    .width('100%')
+    .margin({ bottom: 24 })
+  }
+
+  private async saveApiKey(): Promise<void> {
+    const key: string = this.apiKeyInput.trim();
+    if (key.length === 0) {
+      this.keyTestOk = false;
+      this.keyTestResult = '请先输入 API Key。';
+      return;
+    }
+
+    const store: ApiKeyStore = ApiKeyStore.getInstance();
+    await store.setApiKey(key);
+    this.savedKeyMask = store.maskKey();
+    this.apiKeyInput = '';
+    this.keyTestOk = true;
+    this.keyTestResult = '已保存，现在可以回首页对话了。';
+  }
+
+  private async testApiKey(): Promise<void> {
+    const typed: string = this.apiKeyInput.trim();
+    const key: string = typed.length > 0 ? typed : ApiKeyStore.getInstance().getApiKey();
+    if (key.length === 0) {
+      this.keyTestOk = false;
+      this.keyTestResult = '请先输入 API Key。';
+      return;
+    }
+
+    this.isTestingKey = true;
+    this.keyTestOk = false;
+    this.keyTestResult = '测试中…';
+
+    const message: string = await LLMService.getInstance().ping(key);
+    if (message.length === 0) {
+      this.keyTestOk = true;
+      this.keyTestResult = '连接成功，Key 可用。';
+    } else {
+      this.keyTestOk = false;
+      this.keyTestResult = message;
+    }
+    this.isTestingKey = false;
+  }
+
+  private async clearApiKey(): Promise<void> {
+    await ApiKeyStore.getInstance().clearApiKey();
+    this.savedKeyMask = '';
+    this.apiKeyInput = '';
+    this.keyTestOk = true;
+    this.keyTestResult = '已清除。';
   }
 
   /**

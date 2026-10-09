@@ -1,8 +1,12 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { Agent, AgentType, Message, ProcessResult } from '../models/Message';
+import { AgentRequest } from '../models/LLM';
+import { Agent, AgentType, KnowledgeItem, Message, ProcessResult } from '../models/Message';
 import { LearningAgent } from './LearningAgent';
 import { ScheduleAgent } from './ScheduleAgent';
 import { DocumentAgent } from './DocumentAgent';
+import { RAGService } from './RAGService';
+import { MAIN_SYSTEM } from './AgentPrompts';
+import { runAgent } from './AgentRunner';
 
 const TAG = 'AgentService';
 
@@ -13,11 +17,15 @@ interface RequestParams {
   text: string;
   imageUrl?: string;
   context?: Message[];
+  /** 流式增量回调，透传给具体智能体 */
+  onDelta?: (delta: string) => void;
+  /** 意图路由确定后立刻回调，让界面先把气泡的署名填上 */
+  onAgentName?: (name: string) => void;
 }
 
 /**
  * 智能体编排服务
- * 负责任务分解、智能体调度和结果整合
+ * 负责意图识别、知识库检索和智能体调度
  */
 export class AgentService {
   private learningAgent: LearningAgent;
@@ -48,35 +56,67 @@ export class AgentService {
   }
 
   /**
-   * 处理用户请求
-   * 自动识别意图并分发给相应的智能体
+   * 处理用户请求：识别意图 → 检索知识库 → 分发给对应智能体
    */
   async processRequest(params: RequestParams): Promise<ProcessResult> {
     const text: string = params.text;
     const imageUrl: string | undefined = params.imageUrl;
     const context: Message[] | undefined = params.context;
 
-    hilog.info(0x0000, TAG, 'Processing request: %{public}s', text);
+    hilog.info(0x0000, TAG, 'Processing request, length: %{public}d', text.length);
 
     // 1. 意图识别
-    const intent = this.identifyIntent(text, imageUrl);
+    const intent: AgentType = this.identifyIntent(text, imageUrl);
 
-    // 2. 任务分解（复杂任务）
-    if (this.isComplexTask(intent, text)) {
-      return await this.handleComplexTask(text, context);
+    // 2. 需要同时处理文档和日程的复合请求
+    if (this.needsTwoAgents(text, imageUrl)) {
+      if (params.onAgentName !== undefined) {
+        params.onAgentName('多智能体协作');
+      }
+      return await this.handleComplexTask(params);
     }
 
-    // 3. 分发到相应智能体
+    // 3. 路由已定，先把署名告诉界面（模型首字可能还要等一两秒）
+    if (params.onAgentName !== undefined) {
+      params.onAgentName(AgentService.displayName(intent));
+    }
+
+    // 3. 检索本地知识库（只在学习类和兜底场景做，日程/文档用不上）
+    let knowledge: KnowledgeItem[] = [];
+    if (intent === AgentType.LEARNING || intent === AgentType.MAIN) {
+      knowledge = await RAGService.getInstance().retrieve(text, 3);
+    }
+
+    const req: AgentRequest = {
+      text: text,
+      imageUrl: imageUrl,
+      context: context,
+      onDelta: params.onDelta,
+      knowledge: knowledge
+    };
+
+    // 4. 分发
     switch (intent) {
       case AgentType.LEARNING:
-        return await this.learningAgent.handle(text, context);
+        return await this.learningAgent.handle(req);
       case AgentType.SCHEDULE:
-        return await this.scheduleAgent.handle(text, context);
+        return await this.scheduleAgent.handle(req);
       case AgentType.DOCUMENT:
-        return await this.documentAgent.handle(text, imageUrl, context);
+        return await this.documentAgent.handle(req);
       default:
-        // 主助理处理通用请求
-        return await this.handleGeneralRequest(text, context);
+        return await runAgent(MAIN_SYSTEM, '主助理', req, false);
+    }
+  }
+
+  /**
+   * 意图对应的显示名，要和各智能体 handle() 里传的 agentName 保持一致
+   */
+  private static displayName(intent: AgentType): string {
+    switch (intent) {
+      case AgentType.LEARNING: return '学习助手';
+      case AgentType.SCHEDULE: return '日程管家';
+      case AgentType.DOCUMENT: return '文档处理';
+      default: return '主助理';
     }
   }
 
@@ -84,98 +124,90 @@ export class AgentService {
    * 识别用户意图
    */
   private identifyIntent(text: string, imageUrl?: string): AgentType {
-    const lowerText = text.toLowerCase();
+    const lowerText: string = text.toLowerCase();
 
     // 文档相关关键词
-    if (imageUrl || 
-        lowerText.includes('文档') || 
-        lowerText.includes('总结') || 
-        lowerText.includes('提取') ||
-        lowerText.includes('pdf') ||
-        lowerText.includes('文件')) {
+    if (imageUrl !== undefined && imageUrl.length > 0) {
+      return AgentType.DOCUMENT;
+    }
+    if (lowerText.includes('文档') || lowerText.includes('总结') || lowerText.includes('提取')
+      || lowerText.includes('pdf') || lowerText.includes('文件') || lowerText.includes('摘要')) {
       return AgentType.DOCUMENT;
     }
 
     // 日程相关关键词
-    if (lowerText.includes('日程') || 
-        lowerText.includes('提醒') || 
-        lowerText.includes('会议') ||
-        lowerText.includes('安排') ||
-        lowerText.includes('时间') ||
-        lowerText.includes('明天') ||
-        lowerText.includes('今天')) {
+    if (lowerText.includes('日程') || lowerText.includes('提醒') || lowerText.includes('会议')
+      || lowerText.includes('安排') || lowerText.includes('明天') || lowerText.includes('后天')
+      || lowerText.includes('约') || lowerText.includes('几点')) {
       return AgentType.SCHEDULE;
     }
 
     // 学习相关关键词
-    if (lowerText.includes('学习') || 
-        lowerText.includes('知识') || 
-        lowerText.includes('问题') ||
-        lowerText.includes('解释') ||
-        lowerText.includes('概念') ||
-        lowerText.includes('笔记')) {
+    if (lowerText.includes('学习') || lowerText.includes('知识') || lowerText.includes('问题')
+      || lowerText.includes('解释') || lowerText.includes('概念') || lowerText.includes('笔记')
+      || lowerText.includes('什么是') || lowerText.includes('为什么') || lowerText.includes('怎么')) {
       return AgentType.LEARNING;
     }
 
-    // 默认返回主助理
     return AgentType.MAIN;
   }
 
   /**
-   * 判断是否为复杂任务（需要多智能体协作）
+   * 判断是否需要同时跑文档和日程两个智能体。
+   *
+   * 旧实现是「文本里出现 和/并且/同时/还有 就算复杂任务」，问题是中文里带"和"的
+   * 句子太多（"什么是调和分析"会被误判），而它注释里举的例子
+   * 「帮我总结这份文档，并安排明天下午的会议」反而不含任何一个关键词。
+   * 现在改成：文档意图和日程意图都命中才并行。
    */
-  private isComplexTask(intent: AgentType, text: string): boolean {
-    const complexKeywords = ['并且', '同时', '还有', '另外', '以及', '和'];
-    return complexKeywords.some(keyword => text.includes(keyword));
+  private needsTwoAgents(text: string, imageUrl?: string): boolean {
+    const lowerText: string = text.toLowerCase();
+
+    const docHit: boolean = (imageUrl !== undefined && imageUrl.length > 0)
+      || lowerText.includes('文档') || lowerText.includes('总结')
+      || lowerText.includes('提取') || lowerText.includes('pdf');
+
+    const scheduleHit: boolean = lowerText.includes('日程') || lowerText.includes('提醒')
+      || lowerText.includes('会议') || lowerText.includes('安排');
+
+    return docHit && scheduleHit;
   }
 
   /**
-   * 处理复杂任务（多智能体协作）
+   * 复合任务：串行跑两个智能体，把两段结果拼在一个气泡里。
+   *
+   * 之所以串行而不是并行：只有一个气泡，两路并行的流没法交错渲染。
    */
-  private async handleComplexTask(text: string, context?: Message[]): Promise<ProcessResult> {
-    hilog.info(0x0000, TAG, 'Handling complex task');
-
-    // 任务分解示例
-    // "帮我总结这份文档，并安排明天下午的会议来讨论"
-    // -> 文档处理 + 日程安排
-
-    const results: ProcessResult[] = [];
-
-    // 并行执行多个智能体（两个 Promise 先同时创建，再依次 await）
-    const docPromise: Promise<ProcessResult | null> =
-      this.documentAgent.handle(text, undefined, context).catch(() => null);
-    const schedulePromise: Promise<ProcessResult | null> =
-      this.scheduleAgent.handle(text, context).catch(() => null);
-
-    const docResult: ProcessResult | null = await docPromise;
-    const scheduleResult: ProcessResult | null = await schedulePromise;
-
-    if (docResult) results.push(docResult);
-    if (scheduleResult) results.push(scheduleResult);
-
-    // 整合结果
-    const combinedContent = results.map(r => r.content).join('\n\n');
-    
-    return {
-      content: combinedContent,
-      agentName: '多智能体协作',
-      needsKnowledgeUpdate: true,
-      suggestedActions: results.flatMap(r => r.suggestedActions || [])
+  private async handleComplexTask(params: RequestParams): Promise<ProcessResult> {
+    const emit = (chunk: string): void => {
+      if (params.onDelta !== undefined) {
+        params.onDelta(chunk);
+      }
     };
-  }
 
-  /**
-   * 处理通用请求
-   */
-  private async handleGeneralRequest(text: string, context?: Message[]): Promise<ProcessResult> {
-    // 简单的通用响应逻辑
-    // 实际应该调用 LLM API
-    
+    const docHeader: string = '【文档处理】\n';
+    emit(docHeader);
+    const docResult: ProcessResult = await this.documentAgent.handle({
+      text: params.text,
+      imageUrl: params.imageUrl,
+      context: params.context,
+      knowledge: [],
+      onDelta: params.onDelta
+    });
+
+    const scheduleHeader: string = '\n\n【日程管家】\n';
+    emit(scheduleHeader);
+    const scheduleResult: ProcessResult = await this.scheduleAgent.handle({
+      text: params.text,
+      context: params.context,
+      knowledge: [],
+      onDelta: params.onDelta
+    });
+
     return {
-      content: `我收到了你的消息："${text}"\n\n我可以帮你处理学习、日程或文档相关的任务。请告诉我具体需要什么帮助？`,
-      agentName: '主助理',
-      needsKnowledgeUpdate: false,
-      suggestedActions: ['询问学习问题', '设置日程提醒', '处理文档']
+      content: `${docHeader}${docResult.content}${scheduleHeader}${scheduleResult.content}`,
+      agentName: '多智能体协作',
+      needsKnowledgeUpdate: false
     };
   }
 

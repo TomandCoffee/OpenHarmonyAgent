@@ -2,6 +2,7 @@ import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { RAGService } from '../services/RAGService';
 import { KnowledgeItem } from '../models/Message';
+import { toPreview } from '../utils/TextFormat';
 
 const TAG = 'KnowledgeBase';
 
@@ -13,7 +14,7 @@ struct KnowledgeBase {
   @State isSearching: boolean = false;
   @State showAddDialog: boolean = false;
   
-  private ragService: RAGService = new RAGService();
+  private ragService: RAGService = RAGService.getInstance();
 
   aboutToAppear(): void {
     this.ragService.initialize();
@@ -183,7 +184,7 @@ struct KnowledgeBase {
 
         // 内容
         Column() {
-          Text(item.content.substring(0, 50) + (item.content.length > 50 ? '...' : ''))
+          Text(toPreview(item.content, 50))
             .fontSize(15)
             .fontColor('#333333')
             .lineHeight(22)

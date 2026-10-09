@@ -1,11 +1,18 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { Message, ProcessResult } from '../models/Message';
+import { AgentRequest } from '../models/LLM';
+import { ProcessResult } from '../models/Message';
+import { DOCUMENT_SYSTEM } from './AgentPrompts';
+import { runAgent } from './AgentRunner';
 
 const TAG = 'DocumentAgent';
 
 /**
  * 文档处理智能体
- * 负责文档总结、重点提取、OCR 识别
+ *
+ * 回答由 DeepSeek 生成，人设见 AgentPrompts.DOCUMENT_SYSTEM。
+ *
+ * 关于图片：本地图片链路（相册选择 → 读字节 → base64）还没打通，
+ * 界面传过来的 imageUrl 只是个占位路径。这里如实告知，而不是假装分析过了。
  */
 export class DocumentAgent {
   private isInitialized: boolean = false;
@@ -18,123 +25,20 @@ export class DocumentAgent {
   /**
    * 处理文档相关请求
    */
-  async handle(text: string, imageUrl?: string, context?: Message[]): Promise<ProcessResult> {
-    hilog.info(0x0000, TAG, 'DocumentAgent handling: %{public}s', text);
+  async handle(req: AgentRequest): Promise<ProcessResult> {
+    hilog.info(0x0000, TAG, 'handling: %{public}s', req.text);
 
-    const response = await this.generateResponse(text, imageUrl, context);
+    const hasAttachment: boolean = req.imageUrl !== undefined && req.imageUrl.length > 0;
 
-    return {
-      content: response,
-      agentName: '文档处理',
-      needsKnowledgeUpdate: true,
-      suggestedActions: ['保存摘要', '导出 PDF', '分享']
+    const effective: AgentRequest = {
+      text: hasAttachment
+        ? `${req.text}\n\n（注：用户附加了一张图片，但当前版本还读不到图片内容，请如实说明并请他粘贴文字。）`
+        : req.text,
+      context: req.context,
+      knowledge: req.knowledge,
+      onDelta: req.onDelta
     };
-  }
 
-  /**
-   * 生成响应
-   */
-  private async generateResponse(text: string, imageUrl?: string, context?: Message[]): Promise<string> {
-    // 如果有图片，进行图像分析
-    if (imageUrl) {
-      return this.processImage(imageUrl, text);
-    }
-
-    const lowerText = text.toLowerCase();
-
-    // 检测是否是文档总结请求
-    if (lowerText.includes('总结') || lowerText.includes('摘要') || 
-        lowerText.includes('重点') || lowerText.includes('提取')) {
-      return this.summarizeDocument(text);
-    }
-
-    // 检测是否是 OCR 请求
-    if (lowerText.includes('识别') || lowerText.includes('文字') || 
-        lowerText.includes('扫描')) {
-      return this.performOCR(text);
-    }
-
-    // 默认响应
-    return `📄 **文档处理**
-
-我可以帮你：
-• 📝 总结文档重点
-• 🔍 提取关键信息
-• 📷 OCR 文字识别
-• 📊 格式转换
-
-请上传文档或告诉我具体需求。
-例如："帮我总结这份文档的重点"`;
-  }
-
-  /**
-   * 处理图片（文档拍照/上传）
-   */
-  private processImage(imageUrl: string, text: string): string {
-    // 模拟图像处理流程
-    // 实际应该调用 OCR 和图像分析 API
-
-    return `📷 **图片分析完成**
-
-**图片类型**：文档
-**识别文字**：约 ${Math.floor(Math.random() * 500 + 100)} 字
-
-📝 **内容总结**：
-• 这是一份文档图片
-• 已提取主要文字内容
-• 识别准确率：95%
-
-**下一步操作**：
-• 查看完整识别结果
-• 提取重点摘要
-• 保存到知识库
-
-${text ? `你的指令："${text}"` : '需要我帮你总结重点吗？'}`;
-  }
-
-  /**
-   * 总结文档
-   */
-  private summarizeDocument(text: string): string {
-    return `📝 **文档摘要**
-
-**标题**：待提取
-
-**核心内容**：
-1. **主要观点**
-   - 观点一：...
-   - 观点二：...
-   - 观点三：...
-
-2. **关键数据**
-   - 数据点 1
-   - 数据点 2
-
-3. **结论建议**
-   - 建议 1
-   - 建议 2
-
-**重点标记**：已高亮 3 处关键内容
-
-需要导出为其他格式吗？`;
-  }
-
-  /**
-   * 执行 OCR
-   */
-  private performOCR(text: string): string {
-    return `🔍 **文字识别结果**
-
-**识别状态**：完成
-**文字数量**：约 200 字
-**准确率**：96%
-
-**识别内容**：
-「识别的文字内容将显示在这里」
-
-**操作选项**：
-• 复制文字
-• 翻译内容
-• 保存到笔记`;
+    return runAgent(DOCUMENT_SYSTEM, '文档处理', effective, false);
   }
 }

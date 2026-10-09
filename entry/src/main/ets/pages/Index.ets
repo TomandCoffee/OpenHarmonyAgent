@@ -4,11 +4,14 @@ import { VoiceInput } from '../components/VoiceInput';
 import { ChatTextInput } from '../components/TextInput';
 import { ImageInput } from '../components/ImageInput';
 import { ChatBubble } from '../components/ChatBubble';
-import { Message, MessageType } from '../models/Message';
+import { Message, MessageType, ProcessResult } from '../models/Message';
 import { AgentService } from '../services/AgentService';
 import { RAGService } from '../services/RAGService';
 
 const TAG = 'Index';
+
+/** 流式渲染的合并窗口：每 50ms 才真正写一次 @Observed 对象，避免每个 token 都触发重绘 */
+const FLUSH_INTERVAL_MS = 50;
 
 @Entry
 @Component
@@ -18,24 +21,39 @@ struct Index {
   @State currentInput: string = '';
   @State selectedImage: string = '';
   @State showInputMethods: boolean = false;
-  
+
   private agentService: AgentService = new AgentService();
-  private ragService: RAGService = new RAGService();
+  private ragService: RAGService = RAGService.getInstance();
+  private listScroller: Scroller = new Scroller();
+
+  // 流式渲染的中间状态（刻意不用 @State —— 攒够一批再一次性触发重绘）
+  private streamTarget: Message | null = null;
+  private pendingDelta: string = '';
+  private flushTimerId: number = -1;
+  private lastFlushAt: number = 0;
 
   aboutToAppear(): void {
     hilog.info(0x0000, TAG, 'Index aboutToAppear');
     // 初始化服务
     this.agentService.initialize();
     this.ragService.initialize();
-    
+
     // 添加欢迎消息
-    this.messages.push({
-      id: 'welcome',
-      type: MessageType.AGENT,
-      content: '你好！我是 OpenHarmony Agent，你的智能个人助理。我可以帮你：\n\n📚 整理学习资料、解答问题\n📅 管理日程安排、设置提醒\n📄 处理文档、总结重点\n\n你可以语音、文字或图片与我交流，试试说"帮我总结这份文档"吧！',
-      timestamp: Date.now(),
-      agentName: '主助理'
-    });
+    this.messages.push(new Message(
+      'welcome',
+      MessageType.AGENT,
+      '你好！我是 OpenHarmony Agent，你的智能个人助理。我可以帮你：\n\n📚 整理学习资料、解答问题\n📅 管理日程安排、设置提醒\n📄 处理文档、总结重点\n\n你可以语音、文字或图片与我交流，试试说"帮我总结这份文档"吧！',
+      Date.now(),
+      undefined,
+      '主助理'
+    ));
+  }
+
+  aboutToDisappear(): void {
+    if (this.flushTimerId !== -1) {
+      clearTimeout(this.flushTimerId);
+      this.flushTimerId = -1;
+    }
   }
 
   build() {
@@ -90,6 +108,19 @@ struct Index {
       .onClick(() => {
         router.pushUrl({ url: 'pages/Agents' });
       })
+      .margin({ right: 12 })
+
+      // 设置入口（模型 API Key 在这里配）
+      Button() {
+        Image($r('app.media.ic_settings'))
+          .width(22)
+          .height(22)
+      }
+      .type(ButtonType.Circle)
+      .backgroundColor('transparent')
+      .onClick(() => {
+        router.pushUrl({ url: 'pages/Settings' });
+      })
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 12, bottom: 12 })
@@ -99,7 +130,7 @@ struct Index {
 
   @Builder
   MessageList() {
-    Scroll() {
+    Scroll(this.listScroller) {
       Column() {
         ForEach(this.messages, (message: Message) => {
           ChatBubble({ message: message })
@@ -295,78 +326,148 @@ struct Index {
   }
 
   /**
-   * 发送消息
+   * 发送消息（流式渲染）
    */
   private async sendMessage(): Promise<void> {
-    if (!this.currentInput && !this.selectedImage) {
+    if (this.currentInput.length === 0 && this.selectedImage.length === 0) {
       return;
     }
-
     if (this.isProcessing) {
       return;
     }
-
     this.isProcessing = true;
 
-    // 添加用户消息
-    const userMessage: Message = {
-      id: `user_${Date.now()}`,
-      type: MessageType.USER,
-      content: this.currentInput,
-      timestamp: Date.now(),
-      imageUrl: this.selectedImage || undefined
-    };
-    this.messages.push(userMessage);
+    const inputText: string = this.currentInput;
+    const inputImage: string = this.selectedImage;
 
-    // 清空输入
-    const inputText = this.currentInput;
-    const inputImage = this.selectedImage;
+    // 历史快照必须在 push 本轮消息之前取，否则会把刚加的用户消息重复传一遍
+    const history: Message[] = this.messages.slice();
+
+    this.messages.push(new Message(
+      `user_${Date.now()}`,
+      MessageType.USER,
+      inputText,
+      Date.now(),
+      inputImage.length > 0 ? inputImage : undefined
+    ));
+
     this.currentInput = '';
     this.selectedImage = '';
 
+    // 先放一个空气泡占位，流式的增量往它身上填；
+    // 模型首字可能要等一两秒，所以署名先写"思考中…"
+    const placeholder: Message = new Message(
+      `agent_${Date.now()}`,
+      MessageType.AGENT,
+      '',
+      Date.now(),
+      undefined,
+      '思考中…'
+    );
+    placeholder.isStreaming = true;
+    this.messages.push(placeholder);
+
+    this.streamTarget = placeholder;
+    this.pendingDelta = '';
+    this.lastFlushAt = 0;
+    this.scrollToBottom();
+
     try {
-      // 调用智能体服务处理
-      const response = await this.agentService.processRequest({
+      const response: ProcessResult = await this.agentService.processRequest({
         text: inputText,
-        imageUrl: inputImage,
-        context: this.messages.slice(-10) // 传递最近 10 条消息作为上下文
+        imageUrl: inputImage.length > 0 ? inputImage : undefined,
+        context: history,
+        onDelta: (delta: string) => {
+          this.onStreamDelta(delta);
+        },
+        onAgentName: (name: string) => {
+          placeholder.agentName = name;
+        }
       });
 
-      // 添加助手回复
-      const agentMessage: Message = {
-        id: `agent_${Date.now()}`,
-        type: MessageType.AGENT,
-        content: response.content,
-        timestamp: Date.now(),
-        agentName: response.agentName
-      };
-      this.messages.push(agentMessage);
+      // 收尾：把攒着的尾巴刷出去，再用权威全文覆盖一次（顺带补上可能的差异）
+      this.finishStream();
+      placeholder.content = response.content;
+      placeholder.agentName = response.agentName;
+      placeholder.isStreaming = false;
 
-      // 如果是知识相关的查询，更新 RAG 知识库
-      if (response.needsKnowledgeUpdate) {
+      if (response.needsKnowledgeUpdate && inputText.length > 6) {
+        // 存「问 + 答摘要」而不是只存问题 —— 只存问题的话，检索出来是一条
+        // 没有信息量的疑问句，拼进 prompt 反而干扰模型
+        let answer: string = response.content.trim();
+        if (answer.length > 300) {
+          answer = answer.substring(0, 300);
+        }
         await this.ragService.addKnowledge({
           id: `kb_${Date.now()}`,
-          content: inputText,
-          type: 'conversation',
-          tags: ['对话'],
+          content: `问：${inputText}\n答：${answer}`,
+          type: response.agentName,
+          tags: ['对话', response.agentName],
           timestamp: Date.now()
         });
       }
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to process message: %{public}s', JSON.stringify(error) ?? '');
-      
-      // 添加错误消息
-      const errorMessage: Message = {
-        id: `error_${Date.now()}`,
-        type: MessageType.AGENT,
-        content: '抱歉，处理您的请求时出现了问题，请稍后重试。',
-        timestamp: Date.now(),
-        agentName: '系统'
-      };
-      this.messages.push(errorMessage);
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'sendMessage failed: %{public}s', err.message);
+      this.finishStream();
+      placeholder.agentName = '系统';
+      placeholder.content = `⚠️ 处理请求时出错了：${err.message}`;
+      placeholder.isStreaming = false;
     } finally {
+      this.streamTarget = null;
       this.isProcessing = false;
+      this.scrollToBottom();
     }
+  }
+
+  /**
+   * 收到一段文本增量。
+   * 只往普通字段里拼，攒够 FLUSH_INTERVAL_MS 才写一次 UI —— 每个 token 都
+   * 触发重绘会拖垮栅格化，几十毫秒一批肉眼完全看不出差别。
+   */
+  private onStreamDelta(delta: string): void {
+    this.pendingDelta += delta;
+
+    const now: number = Date.now();
+    const elapsed: number = now - this.lastFlushAt;
+    if (elapsed >= FLUSH_INTERVAL_MS) {
+      this.flushStream();
+    } else if (this.flushTimerId === -1) {
+      // 尾部补偿：保证最后一段增量不会因为不够一个窗口而被丢掉
+      this.flushTimerId = setTimeout(() => {
+        this.flushTimerId = -1;
+        this.flushStream();
+      }, FLUSH_INTERVAL_MS - elapsed);
+    }
+  }
+
+  /**
+   * 唯一真正触发重绘的地方（改的是 @Observed 对象的属性，
+   * 只会让这一个气泡更新，列表其余部分不参与 diff）
+   */
+  private flushStream(): void {
+    if (this.pendingDelta.length === 0 || this.streamTarget === null) {
+      return;
+    }
+    this.streamTarget.content += this.pendingDelta;
+    this.pendingDelta = '';
+    this.lastFlushAt = Date.now();
+    this.scrollToBottom();
+  }
+
+  /**
+   * 结束流式：清掉定时器并确保残余增量落地
+   */
+  private finishStream(): void {
+    if (this.flushTimerId !== -1) {
+      clearTimeout(this.flushTimerId);
+      this.flushTimerId = -1;
+    }
+    this.flushStream();
+  }
+
+  private scrollToBottom(): void {
+    this.listScroller.scrollEdge(Edge.Bottom);
   }
 
   /**

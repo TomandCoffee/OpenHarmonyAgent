@@ -1,4 +1,5 @@
 import { Message, MessageType } from '../models/Message';
+import { stripMarkdown } from '../utils/TextFormat';
 
 /**
  * 对话气泡组件属性
@@ -13,7 +14,9 @@ interface ChatBubbleProps {
  */
 @Component
 export struct ChatBubble {
-  @Prop message: Message;
+  // @ObjectLink 配合 Message 的 @Observed：流式时只改 message.content
+  // 就能让这一个气泡重绘，列表其他部分不参与 diff
+  @ObjectLink message: Message;
 
   build() {
     Row() {
@@ -70,12 +73,22 @@ export struct ChatBubble {
             .margin({ bottom: 4 })
         }
 
-        // 消息文本
-        Text(this.formatContent(this.message.content))
-          .fontSize(15)
-          .fontColor('#333333')
-          .lineHeight(22)
-          .width('100%')
+        // 消息文本（流式中在末尾显示光标）
+        Row() {
+          Text(this.formatContent(this.message.content))
+            .fontSize(15)
+            .fontColor('#333333')
+            .lineHeight(22)
+            .layoutWeight(1)
+
+          if (this.message.isStreaming) {
+            Text('▍')
+              .fontSize(15)
+              .fontColor('#007DFF')
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Top)
 
         // 图片（如果有）
         if (this.message.imageUrl) {
@@ -134,13 +147,13 @@ export struct ChatBubble {
   }
 
   /**
-   * 格式化内容（支持简单的 Markdown）
+   * 格式化内容（剥掉模型输出的轻量 Markdown）
+   *
+   * 聊天界面只渲染纯文本，所以这里把标记去掉而不是真去渲染富文本 ——
+   * 为演示引入富文本渲染器不划算。
    */
   private formatContent(content: string): string {
-    // 简单的格式化，实际可以使用富文本
-    return content
-      .replace(/\*\*(.*?)\*\*/g, '$1') // 粗体
-      .replace(/•/g, '•'); // 列表项
+    return stripMarkdown(content);
   }
 
   /**

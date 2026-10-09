@@ -9,8 +9,13 @@ export enum MessageType {
 
 /**
  * 消息模型
+ *
+ * 用 @Observed class 而不是 interface：流式输出需要「只改 content 就让对应的那一个
+ * 气泡重绘」。普通 interface 配 @Prop 做不到 —— @Prop 是浅拷贝，父对象原地改属性
+ * 子组件收不到通知，而 ForEach 的 key 不变时又不会重建组件。
  */
-export interface Message {
+@Observed
+export class Message {
   id: string;
   type: MessageType;
   content: string;
@@ -18,6 +23,19 @@ export interface Message {
   imageUrl?: string;
   agentName?: string;
   relatedAgent?: string;
+  /** 是否正在流式接收中（用于在气泡末尾显示光标） */
+  isStreaming: boolean = false;
+
+  constructor(id: string, type: MessageType, content: string, timestamp: number,
+              imageUrl?: string, agentName?: string, relatedAgent?: string) {
+    this.id = id;
+    this.type = type;
+    this.content = content;
+    this.timestamp = timestamp;
+    this.imageUrl = imageUrl;
+    this.agentName = agentName;
+    this.relatedAgent = relatedAgent;
+  }
 }
 
 /**

@@ -65,6 +65,9 @@
           "abilities": ["EntryAbility"],
           "when": "always"
         }
+      },
+      {
+        "name": "ohos.permission.INTERNET"
       }
     ],
     "extensionAbilities": [
