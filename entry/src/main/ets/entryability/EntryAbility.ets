@@ -1,26 +1,42 @@
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
-import { distributedDataObject } from '@kit.CoreFileKit';
+import { distributedDataObject } from '@kit.ArkData';
+import { deviceInfo } from '@kit.BasicServicesKit';
 
 const TAG = 'EntryAbility';
 
+/**
+ * 跨设备流转的共享上下文。
+ * 分布式数据对象的字段必须由显式声明的类承载，ArkTS 不允许无类型对象字面量。
+ */
+class SharedContext {
+  sessionId: string = '';
+  deviceId: string = '';
+  deviceType: string = '';
+  currentTask: string = '';
+  contextData: string = '{}';
+  lastUpdateTime: number = 0;
+}
+
 export default class EntryAbility extends UIAbility {
-  private distributedObject: distributedDataObject.DistributedObject | null = null;
+  private distributedObject: distributedDataObject.DataObject | null = null;
+  private sharedContext: SharedContext = new SharedContext();
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, '%{public}s', 'Ability onCreate');
-    
+
     // 初始化分布式数据对象
     this.initDistributedObject();
   }
 
   onDestroy(): void {
     hilog.info(0x0000, TAG, '%{public}s', 'Ability onDestroy');
-    
+
     // 释放分布式对象
     if (this.distributedObject) {
-      this.distributedObject.stop();
+      this.distributedObject.off('change');
+      this.distributedObject = null;
     }
   }
 
@@ -53,52 +69,43 @@ export default class EntryAbility extends UIAbility {
    */
   private initDistributedObject(): void {
     try {
-      // 创建分布式数据对象
-      const object = distributedDataObject.create({
-        name: 'OpenHarmonyAgent_SharedContext',
-        context: this.context
-      });
-      
+      this.sharedContext.sessionId = distributedDataObject.genSessionId();
+      // 不用 udid / serial —— 它们需要 ohos.permission.sec.ACCESS_UDID（系统权限，应用申请不到）
+      this.sharedContext.deviceId = `${deviceInfo.productModel}-${deviceInfo.deviceType}`;
+      this.sharedContext.deviceType = deviceInfo.deviceType;
+      this.sharedContext.lastUpdateTime = Date.now();
+
+      const object = distributedDataObject.create(this.context, this.sharedContext);
       this.distributedObject = object;
-      
-      // 设置初始数据
-      object.sessionId = Date.now().toString();
-      object.deviceId = this.context.deviceInfo.id;
-      object.deviceType = this.context.deviceInfo.deviceType;
-      object.currentTask = '';
-      object.contextData = '{}';
-      
+
       // 监听分布式对象变化
-      object.on('change', (sessionId: string) => {
+      object.on('change', (sessionId: string, fields: Array<string>) => {
         hilog.info(0x0000, TAG, 'Distributed object changed, sessionId: %{public}s', sessionId);
-        // 处理跨设备数据同步
-        this.handleDistributedChange(object);
+        this.handleDistributedChange(fields);
       });
-      
+
       // 加入分布式会话
-      object.join('OpenHarmonyAgent_Session');
-      
+      object.setSessionId(this.sharedContext.sessionId);
+
       hilog.info(0x0000, TAG, 'Distributed object initialized successfully');
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to init distributed object: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to init distributed object: %{public}s', err.message);
     }
   }
 
   /**
    * 处理分布式数据变化
    */
-  private handleDistributedChange(object: distributedDataObject.DistributedObject): void {
+  private handleDistributedChange(fields: Array<string>): void {
     // 可以在这里处理跨设备任务流转逻辑
-    const currentTask = object.currentTask;
-    const contextData = object.contextData;
-    
-    hilog.info(0x0000, TAG, 'Task transferred: %{public}s', currentTask);
+    hilog.info(0x0000, TAG, 'Task transferred: %{public}s', this.sharedContext.currentTask);
   }
 
   /**
    * 获取分布式对象实例
    */
-  getDistributedObject(): distributedDataObject.DistributedObject | null {
+  getDistributedObject(): distributedDataObject.DataObject | null {
     return this.distributedObject;
   }
 }

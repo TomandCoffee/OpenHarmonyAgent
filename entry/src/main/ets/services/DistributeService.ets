@@ -1,112 +1,125 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { distributedDataObject } from '@kit.CoreFileKit';
-import { deviceManager } from '@kit.DeviceManagerKit';
+import { distributedDataObject } from '@kit.ArkData';
+import { distributedDeviceManager } from '@kit.DistributedServiceKit';
+import { common } from '@kit.AbilityKit';
 
 const TAG = 'DistributeService';
 
 /**
+ * 需要跨设备同步的任务上下文。
+ * 分布式数据对象的字段必须由显式声明的类承载。
+ */
+class TaskContext {
+  sessionId: string = '';
+  currentTask: string = '';
+  contextData: string = '{}';
+  targetDeviceId: string = '';
+  lastUpdateTime: number = 0;
+}
+
+/**
+ * 要流转的任务
+ */
+export interface TaskData {
+  type: string;
+  content: string;
+  context?: string;
+}
+
+/**
  * 分布式服务
  * 实现跨设备协同和任务流转
+ *
+ * 说明：使用 ArkData 的 distributedDataObject 做数据同步，
+ * 用 DistributedServiceKit 的 distributedDeviceManager 查询可信设备。
  */
 export class DistributeService {
-  private distributedObject: distributedDataObject.DistributedObject | null = null;
-  private connectedDevices: deviceManager.DeviceInfo[] = [];
+  private distributedObject: distributedDataObject.DataObject | null = null;
+  private taskContext: TaskContext = new TaskContext();
+  private deviceManager: distributedDeviceManager.DeviceManager | null = null;
+  private connectedDevices: distributedDeviceManager.DeviceBasicInfo[] = [];
   private isInitialized: boolean = false;
 
   /**
    * 初始化分布式服务
+   * @param context 应用上下文，分布式数据对象需要它来建立会话
    */
-  async initialize(): Promise<void> {
+  async initialize(context: common.Context): Promise<void> {
     if (this.isInitialized) {
       return;
     }
 
     try {
-      // 初始化设备管理器
-      await this.initDeviceManager();
-
-      // 创建分布式数据对象
-      await this.initDistributedObject();
+      await this.initDeviceManager(context);
+      await this.initDistributedObject(context);
 
       this.isInitialized = true;
       hilog.info(0x0000, TAG, 'DistributeService initialized');
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to initialize DistributeService: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to initialize DistributeService: %{public}s', err.message);
     }
   }
 
   /**
    * 初始化设备管理器
    */
-  private async initDeviceManager(): Promise<void> {
+  private async initDeviceManager(context: common.Context): Promise<void> {
     try {
-      // 订阅设备状态变化
-      deviceManager.on('deviceChange', (devices: deviceManager.DeviceInfo[]) => {
-        this.connectedDevices = devices;
-        hilog.info(0x0000, TAG, 'Devices changed: %{public}d', devices.length);
-        this.onDevicesChanged(devices);
-      });
+      this.deviceManager = distributedDeviceManager.createDeviceManager(context.applicationInfo.name);
+      this.connectedDevices = this.deviceManager.getAvailableDeviceListSync();
 
-      // 获取已连接设备
-      this.connectedDevices = deviceManager.getTrustedDeviceList();
-      
-      hilog.info(0x0000, TAG, 'Connected devices: %{public}d', this.connectedDevices.length);
+      hilog.info(0x0000, TAG, 'Available devices: %{public}d', this.connectedDevices.length);
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to init device manager: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to init device manager: %{public}s', err.message);
     }
   }
 
   /**
    * 初始化分布式数据对象
    */
-  private async initDistributedObject(): Promise<void> {
+  private async initDistributedObject(context: common.Context): Promise<void> {
     try {
-      this.distributedObject = distributedDataObject.create({
-        name: 'OpenHarmonyAgent_Context',
-        context: undefined as any // 需要传入 Ability context
+      this.taskContext.sessionId = distributedDataObject.genSessionId();
+      this.taskContext.lastUpdateTime = Date.now();
+
+      const object = distributedDataObject.create(context, this.taskContext);
+      this.distributedObject = object;
+
+      // 监听远端数据变化
+      object.on('change', (sessionId: string, fields: Array<string>) => {
+        this.handleContextChange(sessionId, fields);
       });
 
-      // 设置初始数据
-      this.distributedObject.currentTask = '';
-      this.distributedObject.contextData = '{}';
-      this.distributedObject.lastUpdateTime = Date.now();
-
-      // 监听变化
-      this.distributedObject.on('change', (sessionId: string) => {
-        this.handleContextChange(sessionId);
-      });
-
-      // 加入会话
-      this.distributedObject.join('OpenHarmonyAgent_Session');
+      // 加入分布式会话
+      await object.setSessionId(this.taskContext.sessionId);
 
       hilog.info(0x0000, TAG, 'Distributed object created');
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to create distributed object: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to create distributed object: %{public}s', err.message);
     }
   }
 
   /**
    * 处理上下文变化
    */
-  private handleContextChange(sessionId: string): void {
-    if (!this.distributedObject) return;
-
-    const currentTask = this.distributedObject.currentTask;
-    const contextData = this.distributedObject.contextData;
-
+  private handleContextChange(sessionId: string, fields: Array<string>): void {
     hilog.info(0x0000, TAG, 'Context changed from session: %{public}s', sessionId);
-    hilog.info(0x0000, TAG, 'Current task: %{public}s', currentTask);
+    hilog.info(0x0000, TAG, 'Current task: %{public}s', this.taskContext.currentTask);
 
-    // 触发上下文更新回调
-    this.onContextUpdated(currentTask, contextData);
+    this.onContextUpdated(this.taskContext.currentTask, this.taskContext.contextData);
   }
 
   /**
-   * 设备列表变化回调
+   * 刷新可信设备列表
    */
-  private onDevicesChanged(devices: deviceManager.DeviceInfo[]): void {
-    // 可以在这里更新 UI 显示可用设备
-    hilog.info(0x0000, TAG, 'Available devices updated');
+  refreshDevices(): distributedDeviceManager.DeviceBasicInfo[] {
+    if (this.deviceManager) {
+      this.connectedDevices = this.deviceManager.getAvailableDeviceListSync();
+    }
+    return this.connectedDevices;
   }
 
   /**
@@ -120,26 +133,22 @@ export class DistributeService {
   /**
    * 流转任务到另一设备
    */
-  async transferTask(taskData: {
-    type: string;
-    content: string;
-    context?: any;
-  }, targetDeviceId: string): Promise<boolean> {
+  async transferTask(taskData: TaskData, targetDeviceId: string): Promise<boolean> {
     if (!this.distributedObject) {
       return false;
     }
 
     try {
-      // 更新分布式对象
-      this.distributedObject.currentTask = JSON.stringify(taskData);
-      this.distributedObject.contextData = JSON.stringify(taskData.context || {});
-      this.distributedObject.lastUpdateTime = Date.now();
-      this.distributedObject.targetDeviceId = targetDeviceId;
+      this.taskContext.currentTask = JSON.stringify(taskData);
+      this.taskContext.contextData = taskData.context ?? '{}';
+      this.taskContext.targetDeviceId = targetDeviceId;
+      this.taskContext.lastUpdateTime = Date.now();
 
       hilog.info(0x0000, TAG, 'Task transferred to device: %{public}s', targetDeviceId);
       return true;
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to transfer task: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to transfer task: %{public}s', err.message);
       return false;
     }
   }
@@ -147,44 +156,46 @@ export class DistributeService {
   /**
    * 获取可用设备列表
    */
-  getAvailableDevices(): deviceManager.DeviceInfo[] {
+  getAvailableDevices(): distributedDeviceManager.DeviceBasicInfo[] {
     return this.connectedDevices;
   }
 
   /**
    * 同步上下文到所有设备
    */
-  async syncContext(contextData: any): Promise<void> {
+  async syncContext(contextData: string): Promise<void> {
     if (!this.distributedObject) {
       return;
     }
 
     try {
-      this.distributedObject.contextData = JSON.stringify(contextData);
-      this.distributedObject.lastUpdateTime = Date.now();
+      this.taskContext.contextData = contextData;
+      this.taskContext.lastUpdateTime = Date.now();
 
       hilog.info(0x0000, TAG, 'Context synced to all devices');
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to sync context: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to sync context: %{public}s', err.message);
     }
   }
 
   /**
    * 从另一设备接收任务
    */
-  async receiveTask(): Promise<any> {
+  async receiveTask(): Promise<TaskData | null> {
     if (!this.distributedObject) {
       return null;
     }
 
     try {
-      const taskData = this.distributedObject.currentTask;
+      const taskData: string = this.taskContext.currentTask;
       if (taskData) {
-        return JSON.parse(taskData);
+        return JSON.parse(taskData) as TaskData;
       }
       return null;
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to receive task: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to receive task: %{public}s', err.message);
       return null;
     }
   }
@@ -195,12 +206,20 @@ export class DistributeService {
   async cleanup(): Promise<void> {
     if (this.distributedObject) {
       try {
-        this.distributedObject.leave('OpenHarmonyAgent_Session');
-        this.distributedObject.stop();
+        // 传空字符串即退出当前会话
+        await this.distributedObject.setSessionId('');
+        this.distributedObject.off('change');
         this.distributedObject = null;
+
+        if (this.deviceManager) {
+          distributedDeviceManager.releaseDeviceManager(this.deviceManager);
+          this.deviceManager = null;
+        }
+
         hilog.info(0x0000, TAG, 'Distributed session cleaned up');
       } catch (error) {
-        hilog.error(0x0000, TAG, 'Failed to cleanup: %{public}s', JSON.stringify(error) ?? '');
+        const err = error as Error;
+        hilog.error(0x0000, TAG, 'Failed to cleanup: %{public}s', err.message);
       }
     }
   }

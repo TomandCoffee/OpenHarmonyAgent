@@ -3,6 +3,16 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const TAG = 'Settings';
 
+/**
+ * 设置项配置
+ */
+interface SettingItemConfig {
+  title: string;
+  subtitle?: string;
+  type: string;
+  key?: string;
+}
+
 @Entry
 @Component
 struct Settings {
@@ -109,7 +119,7 @@ struct Settings {
   Header() {
     Row() {
       Button() {
-        Image($r('sys.media.ohos_ic_public_back'))
+        Image($r('sys.media.ohos_ic_public_arrow_left'))
           .width(24)
           .height(24)
           .fillColor('#333333')
@@ -135,23 +145,23 @@ struct Settings {
   }
 
   @Builder
-  SettingSection(title: string, items: any[]) {
+  SettingSection(title: string, items: SettingItemConfig[]) {
     Column() {
       Text(title)
         .fontSize(14)
         .fontColor('#999999')
         .margin({ bottom: 8, left: 16 })
 
-      ForEach(items, (item: any) => {
+      ForEach(items, (item: SettingItemConfig) => {
         this.SettingItem(item)
-      }, (item: any) => item.title)
+      }, (item: SettingItemConfig) => item.title)
     }
     .width('100%')
     .margin({ bottom: 24 })
   }
 
   @Builder
-  SettingItem(item: any) {
+  SettingItem(item: SettingItemConfig) {
     Row() {
       Column() {
         Text(item.title)
@@ -171,11 +181,11 @@ struct Settings {
       if (item.type === 'toggle') {
         Toggle({
           type: ToggleType.Switch,
-          isOn: this[item.key]
+          isOn: this.getToggleValue(item.key ?? '')
         })
           .selectedColor('#007DFF')
           .onChange((isOn: boolean) => {
-            this[item.key] = isOn;
+            this.setToggleValue(item.key ?? '', isOn);
             hilog.info(0x0000, TAG, '%{public}s changed to %{public}s', item.title, isOn.toString());
           })
       } else if (item.type === 'info') {
@@ -217,5 +227,36 @@ struct Settings {
     .padding(16)
     .backgroundColor('#FFFFFF')
     .borderRadius(12)
+  }
+
+  /**
+   * 按配置项的 key 读取开关状态
+   * （ArkTS 不支持 this[动态属性名] 这种索引访问，只能显式枚举）
+   */
+  private getToggleValue(key: string): boolean {
+    switch (key) {
+      case 'voiceEnabled': return this.voiceEnabled;
+      case 'imageAnalysisEnabled': return this.imageAnalysisEnabled;
+      case 'crossDeviceEnabled': return this.crossDeviceEnabled;
+      case 'autoSaveKnowledge': return this.autoSaveKnowledge;
+      case 'darkMode': return this.darkMode;
+      case 'notificationEnabled': return this.notificationEnabled;
+      default: return false;
+    }
+  }
+
+  /**
+   * 按配置项的 key 写入开关状态
+   */
+  private setToggleValue(key: string, value: boolean): void {
+    switch (key) {
+      case 'voiceEnabled': this.voiceEnabled = value; break;
+      case 'imageAnalysisEnabled': this.imageAnalysisEnabled = value; break;
+      case 'crossDeviceEnabled': this.crossDeviceEnabled = value; break;
+      case 'autoSaveKnowledge': this.autoSaveKnowledge = value; break;
+      case 'darkMode': this.darkMode = value; break;
+      case 'notificationEnabled': this.notificationEnabled = value; break;
+      default: break;
+    }
   }
 }

@@ -7,6 +7,15 @@ import { DocumentAgent } from './DocumentAgent';
 const TAG = 'AgentService';
 
 /**
+ * 请求参数
+ */
+interface RequestParams {
+  text: string;
+  imageUrl?: string;
+  context?: Message[];
+}
+
+/**
  * 智能体编排服务
  * 负责任务分解、智能体调度和结果整合
  */
@@ -42,12 +51,10 @@ export class AgentService {
    * 处理用户请求
    * 自动识别意图并分发给相应的智能体
    */
-  async processRequest(params: {
-    text: string;
-    imageUrl?: string;
-    context?: Message[];
-  }): Promise<ProcessResult> {
-    const { text, imageUrl, context } = params;
+  async processRequest(params: RequestParams): Promise<ProcessResult> {
+    const text: string = params.text;
+    const imageUrl: string | undefined = params.imageUrl;
+    const context: Message[] | undefined = params.context;
 
     hilog.info(0x0000, TAG, 'Processing request: %{public}s', text);
 
@@ -134,11 +141,14 @@ export class AgentService {
 
     const results: ProcessResult[] = [];
 
-    // 并行执行多个智能体
-    const [docResult, scheduleResult] = await Promise.all([
-      this.documentAgent.handle(text, undefined, context).catch(() => null),
-      this.scheduleAgent.handle(text, context).catch(() => null)
-    ]);
+    // 并行执行多个智能体（两个 Promise 先同时创建，再依次 await）
+    const docPromise: Promise<ProcessResult | null> =
+      this.documentAgent.handle(text, undefined, context).catch(() => null);
+    const schedulePromise: Promise<ProcessResult | null> =
+      this.scheduleAgent.handle(text, context).catch(() => null);
+
+    const docResult: ProcessResult | null = await docPromise;
+    const scheduleResult: ProcessResult | null = await schedulePromise;
 
     if (docResult) results.push(docResult);
     if (scheduleResult) results.push(scheduleResult);

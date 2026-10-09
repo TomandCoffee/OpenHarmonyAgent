@@ -40,9 +40,8 @@ export struct ChatBubble {
     }
     .padding(12)
     .backgroundColor('#007DFF')
-    .borderRadius(16)
     .borderRadius({ topLeft: 16, topRight: 16, bottomLeft: 4, bottomRight: 16 })
-    .maxWidth('70%')
+    .constraintSize({ maxWidth: '70%' })
     .shadow({ radius: 2, color: '#20007DFF', offsetY: 1 })
   }
 
@@ -96,9 +95,8 @@ export struct ChatBubble {
       }
       .padding(12)
       .backgroundColor('#FFFFFF')
-      .borderRadius(16)
       .borderRadius({ topLeft: 4, topRight: 16, bottomLeft: 16, bottomRight: 16 })
-      .maxWidth('70%')
+      .constraintSize({ maxWidth: '70%' })
       .alignItems(HorizontalAlign.Start)
     }
   }

@@ -17,8 +17,9 @@ interface ImageInputProps {
  */
 @Component
 export struct ImageInput {
-  @Prop onImageSelected: (imagePath: string) => void;
-  @Prop onAnalyzeComplete?: (result: string) => void;
+  // 回调函数不能用 @Prop 装饰（ArkTS 限制），直接作为普通成员传入
+  onImageSelected: (imagePath: string) => void = () => {};
+  onAnalyzeComplete?: (result: string) => void;
 
   @State selectedImage: string = '';
   @State isAnalyzing: boolean = false;
@@ -54,7 +55,7 @@ export struct ImageInput {
     Column() {
       Button() {
         Column() {
-          Image($r('sys.media.ohos_ic_public_image'))
+          Image($r('sys.media.ohos_ic_public_albums'))
             .width(40)
             .height(40)
             .fillColor('#666666')

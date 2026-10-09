@@ -1,4 +1,5 @@
 {
+  "modelVersion": "5.0.0",
   "name": "openharmonyagent",
   "version": "1.0.0",
   "description": "OpenHarmony Agent - 鸿蒙原生智能多模态个人助理",
@@ -6,10 +7,7 @@
   "author": "",
   "license": "Apache-2.0",
   "dependencies": {
-    "@ohos/lpapi": "^1.0.0"
   },
   "devDependencies": {
-    "@ohos/hvigor-ohos-plugin": "^4.0.0",
-    "@ohos/hvigor": "^4.0.0"
   }
 }

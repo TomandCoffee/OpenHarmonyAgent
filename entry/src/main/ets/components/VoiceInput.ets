@@ -17,8 +17,9 @@ interface VoiceInputProps {
  */
 @Component
 export struct VoiceInput {
-  @Prop onResult: (text: string) => void;
-  @Prop onStatusChange?: (isRecording: boolean) => void;
+  // 回调函数不能用 @Prop 装饰（ArkTS 限制），直接作为普通成员传入
+  onResult: (text: string) => void = () => {};
+  onStatusChange?: (isRecording: boolean) => void;
   
   @State isRecording: boolean = false;
   @State recognizedText: string = '';
@@ -52,7 +53,7 @@ export struct VoiceInput {
         }
       } else {
         // 正常状态
-        Image($r('sys.media.ohos_ic_public_microphone'))
+        Image($r('sys.media.ohos_ic_public_voice'))
           .width(24)
           .height(24)
           .fillColor('#FFFFFF')
@@ -73,7 +74,7 @@ export struct VoiceInput {
 
   @Builder
   WaveAnimation() {
-    Row() {
+    Row({ space: 2 }) {
       ForEach([0, 1, 2, 3, 4], (index: number) => {
         Column()
           .width(3)
@@ -87,7 +88,6 @@ export struct VoiceInput {
           })
       })
     }
-    .gap(2)
   }
 
   /**
@@ -111,7 +111,7 @@ export struct VoiceInput {
         // 启动计时器
         this.recordingTimer = setInterval(() => {
           this.recordingTime++;
-        }, 1000) as any;
+        }, 1000);
 
         if (this.onStatusChange) {
           this.onStatusChange(true);

@@ -1,7 +1,7 @@
 import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VoiceInput } from '../components/VoiceInput';
-import { TextInput } from '../components/TextInput';
+import { ChatTextInput } from '../components/TextInput';
 import { ImageInput } from '../components/ImageInput';
 import { ChatBubble } from '../components/ChatBubble';
 import { Message, MessageType } from '../models/Message';
@@ -66,7 +66,7 @@ struct Index {
 
       // 知识库入口
       Button() {
-        Image($r('sys.media.ohos_ic_public_search'))
+        Image($r('sys.media.ohos_ic_public_search_filled'))
           .width(24)
           .height(24)
           .fillColor('#666666')
@@ -141,16 +141,15 @@ struct Index {
         })
 
         // 文本输入框
-        TextInput({ placeholder: '输入消息...', text: this.currentInput })
-          .layoutWeight(1)
-          .height(40)
-          .margin({ left: 8, right: 8 })
-          .backgroundColor('#F5F5F5')
-          .borderRadius(20)
-          .padding({ left: 16, right: 16 })
-          .onChange((value: string) => {
+        ChatTextInput({
+          placeholder: '输入消息...',
+          text: this.currentInput,
+          onChange: (value: string) => {
             this.currentInput = value;
-          })
+          }
+        })
+          .layoutWeight(1)
+          .margin({ left: 8, right: 8 })
 
         // 语音输入按钮
         VoiceInput({
@@ -163,7 +162,7 @@ struct Index {
         // 发送按钮
         if (this.currentInput || this.selectedImage) {
           Button() {
-            Image($r('sys.media.ohos_ic_public_send'))
+            Image($r('sys.media.ohos_ic_public_arrow_right'))
               .width(24)
               .height(24)
               .fillColor('#FFFFFF')
@@ -196,7 +195,7 @@ struct Index {
         .margin({ right: 8 })
 
       Button() {
-        Image($r('sys.media.ohos_ic_public_delete'))
+        Image($r('sys.media.ohos_ic_public_remove'))
           .width(20)
           .height(20)
           .fillColor('#FFFFFF')
@@ -220,7 +219,7 @@ struct Index {
       // 语音输入
       Column() {
         Button() {
-          Image($r('sys.media.ohos_ic_public_microphone'))
+          Image($r('sys.media.ohos_ic_public_voice'))
             .width(32)
             .height(32)
             .fillColor('#007DFF')
@@ -244,7 +243,7 @@ struct Index {
       // 图片输入
       Column() {
         Button() {
-          Image($r('sys.media.ohos_ic_public_image'))
+          Image($r('sys.media.ohos_ic_public_albums'))
             .width(32)
             .height(32)
             .fillColor('#52C41A')
@@ -268,7 +267,7 @@ struct Index {
       // 文档输入
       Column() {
         Button() {
-          Image($r('sys.media.ohos_ic_public_file'))
+          Image($r('sys.media.ohos_ic_public_text'))
             .width(32)
             .height(32)
             .fillColor('#722ED1')
@@ -346,8 +345,10 @@ struct Index {
       // 如果是知识相关的查询，更新 RAG 知识库
       if (response.needsKnowledgeUpdate) {
         await this.ragService.addKnowledge({
+          id: `kb_${Date.now()}`,
           content: inputText,
           type: 'conversation',
+          tags: ['对话'],
           timestamp: Date.now()
         });
       }

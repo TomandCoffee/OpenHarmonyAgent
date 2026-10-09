@@ -106,11 +106,11 @@ export class VoiceService {
   private async readAudioData(): Promise<void> {
     while (this.isRecording && this.audioCapturer) {
       try {
-        const buffer = new ArrayBuffer(2048);
-        const length = await this.audioCapturer.read(buffer);
+        // AudioCapturer.read(size, isBlockingRead) 返回 Promise<ArrayBuffer>
+        const buffer = await this.audioCapturer.read(2048, true);
 
-        if (length > 0) {
-          const view = new Int16Array(buffer, 0, length / 2);
+        if (buffer.byteLength > 0) {
+          const view = new Int16Array(buffer);
           this.audioData.push(...Array.from(view));
 
           // 实时识别（流式）

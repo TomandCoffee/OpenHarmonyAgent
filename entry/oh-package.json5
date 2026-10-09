@@ -6,7 +6,6 @@
   "author": "",
   "license": "Apache-2.0",
   "dependencies": {
-    "@ohos/lpapi": "^1.0.0"
   },
   "devDependencies": {}
 }

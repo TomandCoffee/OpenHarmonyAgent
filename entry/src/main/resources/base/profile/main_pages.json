@@ -3,7 +3,6 @@
     "pages/Index",
     "pages/KnowledgeBase",
     "pages/Agents",
-    "pages/Settings",
-    "pages/ChatDetail"
+    "pages/Settings"
   ]
 }

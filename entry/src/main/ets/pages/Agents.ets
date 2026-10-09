@@ -49,7 +49,7 @@ struct Agents {
   Header() {
     Row() {
       Button() {
-        Image($r('sys.media.ohos_ic_public_back'))
+        Image($r('sys.media.ohos_ic_public_arrow_left'))
           .width(24)
           .height(24)
           .fillColor('#333333')

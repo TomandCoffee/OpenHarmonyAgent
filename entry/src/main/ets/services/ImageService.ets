@@ -4,6 +4,35 @@ import { ImageAnalysisResult } from '../models/Message';
 const TAG = 'ImageService';
 
 /**
+ * 图像分类结果
+ */
+interface ClassificationResult {
+  description: string;
+  tags: string[];
+}
+
+/**
+ * 裁剪区域
+ */
+interface CropRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * 模拟耗时（ArkTS 不允许把 Promise 的类型参数留给推导）
+ */
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve: () => void) => {
+    setTimeout(() => {
+      resolve();
+    }, ms);
+  });
+}
+
+/**
  * 图像分析服务
  * 支持 OCR 文字识别和图像内容分析
  */
@@ -51,7 +80,7 @@ export class ImageService {
       };
     } catch (error) {
       hilog.error(0x0000, TAG, 'Failed to analyze image: %{public}s', JSON.stringify(error) ?? '');
-      throw error;
+      throw error as Error;
     }
   }
 
@@ -63,7 +92,7 @@ export class ImageService {
     // 实际应该调用鸿蒙 ML Kit 的 OCR 能力
 
     // 模拟延迟
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await delay(500);
 
     return `这是从图片中识别出的文字内容：
     
@@ -80,11 +109,11 @@ export class ImageService {
   /**
    * 图像分类
    */
-  private async classifyImage(imagePath: string): Promise<{ description: string; tags: string[] }> {
+  private async classifyImage(imagePath: string): Promise<ClassificationResult> {
     // 模拟图像分类
     // 实际应该调用图像分类模型
 
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await delay(300);
 
     return {
       description: '文档图片',
@@ -99,7 +128,7 @@ export class ImageService {
     // 模拟物体检测
     // 实际应该调用物体检测模型
 
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await delay(300);
 
     return ['文档', '文字区域', '表格'];
   }
@@ -133,7 +162,7 @@ export class ImageService {
   /**
    * 裁剪图像
    */
-  async cropImage(imagePath: string, rect: { x: number; y: number; width: number; height: number }): Promise<string> {
+  async cropImage(imagePath: string, rect: CropRect): Promise<string> {
     // 图像裁剪逻辑
     // 返回裁剪后的路径
     return imagePath;
