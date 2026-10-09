@@ -262,6 +262,14 @@ export class TTSService {
       this.stop();
     }
 
+    // 无论如何都要推进会话代号。
+    //
+    // 引擎会拒绝重复的 requestId（错误码 40003 "requestId is empty or repeated"），
+    // 而上一条播完时 speaking 已经是 false、不会走 stop()，代号不变的话
+    // 这次就会发出和上一轮完全相同的 requestId —— 表现为「第一遍能念，
+    // 之后再点就没声音」。所以推进动作必须在这里，不能只放在 stop() 里。
+    this.epoch++;
+
     this.currentTag = tag;
     this.queue = TTSService.split(plain, MAX_SEGMENT_CHARS);
     this.cursor = 0;
