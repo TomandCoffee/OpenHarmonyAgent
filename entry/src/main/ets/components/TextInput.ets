@@ -18,11 +18,12 @@ interface TextInputProps {
  * 支持多行输入、快捷短语
  */
 @Component
-export struct TextInput {
+export struct ChatTextInput {
   @Prop placeholder: string = '输入消息...';
-  @Prop text: string;
-  @Prop onChange: (value: string) => void;
-  @Prop onSubmit?: () => void;
+  @Prop text: string = '';
+  // 回调函数不能用 @Prop 装饰（ArkTS 限制），直接作为普通成员传入
+  onChange: (value: string) => void = () => {};
+  onSubmit?: () => void;
   @Prop maxLength: number = 1000;
 
   @State isFocused: boolean = false;

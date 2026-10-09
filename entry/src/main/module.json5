@@ -59,12 +59,15 @@
         }
       },
       {
-        "name": "ohos.permission.DISTRIBUTED_SOFTBUSINESS",
+        "name": "ohos.permission.DISTRIBUTED_DATASYNC",
         "reason": "$string:permission_distributed_reason",
         "usedScene": {
           "abilities": ["EntryAbility"],
           "when": "always"
         }
+      },
+      {
+        "name": "ohos.permission.INTERNET"
       }
     ],
     "extensionAbilities": [

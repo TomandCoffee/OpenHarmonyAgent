@@ -2,6 +2,7 @@ import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { RAGService } from '../services/RAGService';
 import { KnowledgeItem } from '../models/Message';
+import { toPreview } from '../utils/TextFormat';
 
 const TAG = 'KnowledgeBase';
 
@@ -13,7 +14,7 @@ struct KnowledgeBase {
   @State isSearching: boolean = false;
   @State showAddDialog: boolean = false;
   
-  private ragService: RAGService = new RAGService();
+  private ragService: RAGService = RAGService.getInstance();
 
   aboutToAppear(): void {
     this.ragService.initialize();
@@ -43,7 +44,7 @@ struct KnowledgeBase {
   Header() {
     Row() {
       Button() {
-        Image($r('sys.media.ohos_ic_public_back'))
+        Image($r('sys.media.ohos_ic_public_arrow_left'))
           .width(24)
           .height(24)
           .fillColor('#333333')
@@ -76,7 +77,7 @@ struct KnowledgeBase {
   @Builder
   SearchBar() {
     Row() {
-      Image($r('sys.media.ohos_ic_public_search'))
+      Image($r('sys.media.ohos_ic_public_search_filled'))
         .width(20)
         .height(20)
         .fillColor('#999999')
@@ -183,7 +184,7 @@ struct KnowledgeBase {
 
         // 内容
         Column() {
-          Text(item.content.substring(0, 50) + (item.content.length > 50 ? '...' : ''))
+          Text(toPreview(item.content, 50))
             .fontSize(15)
             .fontColor('#333333')
             .lineHeight(22)
@@ -210,7 +211,7 @@ struct KnowledgeBase {
 
         // 删除按钮
         Button() {
-          Image($r('sys.media.ohos_ic_public_delete'))
+          Image($r('sys.media.ohos_ic_public_remove'))
             .width(18)
             .height(18)
             .fillColor('#FF4D4F')
@@ -250,24 +251,8 @@ struct KnowledgeBase {
   }
 
   private async loadKnowledgeItems(): Promise<void> {
-    // 从 RAG 服务加载知识
-    // 实际实现需要查询所有知识
-    this.knowledgeItems = [
-      {
-        id: '1',
-        content: '机器学习是人工智能的一个分支，它使计算机能够从数据中学习而不需要显式编程。',
-        type: '学习笔记',
-        tags: ['AI', '机器学习'],
-        timestamp: Date.now() - 86400000
-      },
-      {
-        id: '2',
-        content: '会议纪要：项目进度评审会，确定了下阶段的开发计划和里程碑。',
-        type: '会议纪要',
-        tags: ['工作', '会议'],
-        timestamp: Date.now() - 172800000
-      }
-    ];
+    // 从 RAG 服务读取当前知识库内容
+    this.knowledgeItems = this.ragService.getAllKnowledge();
   }
 
   private async performSearch(): Promise<void> {

@@ -1,4 +1,8 @@
 import { Message, MessageType } from '../models/Message';
+import { stripMarkdown } from '../utils/TextFormat';
+import { TTSService } from '../services/TTSService';
+import { Capability } from '../utils/Capability';
+import { promptAction } from '@kit.ArkUI';
 
 /**
  * 对话气泡组件属性
@@ -13,7 +17,50 @@ interface ChatBubbleProps {
  */
 @Component
 export struct ChatBubble {
-  @Prop message: Message;
+  // @ObjectLink 配合 Message 的 @Observed：流式时只改 message.content
+  // 就能让这一个气泡重绘，列表其他部分不参与 diff
+  @ObjectLink message: Message;
+  /** 本条消息是否正在被朗读 */
+  @State isSpeaking: boolean = false;
+
+  private ttsListener = (speaking: boolean, tag: string): void => {
+    this.isSpeaking = speaking && tag === this.message.id;
+  };
+
+  aboutToAppear(): void {
+    TTSService.getInstance().addStateListener(this.ttsListener);
+  }
+
+  aboutToDisappear(): void {
+    TTSService.getInstance().removeStateListener(this.ttsListener);
+  }
+
+  /**
+   * 朗读入口的显示条件：设备支持 + 消息已生成完 + 有内容 + 不是用户自己发的
+   */
+  private canSpeak(): boolean {
+    return Capability.canUseTts()
+      && this.message.type === MessageType.AGENT
+      && !this.message.isStreaming
+      && this.message.content.trim().length > 0;
+  }
+
+  /**
+   * 消息上的喇叭：单击即从头朗读这条。
+   *
+   * 刻意不做成「正在念就停」的切换 —— 停止与静音统一由首页右上角的开关负责，
+   * 这里的语义只有一个：读这条。正在念别的（或念的就是这条）都会被打断重来。
+   */
+  private readAloud(): void {
+    const tts: TTSService = TTSService.getInstance();
+
+    if (tts.isMuted()) {
+      promptAction.showToast({ message: '已静音，可在右上角开启' });
+      return;
+    }
+
+    tts.speak(this.message.content, this.message.id);
+  }
 
   build() {
     Row() {
@@ -40,43 +87,42 @@ export struct ChatBubble {
     }
     .padding(12)
     .backgroundColor('#007DFF')
-    .borderRadius(16)
     .borderRadius({ topLeft: 16, topRight: 16, bottomLeft: 4, bottomRight: 16 })
-    .maxWidth('70%')
+    .constraintSize({ maxWidth: '70%' })
     .shadow({ radius: 2, color: '#20007DFF', offsetY: 1 })
   }
 
   @Builder
   AgentBubble() {
     Row() {
-      // 头像
+      // 头像：去掉智能体之后统一用一个中性图标
       Column() {
-        Text(this.getAgentIcon())
+        Text('🤖')
           .fontSize(24)
       }
       .width(36)
       .height(36)
-      .backgroundColor(this.getAgentColor())
+      .backgroundColor('#F0F0F0')
       .borderRadius(18)
       .justifyContent(FlexAlign.Center)
       .margin({ right: 8 })
 
       // 消息内容
       Column() {
-        // 发送者名称
-        if (this.message.agentName) {
-          Text(this.message.agentName)
-            .fontSize(12)
-            .fontColor('#999999')
-            .margin({ bottom: 4 })
+        // 消息文本（流式时末尾跟一个光标）
+        //
+        // 光标用 Span 而不是外面再包一层 Row —— 包 Row 就得给 Row 设
+        // width('100%')，而百分比是相对外层容器算的，会直接撑破
+        // Column 上的 constraintSize({maxWidth:'70%'})，表现为文字溢出气泡背景。
+        // 放进同一个 Text 里，换行和宽度都由 Text 自己算，不会出这个问题。
+        Text() {
+          Span(this.formatContent(this.message.content))
+          Span(this.message.isStreaming ? '▍' : '')
+            .fontColor('#007DFF')
         }
-
-        // 消息文本
-        Text(this.formatContent(this.message.content))
-          .fontSize(15)
-          .fontColor('#333333')
-          .lineHeight(22)
-          .width('100%')
+        .fontSize(15)
+        .fontColor('#333333')
+        .lineHeight(22)
 
         // 图片（如果有）
         if (this.message.imageUrl) {
@@ -88,61 +134,50 @@ export struct ChatBubble {
             .margin({ top: 8 })
         }
 
-        // 时间戳
-        Text(this.formatTime(this.message.timestamp))
-          .fontSize(11)
-          .fontColor('#999999')
-          .margin({ top: 4 })
+        // 时间戳 + 朗读按钮
+        Row() {
+          Text(this.formatTime(this.message.timestamp))
+            .fontSize(11)
+            .fontColor('#999999')
+
+          // 朗读只对已生成完的助手消息开放：流式进行中内容还在变，
+          // 念出来必然和最终结果对不上
+          if (this.canSpeak()) {
+            Button() {
+              // 图标不换成 sound_off —— 这个按钮没有「停止」语义，
+              // 播报中只是把图标染蓝作为反馈
+              Image($r('sys.media.ohos_ic_public_sound'))
+                .width(16)
+                .height(16)
+                .fillColor(this.isSpeaking ? '#007DFF' : '#999999')
+            }
+            .type(ButtonType.Circle)
+            .backgroundColor('transparent')
+            .padding(0)
+            .margin({ left: 10 })
+            .onClick(() => {
+              this.readAloud();
+            })
+          }
+        }
+        .margin({ top: 4 })
       }
       .padding(12)
       .backgroundColor('#FFFFFF')
-      .borderRadius(16)
       .borderRadius({ topLeft: 4, topRight: 16, bottomLeft: 16, bottomRight: 16 })
-      .maxWidth('70%')
+      .constraintSize({ maxWidth: '70%' })
       .alignItems(HorizontalAlign.Start)
     }
   }
 
   /**
-   * 获取智能体图标
-   */
-  private getAgentIcon(): string {
-    switch (this.message.agentName) {
-      case '学习助手':
-        return '📚';
-      case '日程管家':
-        return '📅';
-      case '文档处理':
-        return '📄';
-      default:
-        return '🤖';
-    }
-  }
-
-  /**
-   * 获取智能体颜色
-   */
-  private getAgentColor(): string {
-    switch (this.message.agentName) {
-      case '学习助手':
-        return '#E6F4FF';
-      case '日程管家':
-        return '#E6F7E6';
-      case '文档处理':
-        return '#F3E5F5';
-      default:
-        return '#F0F0F0';
-    }
-  }
-
-  /**
-   * 格式化内容（支持简单的 Markdown）
+   * 格式化内容（剥掉模型输出的轻量 Markdown）
+   *
+   * 聊天界面只渲染纯文本，所以这里把标记去掉而不是真去渲染富文本 ——
+   * 为演示引入富文本渲染器不划算。
    */
   private formatContent(content: string): string {
-    // 简单的格式化，实际可以使用富文本
-    return content
-      .replace(/\*\*(.*?)\*\*/g, '$1') // 粗体
-      .replace(/•/g, '•'); // 列表项
+    return stripMarkdown(content);
   }
 
   /**

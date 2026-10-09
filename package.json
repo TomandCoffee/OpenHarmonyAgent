@@ -16,11 +16,11 @@
     "多模态",
     "智能助理"
   ],
-  "author": "Tom1224134426",
+  "author": "TomandCoffee",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Tom1224134426/OpenHarmonyAgent.git"
+    "url": "https://github.com/TomandCoffee/OpenHarmonyAgent.git"
   },
   "devDependencies": {
     "@ohos/hvigor-ohos-plugin": "^4.0.0"
