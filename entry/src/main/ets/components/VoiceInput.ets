@@ -1,4 +1,5 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { common } from '@kit.AbilityKit';
 import { VoiceService } from '../services/VoiceService';
 
 const TAG = 'VoiceInput';
@@ -25,10 +26,12 @@ export struct VoiceInput {
   @State recognizedText: string = '';
   @State recordingTime: number = 0;
   
-  private voiceService: VoiceService = new VoiceService();
+  private voiceService: VoiceService = VoiceService.getInstance();
   private recordingTimer: number = -1;
 
   aboutToAppear(): void {
+    // 提前把引擎建起来，首次按住说话时就不用等初始化
+    // （initialize 内部做了并发保护，这里和 startRecording 里重复调用是安全的）
     this.voiceService.initialize();
   }
 
@@ -36,6 +39,12 @@ export struct VoiceInput {
     if (this.isRecording) {
       this.stopRecording();
     }
+    if (this.recordingTimer !== -1) {
+      clearInterval(this.recordingTimer);
+      this.recordingTimer = -1;
+    }
+    // 注意：这里不释放引擎 —— VoiceService 是全局单例，引擎跟着应用生命周期走。
+    // 每次切页面都 shutdown 重建反而更慢，也更容易和 ASR 系统服务抢实例。
   }
 
   build() {
@@ -98,16 +107,25 @@ export struct VoiceInput {
       return;
     }
 
+    // 麦克风是敏感权限，必须在运行时弹窗申请 —— 光在 module.json5 里声明拿不到
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    const granted: boolean = await this.voiceService.ensureMicrophonePermission(context);
+    if (!granted) {
+      hilog.warn(0x0000, TAG, 'microphone permission not granted');
+      return;
+    }
+
     try {
-      const success = await this.voiceService.startRecording((result) => {
-        this.recognizedText = result.text;
+      const success = await this.voiceService.startRecording((text: string, isFinal: boolean) => {
+        // 中间结果也实时上屏，说话的时候就能看到字往外冒
+        this.recognizedText = text;
       });
 
       if (success) {
         this.isRecording = true;
         this.recordingTime = 0;
         this.recognizedText = '';
-        
+
         // 启动计时器
         this.recordingTimer = setInterval(() => {
           this.recordingTime++;
@@ -120,7 +138,8 @@ export struct VoiceInput {
         hilog.info(0x0000, TAG, 'Recording started');
       }
     } catch (error) {
-      hilog.error(0x0000, TAG, 'Failed to start recording: %{public}s', JSON.stringify(error) ?? '');
+      const err = error as Error;
+      hilog.error(0x0000, TAG, 'Failed to start recording: %{public}s', err.message);
     }
   }
 

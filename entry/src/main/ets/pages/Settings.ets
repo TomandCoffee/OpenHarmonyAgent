@@ -2,6 +2,7 @@ import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LLMService } from '../services/LLMService';
 import { ApiKeyStore } from '../services/ApiKeyStore';
+import { VoiceService, VoiceProbeResult } from '../services/VoiceService';
 
 const TAG = 'Settings';
 
@@ -32,6 +33,11 @@ struct Settings {
   @State keyTestOk: boolean = false;
   @State isTestingKey: boolean = false;
 
+  // 语音自检
+  @State voiceProbeResult: string = '';
+  @State voiceProbeOk: boolean = false;
+  @State isProbingVoice: boolean = false;
+
   aboutToAppear(): void {
     const store: ApiKeyStore = ApiKeyStore.getInstance();
     this.savedKeyMask = store.hasKey() ? store.maskKey() : '';
@@ -47,6 +53,9 @@ struct Settings {
         Column() {
           // 模型设置（放最前，这是整个应用能否工作的前提）
           this.ModelSettingsSection()
+
+          // 语音能力自检
+          this.VoiceCheckSection()
 
           // 功能设置
           this.SettingSection('功能设置', [
@@ -244,6 +253,92 @@ struct Settings {
     .padding(16)
     .backgroundColor('#FFFFFF')
     .borderRadius(12)
+  }
+
+  /**
+   * 语音能力自检
+   *
+   * 离线语音识别依赖设备上预装的中文语言包，这个没法从代码推断，
+   * 只能实际建一次引擎才知道。所以这里做成一个可点的自检。
+   */
+  @Builder
+  VoiceCheckSection() {
+    Column() {
+      Text('语音识别')
+        .fontSize(14)
+        .fontColor('#999999')
+        .margin({ bottom: 8, left: 16 })
+
+      Column() {
+        Row() {
+          Text('系统语音引擎')
+            .fontSize(16)
+            .fontColor('#333333')
+
+          Blank()
+
+          Text(this.voiceProbeResult.length > 0
+            ? (this.voiceProbeOk ? '可用' : '不可用')
+            : '未检测')
+            .fontSize(13)
+            .fontColor(this.voiceProbeResult.length === 0 ? '#999999'
+              : (this.voiceProbeOk ? '#52C41A' : '#FF4D4F'))
+        }
+        .width('100%')
+
+        Text('使用系统自带的 Core Speech Kit，不需要第三方服务')
+          .fontSize(13)
+          .fontColor('#999999')
+          .width('100%')
+          .margin({ top: 4 })
+
+        Button(this.isProbingVoice ? '检测中…' : '检测语音引擎')
+          .fontSize(14)
+          .enabled(!this.isProbingVoice)
+          .margin({ top: 12 })
+          .onClick(() => {
+            this.runVoiceProbe();
+          })
+
+        if (this.voiceProbeResult.length > 0) {
+          Text(this.voiceProbeResult)
+            .fontSize(13)
+            .fontColor(this.voiceProbeOk ? '#52C41A' : '#FF4D4F')
+            .width('100%')
+            .margin({ top: 8 })
+        }
+      }
+      .padding(16)
+      .backgroundColor('#FFFFFF')
+      .borderRadius(12)
+    }
+    .width('100%')
+    .margin({ bottom: 24 })
+  }
+
+  private async runVoiceProbe(): Promise<void> {
+    this.isProbingVoice = true;
+    this.voiceProbeResult = '';
+    try {
+      const probe = VoiceService.getInstance();
+      const result: VoiceProbeResult = await probe.probe();
+
+      if (result.offlineOk) {
+        this.voiceProbeOk = true;
+        this.voiceProbeResult = '离线识别可用（推荐，不依赖网络）';
+      } else if (result.onlineOk) {
+        this.voiceProbeOk = true;
+        this.voiceProbeResult = '仅在线识别可用（需要联网）';
+      } else {
+        this.voiceProbeOk = false;
+        this.voiceProbeResult = `两种模式都不可用：\n${result.detail}`;
+      }
+    } catch (error) {
+      const err = error as Error;
+      this.voiceProbeOk = false;
+      this.voiceProbeResult = `检测失败：${err.message}`;
+    }
+    this.isProbingVoice = false;
   }
 
   /**
