@@ -104,14 +104,34 @@ struct Settings {
    * 如果当前选中的音色在这个语言下不存在（比如从中文切到英文），自动落到第一个。
    */
   private async loadVoices(): Promise<void> {
-    const all: textToSpeech.VoiceInfo[] =
-      await TTSService.getInstance().listVoicesFor(this.speakLang);
+    const tts: TTSService = TTSService.getInstance();
+    let all: textToSpeech.VoiceInfo[] = await tts.listVoicesFor(this.speakLang);
 
+    // 自愈：存盘的语言可能是本机播不了的 —— 历史遗留的坏设置，或者用户把语音
+    // 资源卸了。不修的话朗读永远没声音、音色列表永远是空的，界面上还看不出原因。
+    if (all.length === 0) {
+      for (const option of LANGUAGE_OPTIONS) {
+        if (sameLanguage(option.code, this.speakLang)) {
+          continue;
+        }
+        const other: textToSpeech.VoiceInfo[] = await tts.listVoicesFor(option.code);
+        if (other.length > 0) {
+          hilog.warn(0x0000, TAG, 'speak language %{public}s unusable, fall back to %{public}s',
+            this.speakLang, option.code);
+          this.speakLang = option.code;
+          this.speakPerson = 0;
+          await SettingsStore.getInstance().setSpeakVoice(option.code, 0);
+          tts.setVoice(option.code, 0);
+          all = other;
+          break;
+        }
+      }
+    }
+
+    // listVoicesFor 已经按语言筛过了，这里只需要转成界面用的结构
     const opts: VoiceOption[] = [];
     for (const v of all) {
-      if (sameLanguage(v.language, this.speakLang)) {
-        opts.push({ person: v.person, label: voiceLabel(v.gender, v.person) });
-      }
+      opts.push({ person: v.person, label: voiceLabel(v.gender, v.person) });
     }
     this.voiceOptions = opts;
 
@@ -487,9 +507,11 @@ struct Settings {
         Blank()
 
         if (this.voiceOptions.length === 0) {
-          Text('未查到')
+          // 走到这里说明所有语言都试过了、一个能用的音色都没有 ——
+          // 不是「还没查」，是设备确实没有装好的语音资源
+          Text('本机无可用音色')
             .fontSize(13)
-            .fontColor('#999999')
+            .fontColor('#FF4D4F')
         }
       }
       .width('100%')
@@ -517,7 +539,7 @@ struct Settings {
     .padding({ top: 8, bottom: 8 })
   }
 
-  private pickLanguage(which: string, code: string): void {
+  private async pickLanguage(which: string, code: string): Promise<void> {
     const store: SettingsStore = SettingsStore.getInstance();
 
     if (which === 'recognize') {
@@ -529,9 +551,26 @@ struct Settings {
     }
 
     if (which === 'speak') {
+      const tts: TTSService = TTSService.getInstance();
+
+      // 先验证本机能不能用这个语言播报，**能播才存**。
+      //
+      // 设备的语音资源是按音色单独下载的：实测这台平板的英文音色 status 是 GA
+      // （资源没装），拿它建引擎直接失败。一旦存进去，朗读会彻底没声音、音色列表
+      // 也是空的，而界面上完全看不出原因 —— 用户只会觉得「按钮坏了」。
+      const voices: textToSpeech.VoiceInfo[] = await tts.listVoicesFor(code);
+      if (voices.length === 0) {
+        // 探测本身会把服务的语言改成 code（initialize 先 release 再赋值），
+        // 失败时得还原，否则内存状态和存盘状态对不上
+        tts.setVoice(this.speakLang, this.speakPerson);
+        promptAction.showToast({ message: '本机没有这个语言的语音资源，保持原设置' });
+        hilog.warn(0x0000, TAG, 'speak language %{public}s has no usable voice', code);
+        return;
+      }
+
       this.speakLang = code;
       store.setSpeakVoice(code, this.speakPerson);
-      TTSService.getInstance().setVoice(code, this.speakPerson);
+      tts.setVoice(code, this.speakPerson);
       // 音色是按语言分的，切换语言后要重新查；当前音色在新语言下不存在会自动落到第一个
       this.loadVoices();
       return;

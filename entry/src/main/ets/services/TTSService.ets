@@ -353,22 +353,39 @@ export class TTSService {
   }
 
   /**
-   * 查指定语言下可用的音色。
+   * 查指定语言下**本机装了资源**的音色。
    *
    * 先确保引擎按这个语言建起来再查 —— 否则 listVoices 返回空
    * （引擎没初始化时会直接抛，这里也不会有结果）。
+   *
+   * 返回空数组有一个重要含义：**这个语言在本机播不了**。设置页据此拒绝切换语言，
+   * 所以这里不能把别的语言的音色混进来。
    */
   async listVoicesFor(language: string): Promise<textToSpeech.VoiceInfo[]> {
     const ok: boolean = await this.initialize(language, this.person);
     if (!ok) {
-      hilog.warn(0x0000, TAG, 'cannot list voices: engine not ready');
+      hilog.warn(0x0000, TAG, 'engine not ready for %{public}s, no voice available', language);
       return [];
     }
-    return await this.listVoices();
+    const all: textToSpeech.VoiceInfo[] = await this.listVoices();
+    const matched: textToSpeech.VoiceInfo[] = [];
+    for (const v of all) {
+      if (TTSService.sameLanguage(v.language, language)) {
+        matched.push(v);
+      }
+    }
+    return matched;
   }
 
   /**
-   * 查设备支持哪些语言和音色 —— 设置页用它来填下拉选项
+   * 语言码归一化比对：引擎返回 zh_CN，我们存的是 zh-CN
+   */
+  private static sameLanguage(a: string, b: string): boolean {
+    return a.replace(/_/g, '-').toLowerCase() === b.replace(/_/g, '-').toLowerCase();
+  }
+
+  /**
+   * 查设备声明的全部音色（已剔除资源未下载的）
    */
   async listVoices(): Promise<textToSpeech.VoiceInfo[]> {
     const engine: textToSpeech.TextToSpeechEngine | null = this.engine;
@@ -377,12 +394,38 @@ export class TTSService {
     }
     try {
       const query: textToSpeech.VoiceQuery = { requestId: `query_${Date.now()}`, online: 1 };
-      return await engine.listVoices(query);
+      return TTSService.installedOnly(await engine.listVoices(query));
     } catch (error) {
       const err = error as BusinessError;
       hilog.warn(0x0000, TAG, 'listVoices failed: code=%{public}d', err.code);
       return [];
     }
+  }
+
+  /**
+   * 剔除资源没下载的音色。
+   *
+   * listVoices() 返回的是引擎**支持**的音色，不是本机**装了资源**的音色。
+   * 区分靠 status 字段，实测同一台 MatePad 11.5"S 上：
+   *
+   *   中文 聆小珊女声  status=INSTALLED  → 引擎建得起来，正常播报
+   *   中文 凌飞哲男声  status=GA         → 1002300005 Invalid relative path
+   *   英文 voice      status=GA         → 1002300003 person not support
+   *
+   * 把 GA 的也列出来，用户选中就必然踩坑（issue #9）。
+   * status 是可选字段，取不到时保守放行，别把能用的音色误杀。
+   */
+  private static installedOnly(voices: textToSpeech.VoiceInfo[]): textToSpeech.VoiceInfo[] {
+    const usable: textToSpeech.VoiceInfo[] = [];
+    for (const v of voices) {
+      const s: string = v.status ?? '';
+      if (s === '' || s === 'INSTALLED') {
+        usable.push(v);
+      } else {
+        hilog.info(0x0000, TAG, 'skip voice person=%{public}d (status=%{public}s)', v.person, s);
+      }
+    }
+    return usable;
   }
 
   /**
