@@ -115,9 +115,33 @@ export class VoiceService {
   }
 
   private async tryCreateEngine(online: number): Promise<boolean> {
+    return await this.tryCreateEngineWith(this.currentLanguage(), online);
+  }
+
+  /**
+   * 探测某个语言在本机能不能做语音识别。不落盘、不改设置，纯粹试一次。
+   *
+   * 和 TTS 是同一个道理：设备的语音资源**按语言**安装，能不能用只能实际建一次
+   * 引擎才知道。实测这台 MatePad 只装了中文离线识别资源 —— 把识别语言设成英文后
+   * `createEngine` 报 `1002200001 Asr CreateEngineParams is wrong`，
+   * 表现为**麦克风按钮按下去毫无反应**（长按有动画，但一个字都识别不出来），
+   * 而界面上完全看不出原因。所以存语言之前必须先探测。
+   *
+   * 离线或在线任一条能建起来就算可用。
+   */
+  async canRecognize(language: string): Promise<boolean> {
+    // 先释放当前引擎 —— ASR 是系统服务，全局只允许一个实例
+    this.release();
+    if (await this.tryCreateEngineWith(language, 1)) {
+      return true;
+    }
+    return await this.tryCreateEngineWith(language, 0);
+  }
+
+  private async tryCreateEngineWith(language: string, online: number): Promise<boolean> {
     try {
       const params: speechRecognizer.CreateEngineParams = {
-        language: this.currentLanguage(),
+        language: language,
         online: online
       };
       const engine: speechRecognizer.SpeechRecognitionEngine =
@@ -126,8 +150,9 @@ export class VoiceService {
       return true;
     } catch (error) {
       const err = error as BusinessError;
-      hilog.warn(0x0000, TAG, 'createEngine(online=%{public}d) failed: code=%{public}d, msg=%{public}s',
-        online, err.code, err.message);
+      hilog.warn(0x0000, TAG,
+        'createEngine(%{public}s, online=%{public}d) failed: code=%{public}d, msg=%{public}s',
+        language, online, err.code, err.message);
       return false;
     }
   }
