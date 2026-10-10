@@ -146,6 +146,37 @@ struct Settings {
 
     // 查当前语言下有哪些音色可选
     this.loadVoices();
+
+    // 识别语言也要自愈，理由见方法注释
+    this.healRecognizeLanguage();
+  }
+
+  /**
+   * 自愈：存盘的识别语言可能是本机做不到的 —— 历史坏数据，或者用户卸载了语言包。
+   *
+   * 不修的话麦克风「按下去有动画、却一个字都识别不出来」，界面上完全看不出原因。
+   * 和播报语言的自愈是同一个道理，只是那边查的是音色列表、这边要真建一次引擎。
+   */
+  private async healRecognizeLanguage(): Promise<void> {
+    const voice: VoiceService = VoiceService.getInstance();
+
+    if (await voice.canRecognize(this.recognizeLang)) {
+      return;
+    }
+
+    for (const option of LANGUAGE_OPTIONS) {
+      if (option.code === this.recognizeLang) {
+        continue;
+      }
+      if (await voice.canRecognize(option.code)) {
+        hilog.warn(0x0000, TAG, 'recognize language %{public}s unusable, fall back to %{public}s',
+          this.recognizeLang, option.code);
+        this.recognizeLang = option.code;
+        await SettingsStore.getInstance().setRecognizeLanguage(option.code);
+        voice.invalidateEngine();
+        return;
+      }
+    }
   }
 
   /**
@@ -578,10 +609,21 @@ struct Settings {
     const store: SettingsStore = SettingsStore.getInstance();
 
     if (which === 'recognize') {
+      const voice: VoiceService = VoiceService.getInstance();
+
+      // 和播报语言同一个道理：设备的语音资源是按语言装的，存之前必须先试。
+      // 选了本机做不到的语言，麦克风会变成「按下去有动画、却一个字都识别不出来」，
+      // 界面上完全看不出原因 —— 用户只会觉得语音按钮坏了。
+      if (!await voice.canRecognize(code)) {
+        promptAction.showToast({ message: '本机没有这个语言的识别资源，保持原设置' });
+        hilog.warn(0x0000, TAG, 'recognize language %{public}s unusable', code);
+        return;
+      }
+
       this.recognizeLang = code;
       store.setRecognizeLanguage(code);
       // 识别语言变了要让 ASR 引擎重建，否则还在用旧语言识别
-      VoiceService.getInstance().invalidateEngine();
+      voice.invalidateEngine();
       return;
     }
 
