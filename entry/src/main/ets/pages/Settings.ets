@@ -48,6 +48,55 @@ function voiceLabel(gender: string, person: number): string {
   return `音色${person}`;
 }
 
+/**
+ * 语言选择行（语音识别 / 语音播报 / 回复语言共用）。
+ *
+ * 这里必须是独立的 @Component，**不能写成 @Builder**。
+ *
+ * @Builder 的参数是按值传递的，值变化时不保证重建那条 builder 链。实测：
+ * 点「回复语言 → English」后存盘确实生效了（杀掉应用重进，页面正确显示 English），
+ * 但当前页面上那排 chip 一动不动 —— 用户看到的就是「点了没反应」。
+ * 同一个页面上「语音识别」那行当时恰好刷了，所以这个问题很隐蔽，只表现为偶发。
+ *
+ * @Prop 是单向同步：父组件的值一变，子组件必然重建。
+ */
+@Component
+struct LanguageChipRow {
+  @Prop label: string = '';
+  @Prop current: string = '';
+  @Prop which: string = '';
+  // 回调不能加 @Prop（ArkTS 不允许函数类型），普通成员传入即可
+  onPick: (which: string, code: string) => void = () => {};
+
+  build() {
+    Column() {
+      Text(this.label)
+        .fontSize(15)
+        .fontColor('#333333')
+        .width('100%')
+
+      Row() {
+        ForEach(LANGUAGE_OPTIONS, (option: LanguageOption) => {
+          Text(option.label)
+            .fontSize(13)
+            .fontColor(this.current === option.code ? '#FFFFFF' : '#007DFF')
+            .backgroundColor(this.current === option.code ? '#007DFF' : '#E6F4FF')
+            .borderRadius(14)
+            .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+            .margin({ right: 8 })
+            .onClick(() => {
+              this.onPick(this.which, option.code);
+            })
+        }, (option: LanguageOption) => `${this.which}_${option.code}`)
+      }
+      .width('100%')
+      .margin({ top: 8 })
+    }
+    .width('100%')
+    .padding({ top: 8, bottom: 8 })
+  }
+}
+
 @Entry
 @Component
 struct Settings {
@@ -395,12 +444,26 @@ struct Settings {
 
       Column() {
         // 语音识别语言
-        this.LanguageRow('语音识别', this.recognizeLang, 'recognize')
+        LanguageChipRow({
+          label: '语音识别',
+          current: this.recognizeLang,
+          which: 'recognize',
+          onPick: (which: string, code: string): void => {
+            this.pickLanguage(which, code);
+          }
+        })
 
         Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
 
         // 播报语言 + 音色
-        this.LanguageRow('语音播报', this.speakLang, 'speak')
+        LanguageChipRow({
+          label: '语音播报',
+          current: this.speakLang,
+          which: 'speak',
+          onPick: (which: string, code: string): void => {
+            this.pickLanguage(which, code);
+          }
+        })
 
         Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
 
@@ -409,7 +472,14 @@ struct Settings {
         Divider().color('#F0F0F0').margin({ top: 4, bottom: 4 })
 
         // 回复语言
-        this.LanguageRow('回复语言', this.replyLang, 'reply')
+        LanguageChipRow({
+          label: '回复语言',
+          current: this.replyLang,
+          which: 'reply',
+          onPick: (which: string, code: string): void => {
+            this.pickLanguage(which, code);
+          }
+        })
 
         // 播报自检
         Row() {
@@ -451,42 +521,6 @@ struct Settings {
     }
     .width('100%')
     .margin({ bottom: 24 })
-  }
-
-  /**
-   * 一行语言选择：标签 + 若干可点的选项胶囊
-   *
-   * 刻意只传字符串不传回调函数 —— ArkUI V1 的 @Builder 按值传参对函数类型
-   * 支持不稳（实测传进去的 onPick 不一定被调用），改成传一个标识，
-   * 由 pickLanguage() 内部派发。
-   */
-  @Builder
-  LanguageRow(label: string, current: string, which: string) {
-    Column() {
-      Text(label)
-        .fontSize(15)
-        .fontColor('#333333')
-        .width('100%')
-
-      Row() {
-        ForEach(LANGUAGE_OPTIONS, (option: LanguageOption) => {
-          Text(option.label)
-            .fontSize(13)
-            .fontColor(current === option.code ? '#FFFFFF' : '#007DFF')
-            .backgroundColor(current === option.code ? '#007DFF' : '#E6F4FF')
-            .borderRadius(14)
-            .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-            .margin({ right: 8 })
-            .onClick(() => {
-              this.pickLanguage(which, option.code);
-            })
-        }, (option: LanguageOption) => `${which}_${option.code}`)
-      }
-      .width('100%')
-      .margin({ top: 8 })
-    }
-    .width('100%')
-    .padding({ top: 8, bottom: 8 })
   }
 
   /**
@@ -540,6 +574,7 @@ struct Settings {
   }
 
   private async pickLanguage(which: string, code: string): Promise<void> {
+    hilog.info(0x0000, TAG, 'pickLanguage(%{public}s, %{public}s) entered', which, code);
     const store: SettingsStore = SettingsStore.getInstance();
 
     if (which === 'recognize') {
