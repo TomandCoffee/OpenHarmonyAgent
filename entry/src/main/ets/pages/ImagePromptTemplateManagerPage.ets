@@ -187,22 +187,6 @@ struct ImagePromptTemplateManagerPage {
     return result
   }
 
-  private syncRemoteBuiltins(): void {
-    if (this.syncingRemote) {
-      return
-    }
-    this.syncingRemote = true
-    this.viewModel.syncRemotePromptTemplates().then((): void => {
-      showToast(this.getUIContext(), $r('app.string.image_prompt_template_sync_success'))
-    }).catch((error: Object): void => {
-      console.error('ImagePromptTemplateManagerPage', `Sync remote prompt templates failed: ${JSON.stringify(error)}`)
-      showToast(this.getUIContext(), $r('app.string.image_prompt_template_sync_failed'))
-    }).finally((): void => {
-      this.syncingRemote = false
-      this.cancelEdit()
-    })
-  }
-
   private resetBuiltins(): void {
     this.viewModel.resetBuiltinPromptTemplates().then((): void => {
       this.cancelEdit()
@@ -300,9 +284,6 @@ struct ImagePromptTemplateManagerPage {
       this.FilterTabs()
 
       Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap }) {
-        this.ActionButton($r('sys.symbol.arrow_clockwise'), $r('app.string.image_prompt_template_sync_remote'), true, (): void => {
-          this.syncRemoteBuiltins()
-        }, !this.syncingRemote)
         this.ActionButton($r('sys.symbol.arrow_counterclockwise'), $r('app.string.image_prompt_template_reset_builtins'), false, (): void => {
           this.resetBuiltins()
         }, !this.syncingRemote)

@@ -353,14 +353,6 @@
       "value": "About Cube Chat"
     },
     {
-      "name": "settings_invitation",
-      "value": "Beta Invitation"
-    },
-    {
-      "name": "settings_invitation_desc",
-      "value": "Get the latest invite link and QR code"
-    },
-    {
       "name": "settings_privacy_policy",
       "value": "Privacy Policy"
     },
@@ -3363,18 +3355,6 @@
     {
       "name": "image_prompt_template_no_results",
       "value": "没有找到匹配的提示词"
-    },
-    {
-      "name": "image_prompt_template_sync_remote",
-      "value": "同步预置"
-    },
-    {
-      "name": "image_prompt_template_sync_success",
-      "value": "预置提示词已同步"
-    },
-    {
-      "name": "image_prompt_template_sync_failed",
-      "value": "同步预置失败"
     },
     {
       "name": "image_prompt_template_reset_success",

@@ -1,11 +1,8 @@
 import { ImagePromptTemplate } from '../models/ImagePromptTemplateModels'
-import { getHttpService, HttpService } from './HttpService'
 import { getPreferencesService, PreferencesService, PreferenceKeys } from './PreferencesService'
 
 const BUILTIN_TEMPLATE_VERSION = 1
 const REMOTE_TEMPLATE_VERSION_OFFSET = 1000
-export const IMAGE_PROMPT_TEMPLATES_REMOTE_URL =
-  'https://beta.04160518.xyz/chatbox/image-prompt-templates.json'
 
 interface ImagePromptTemplateJsonData {
   id?: string
@@ -35,7 +32,6 @@ class ImagePromptTemplateRemotePayloadData {
 export class ImagePromptTemplateService {
   private static instance: ImagePromptTemplateService | null = null
   private preferencesService: PreferencesService = getPreferencesService()
-  private httpService: HttpService = getHttpService()
 
   static getInstance(): ImagePromptTemplateService {
     if (ImagePromptTemplateService.instance === null) {
@@ -100,29 +96,6 @@ export class ImagePromptTemplateService {
       next.push(customTemplates[i])
     }
     return await this.persistTemplates(next, BUILTIN_TEMPLATE_VERSION)
-  }
-
-  async syncRemoteBuiltins(): Promise<ImagePromptTemplate[]> {
-    const response = await this.httpService.get(IMAGE_PROMPT_TEMPLATES_REMOTE_URL)
-    if (!response.success) {
-      throw new Error(response.errorMessage !== '' ? response.errorMessage : `HTTP ${response.statusCode}`)
-    }
-    const payload = this.parseRemotePayload(response.data)
-    const remoteBuiltins = this.normalizeRemoteBuiltins(payload.templates, payload.version)
-    if (remoteBuiltins.length === 0) {
-      throw new Error('Remote prompt template list is empty')
-    }
-    const templates = await this.loadTemplates()
-    const next: ImagePromptTemplate[] = []
-    for (let i = 0; i < templates.length; i++) {
-      if (!templates[i].builtin) {
-        next.push(templates[i])
-      }
-    }
-    for (let i = 0; i < remoteBuiltins.length; i++) {
-      next.push(remoteBuiltins[i])
-    }
-    return await this.persistTemplates(next, REMOTE_TEMPLATE_VERSION_OFFSET + payload.version)
   }
 
   private async loadTemplates(): Promise<ImagePromptTemplate[]> {

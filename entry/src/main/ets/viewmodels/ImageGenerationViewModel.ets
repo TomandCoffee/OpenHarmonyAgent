@@ -413,11 +413,6 @@ export class ImageGenerationViewModel {
     this.updateVisiblePromptTemplates()
   }
 
-  async syncRemotePromptTemplates(): Promise<void> {
-    this.promptTemplates = await this.promptTemplateService.syncRemoteBuiltins()
-    this.updateVisiblePromptTemplates()
-  }
-
   async setPromptTemplateRecommendationsVisible(visible: boolean): Promise<void> {
     this.promptTemplateRecommendationsVisible = visible
     await this.preferencesService.setBoolean(PreferenceKeys.IMAGE_PROMPT_TEMPLATE_RECOMMENDATIONS_VISIBLE, visible)
