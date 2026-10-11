@@ -1,0 +1,295 @@
+import { motion } from '@kit.MultimodalAwarenessKit'
+import { BusinessError } from '@kit.BasicServicesKit'
+import { AppStorageKeys } from '../config/AppStorageKeys'
+import { setAppUiStateValue } from '../state/AppUiState'
+import { LayoutSizeClass } from '../config/LayoutProfile'
+import { PreferenceKeys } from '../services/PreferencesService'
+import { ServiceRegistry } from '../services/ServiceRegistry'
+import { IndexSettingsSheetContent } from '../components/index/IndexSettingsSheetContent'
+import {
+  HdsNavigation,
+  HdsNavDestination,
+  HdsNavDestinationTitleMode,
+  HdsNavigationTitleBarOptions,
+  HdsNavigationTitleMode
+} from '@kit.UIDesignKit'
+import { IndexSettingsSheetActionCallbacks } from './index/IndexSettingsSheetCoordinator'
+import { SettingsSheetType } from './index/IndexPageTypes'
+import { getSettingsPageContentMaxWidth, getSettingsPageCompactTabsTotalInset } from '../utils/SettingsPageLayoutHelper'
+import { SettingsPagePresentationMode } from '../config/SettingsDetailPresentation'
+import { getAppUiState } from '../state/AppUiState'
+import {
+  buildHdsTopNavigationTitleBarOptionsForNativePage,
+  getHdsTopNavigationContentTopPadding,
+  getHdsStatusBarContentColor
+} from '../utils/HdsVisualEffectUtil'
+
+let handAdaptiveSettingsPathStack: NavPathStack | null = null
+
+@Entry
+@ComponentV2
+struct HandAdaptiveSettingsPage {
+  @Param hostedInNavDestination: boolean = false
+  private get topAvoidHeight(): number {
+    return getAppUiState().topAvoidHeight
+  }
+  private get bottomAvoidHeight(): number {
+    return getAppUiState().bottomAvoidHeight
+  }
+  private get layoutSizeClass(): string {
+    return getAppUiState().layoutSizeClass
+  }
+  private get windowWidthVp(): number {
+    return getAppUiState().windowWidthVp
+  }
+  private get windowHeightVp(): number {
+    return getAppUiState().windowHeightVp
+  }
+  private get settingsDetailPresentationMode(): string {
+    return getAppUiState().settingsDetailPresentationMode
+  }
+  private get materialType(): number {
+    return getAppUiState().materialType
+  }
+  private get materialLevel(): number {
+    return getAppUiState().materialLevel
+  }
+
+  @Local handAdaptiveEnabled: boolean = false
+  @Local handAdaptiveNewChat: boolean = false
+  @Local handAdaptiveUnsupported: boolean = false
+
+  private preferencesService = ServiceRegistry.preferences()
+  private readonly probeHoldingHandCallback = (_status: motion.HoldingHandStatus): void => {}
+  private compactScroller: Scroller = new Scroller()
+
+  private px2vp(px: number): number {
+    return px / (this.getUIContext().getHostContext()?.resourceManager.getDeviceCapabilitySync().screenDensity ?? 3) * 160
+  }
+
+  aboutToAppear(): void {
+    this.loadSettings()
+  }
+
+  private getContentMaxWidth(): number {
+    return getSettingsPageContentMaxWidth(this.layoutSizeClass, this.windowWidthVp, this.settingsDetailPresentationMode,
+      this.windowHeightVp)
+  }
+
+  private isDetailPaneMode(): boolean {
+    return this.settingsDetailPresentationMode === SettingsPagePresentationMode.DETAIL_PANE
+  }
+
+  private getScrollBottomPadding(): number {
+    return 24 + getSettingsPageCompactTabsTotalInset(this.px2vp(this.bottomAvoidHeight),
+      this.settingsDetailPresentationMode)
+  }
+
+  private handleBack(): void {
+    if (handAdaptiveSettingsPathStack !== null && handAdaptiveSettingsPathStack.size() > 0) {
+      handAdaptiveSettingsPathStack.pop()
+    }
+  }
+
+  private getCompactContentTopPadding(): number {
+    return getHdsTopNavigationContentTopPadding(this.px2vp(this.topAvoidHeight), this.windowWidthVp,
+      this.windowHeightVp)
+  }
+
+  private getCompactTitleBarOptions(): HdsNavigationTitleBarOptions {
+    return buildHdsTopNavigationTitleBarOptionsForNativePage(this.materialType, this.materialLevel, this.windowWidthVp,
+      this.windowHeightVp, $r('app.string.hand_adaptive_title'), (): void => {
+        this.handleBack()
+      })
+  }
+
+  private async loadSettings(): Promise<void> {
+    const enabled = await this.preferencesService.getBoolean(PreferenceKeys.HAND_ADAPTIVE_ENABLED, false)
+    this.handAdaptiveEnabled = enabled
+    this.handAdaptiveNewChat = enabled
+    this.handAdaptiveUnsupported = enabled ? !this.isHoldingHandSupported() : false
+  }
+
+  private isHoldingHandSupported(): boolean {
+    try {
+      motion.on('holdingHandChanged', this.probeHoldingHandCallback)
+      motion.off('holdingHandChanged', this.probeHoldingHandCallback)
+      return true
+    } catch (error) {
+      const businessError = error as BusinessError
+      console.error('HandAdaptiveSettingsPage',
+        `Failed to probe holding hand support: ${JSON.stringify(businessError)}`)
+      return false
+    }
+  }
+
+  private async persistSettings(): Promise<void> {
+    await this.preferencesService.setBoolean(PreferenceKeys.HAND_ADAPTIVE_ENABLED, this.handAdaptiveEnabled)
+    await this.preferencesService.setBoolean(PreferenceKeys.HAND_ADAPTIVE_NEW_CHAT, this.handAdaptiveEnabled)
+    setAppUiStateValue(AppStorageKeys.SETTING_HAND_ADAPTIVE_ENABLED, this.handAdaptiveEnabled)
+    setAppUiStateValue(AppStorageKeys.SETTING_HAND_ADAPTIVE_NEW_CHAT, this.handAdaptiveEnabled)
+    setAppUiStateValue(AppStorageKeys.SETTING_HAND_ADAPTIVE_UNSUPPORTED, this.handAdaptiveUnsupported)
+    setAppUiStateValue(AppStorageKeys.SETTINGS_HAND_ADAPTIVE_CHANGED_AT, Date.now())
+  }
+
+  private buildCallbacks(): IndexSettingsSheetActionCallbacks {
+    const callbacks = new IndexSettingsSheetActionCallbacks()
+    callbacks.onToggleHandAdaptiveEnabled = (value: boolean): void => {
+      this.applyMasterSetting(value)
+    }
+    return callbacks
+  }
+
+  private applyMasterSetting(value: boolean): void {
+    this.handAdaptiveEnabled = value
+    if (value) {
+      this.handAdaptiveNewChat = true
+      this.handAdaptiveUnsupported = !this.isHoldingHandSupported()
+    } else {
+      this.handAdaptiveNewChat = false
+      this.handAdaptiveUnsupported = false
+    }
+    this.persistSettings().catch((error: Error): void => {
+      console.error('HandAdaptiveSettingsPage', `Failed to persist master setting: ${JSON.stringify(error)}`)
+    })
+  }
+
+  private applyNewChatSetting(value: boolean): void {
+    this.applyMasterSetting(value)
+  }
+
+  @Builder
+  private PageContent() {
+    Scroll(this.compactScroller) {
+      Row() {
+        Column() {
+          if (!this.isDetailPaneMode()) {
+            Blank()
+              .width('100%')
+              .height(this.getCompactContentTopPadding())
+          }
+
+          IndexSettingsSheetContent({
+            settingsSheetType: SettingsSheetType.HAND_ADAPTIVE,
+            handAdaptiveEnabled: this.handAdaptiveEnabled,
+            handAdaptiveNewChat: this.handAdaptiveNewChat,
+            handAdaptiveUnsupported: this.handAdaptiveUnsupported,
+            callbacks: this.buildCallbacks()
+          })
+        }
+        .width('100%')
+        .constraintSize({ maxWidth: this.getContentMaxWidth() })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+      .padding({ left: 16, right: 16, bottom: this.getScrollBottomPadding() })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+  }
+
+  @Builder
+  private DetailPaneHeader() {
+    Column() {
+      Row() {
+        Text($r('app.string.hand_adaptive_title'))
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .height(64)
+      .padding({ left: 24, right: 24 })
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+    .border({ width: { bottom: 1 }, color: $r('app.color.divider') })
+  }
+
+  build() {
+    if (this.hostedInNavDestination) {
+      this.NavDestinationRoot()
+    } else {
+      this.StandaloneRoot()
+    }
+  }
+
+  @Builder
+  private PageRootContent() {
+    Column() {
+      if (this.isDetailPaneMode()) {
+        Column() {
+          this.DetailPaneHeader()
+          this.PageContent()
+        }
+        .width('100%')
+        .layoutWeight(1)
+      } else {
+        this.PageContent()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+  }
+
+  @Builder
+  private NavDestinationRoot() {
+    HdsNavDestination() {
+      this.PageRootContent()
+    }
+    .titleBar(this.getCompactTitleBarOptions())
+    .bindToScrollable([this.compactScroller])
+    .titleMode(HdsNavDestinationTitleMode.MINI)
+    .hideTitleBar(this.isDetailPaneMode(), false)
+    .systemBarStyle(
+      { statusBarContentColor: getHdsStatusBarContentColor() },
+      { statusBarContentColor: getHdsStatusBarContentColor() }
+    )
+    .hideBackButton(false)
+    .hideToolBar(true)
+    .backgroundColor(getAppUiState().themeBackground)
+    .onReady((context: NavDestinationContext) => {
+      handAdaptiveSettingsPathStack = context.pathStack
+    })
+    .onBackPressed((): boolean => {
+      this.handleBack()
+      return true
+    })
+  }
+
+  @Builder
+  private StandaloneRoot() {
+    if (this.isDetailPaneMode()) {
+      this.PageRootContent()
+    } else {
+      HdsNavigation() {
+        this.PageRootContent()
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor(getAppUiState().themeBackground)
+      .titleBar(this.getCompactTitleBarOptions())
+      .bindToScrollable([this.compactScroller])
+      .titleMode(HdsNavigationTitleMode.MINI)
+      .systemBarStyle(
+        { statusBarContentColor: getHdsStatusBarContentColor() },
+        { statusBarContentColor: getHdsStatusBarContentColor() }
+      )
+      .hideBackButton(false)
+      .hideToolBar(true)
+      .mode(NavigationMode.Stack)
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP])
+    }
+  }
+}
+
+@Builder
+export function HandAdaptiveSettingsPageBuilder(name: string, param: Object) {
+  HandAdaptiveSettingsPage({
+    hostedInNavDestination: true
+  })
+}

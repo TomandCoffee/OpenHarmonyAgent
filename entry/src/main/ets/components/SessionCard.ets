@@ -1,0 +1,358 @@
+import { ChatSession } from '../models/ChatModels'
+import {
+  getSessionDisplayPreviewText,
+  getSessionPreviewBodyText,
+  hasSessionDraftContent,
+  SESSION_DRAFT_TAG_TEXT
+} from '../utils/ChatSessionDisplayHelper'
+import { getAppUiState } from '../state/AppUiState'
+import { buildPointLightBorderEffect, getCurrentMaterialBlurStyle } from '../utils/HdsVisualEffectUtil'
+import { withColorAlpha } from '../utils/ColorAlphaUtils'
+import { SymbolGlyphModifier } from '@kit.ArkUI'
+
+const CONTEXT_MENU_SHEET_ACTION_DELAY_MS = 120
+
+@ComponentV2
+export struct SessionCard {
+  @Param session: ChatSession = new ChatSession('', '', '')
+  @Param enableAnimation: boolean = true
+  @Param enableContextMenu: boolean = true
+  @Param isActive: boolean = false
+  @Local scaleValue: number = 1
+  private get isDarkMode(): boolean {
+    return getAppUiState().isDarkMode
+  }
+  private get themePrimary(): string {
+    return getAppUiState().themePrimary
+  }
+  private get themePrimaryLight(): string {
+    return getAppUiState().themePrimaryLight
+  }
+  private get themeSurface(): string {
+    return getAppUiState().themeSurface
+  }
+  private get themeDivider(): string {
+    return getAppUiState().themeDivider
+  }
+  private get themeTextPrimary(): string {
+    return getAppUiState().themeTextPrimary
+  }
+  private get themeTextSecondary(): string {
+    return getAppUiState().themeTextSecondary
+  }
+  private get themeTextTertiary(): string {
+    return getAppUiState().themeTextTertiary
+  }
+  private get materialType(): number {
+    return getAppUiState().materialType
+  }
+  @Param uiVisualEnhanced: boolean = false
+  @Event onTap: () => void = () => {}
+  @Event onDelete: () => void = () => {}
+  @Event onMultiSelect: () => void = () => {}
+  @Event onShare: () => void = () => {}
+  @Event onToggleFavorite: () => void = () => {}
+
+  private requestShareFromContextMenu(): void {
+    try {
+      this.getUIContext().getContextMenuController().close()
+    } catch (_error) {
+      // 菜单可能已被系统自动关闭，继续等待退场动画即可。
+    }
+    setTimeout(() => {
+      this.onShare()
+    }, CONTEXT_MENU_SHEET_ACTION_DELAY_MS)
+  }
+
+  private getFavoriteMenuText(): Resource {
+    if (this.session.isFavorite) {
+      return $r('app.string.menu_unfavorite')
+    }
+    return $r('app.string.menu_favorite')
+  }
+
+  private getPreviewText(): string {
+    return getSessionDisplayPreviewText(this.session)
+  }
+
+  private getPreviewBodyText(): string {
+    return getSessionPreviewBodyText(this.session)
+  }
+
+  private hasDraftPreview(): boolean {
+    return hasSessionDraftContent(this.session)
+  }
+
+  private getContextMenuBackgroundColor(): string {
+    if (this.materialType === 0) {
+      return this.themeSurface
+    }
+    return withColorAlpha(this.themeSurface, this.isDarkMode ? 'E8' : 'D9')
+  }
+
+  @Builder
+  private PreviewTextContent() {
+    if (this.hasDraftPreview()) {
+      Row({ space: 6 }) {
+        Text(SESSION_DRAFT_TAG_TEXT)
+          .fontSize(10)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.themePrimary)
+          .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+          .backgroundColor(this.themePrimaryLight)
+          .borderRadius(6)
+
+        Text(this.getPreviewBodyText())
+          .fontSize(12)
+          .fontColor(this.themeTextSecondary)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('100%')
+    } else {
+      Text(this.getPreviewText())
+        .fontSize(12)
+        .fontColor(this.themeTextSecondary)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+  }
+
+  @Builder
+  SessionContextMenu() {
+    Menu() {
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.checkmark_circle')).fontSize(16),
+        content: $r('app.string.menu_multi_select')
+      })
+        .onClick(() => {
+          this.onMultiSelect()
+        })
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.share')).fontSize(16),
+        content: $r('app.string.menu_share')
+      })
+        .onClick(() => {
+          this.requestShareFromContextMenu()
+        })
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.heart')).fontSize(16),
+        content: this.getFavoriteMenuText()
+      })
+        .onClick(() => {
+          this.onToggleFavorite()
+        })
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.trash')).fontSize(16)
+          .fontColor([$r('app.color.status_error')]),
+        content: $r('app.string.delete')
+      })
+        .contentFontColor('#FF3B30')
+        .onClick(() => {
+          this.onDelete()
+        })
+    }
+  }
+
+  @Builder
+  private PrefixContent() {
+    Column() {
+      SymbolGlyph($r('sys.symbol.message_on_message_fill'))
+        .fontSize(18)
+        .fontColor([this.themePrimary])
+    }
+    .width(36)
+    .height(36)
+    .borderRadius(9)
+    .backgroundColor(this.themePrimaryLight)
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+  }
+
+  @Builder
+  private MiddleContent() {
+    Column() {
+      Row() {
+        Text(this.session.title)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.themeTextPrimary)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+
+        this.RelativeTimeText()
+      }
+      .width('100%')
+
+      Row() {
+        if (this.getPreviewText() !== '') {
+          Row() {
+            this.PreviewTextContent()
+          }
+          .width('100%')
+            .layoutWeight(1)
+        } else {
+          Text($r('app.string.session_no_preview'))
+            .fontSize(12)
+            .fontColor(this.themeTextSecondary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+        }
+
+        Row() {
+          SymbolGlyph($r('sys.symbol.message_on_message'))
+            .fontSize(10)
+            .fontColor([this.getMetaTextColor()])
+          Text(this.session.messageCount.toString())
+            .fontSize(10)
+            .fontColor(this.getMetaTextColor())
+            .margin({ left: 2 })
+
+          if (this.session.isFavorite) {
+            SymbolGlyph($r('sys.symbol.heart_fill'))
+              .fontSize(10)
+              .fontColor([$r('app.color.status_error')])
+              .margin({ left: 6 })
+          }
+        }
+        .margin({ left: 8 })
+      }
+      .width('100%')
+      .margin({ top: 4 })
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  private SuffixContent() {
+    SymbolGlyph($r('sys.symbol.chevron_right'))
+      .fontSize(14)
+      .fontColor([this.getMetaTextColor()])
+      .margin({ left: 8 })
+  }
+
+  private getMetaTextColor(): string {
+    return this.isDarkMode ? this.themeTextSecondary : this.themeTextTertiary
+  }
+
+  build() {
+    Row() {
+      this.PrefixContent()
+
+      Column() {
+        this.MiddleContent()
+      }
+      .layoutWeight(1)
+      .margin({ left: 10 })
+
+      this.SuffixContent()
+    }
+    .width('100%')
+    .backgroundColor(this.isActive ? this.themePrimaryLight : this.themeSurface)
+    .border({
+      width: this.isActive ? 1.5 : 1,
+      color: this.isActive ? this.themePrimary : this.themeDivider
+    })
+    .borderRadius(12)
+    .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+    .animation({ duration: 300, curve: Curve.EaseOut })
+    .visualEffect(buildPointLightBorderEffect(this.uiVisualEnhanced))
+    .onClick(() => {
+      this.onTap()
+    })
+    .bindContextMenu(this.enableContextMenu ? this.SessionContextMenu : undefined, ResponseType.LongPress, {
+      preview: MenuPreviewMode.IMAGE,
+      previewBorderRadius: 12,
+      previewAnimationOptions: {
+        scale: [1, 1.04]
+      },
+      backgroundColor: this.getContextMenuBackgroundColor(),
+      backgroundBlurStyle: getCurrentMaterialBlurStyle(),
+      borderRadius: 16
+    })
+  }
+
+  @Builder
+  RelativeTimeText() {
+    Row({ space: 0 }) {
+      if (this.isJustNow(this.session.updatedAt)) {
+        Text($r('app.string.time_just_now'))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+      } else if (this.isMinutesAgo(this.session.updatedAt)) {
+        Text(this.getMinutesAgoValue(this.session.updatedAt))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+        Text($r('app.string.time_minutes_ago_suffix'))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+      } else if (this.isHoursAgo(this.session.updatedAt)) {
+        Text(this.getHoursAgoValue(this.session.updatedAt))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+        Text($r('app.string.time_hours_ago_suffix'))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+      } else if (this.isDaysAgo(this.session.updatedAt)) {
+        Text(this.getDaysAgoValue(this.session.updatedAt))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+        Text($r('app.string.time_days_ago_suffix'))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+      } else {
+        Text(this.formatDateMMDD(this.session.updatedAt))
+          .fontSize(11)
+          .fontColor(this.getMetaTextColor())
+      }
+    }
+    .margin({ left: 8 })
+  }
+
+  private formatDateMMDD(timestamp: number): string {
+    const date = new Date(timestamp)
+    const month = (date.getMonth() + 1).toString().padStart(2, '0')
+    const dayNum = date.getDate().toString().padStart(2, '0')
+    return `${month}-${dayNum}`
+  }
+
+  private getRelativeDiff(timestamp: number): number {
+    const now = Date.now()
+    return now > timestamp ? now - timestamp : 0
+  }
+
+  private isJustNow(timestamp: number): boolean {
+    return this.getRelativeDiff(timestamp) < 60 * 1000
+  }
+
+  private isMinutesAgo(timestamp: number): boolean {
+    const diff = this.getRelativeDiff(timestamp)
+    return diff >= 60 * 1000 && diff < 60 * 60 * 1000
+  }
+
+  private isHoursAgo(timestamp: number): boolean {
+    const diff = this.getRelativeDiff(timestamp)
+    return diff >= 60 * 60 * 1000 && diff < 24 * 60 * 60 * 1000
+  }
+
+  private isDaysAgo(timestamp: number): boolean {
+    const diff = this.getRelativeDiff(timestamp)
+    return diff >= 24 * 60 * 60 * 1000 && diff < 7 * 24 * 60 * 60 * 1000
+  }
+
+  private getMinutesAgoValue(timestamp: number): string {
+    return `${Math.floor(this.getRelativeDiff(timestamp) / (60 * 1000))}`
+  }
+
+  private getHoursAgoValue(timestamp: number): string {
+    return `${Math.floor(this.getRelativeDiff(timestamp) / (60 * 60 * 1000))}`
+  }
+
+  private getDaysAgoValue(timestamp: number): string {
+    return `${Math.floor(this.getRelativeDiff(timestamp) / (24 * 60 * 60 * 1000))}`
+  }
+}

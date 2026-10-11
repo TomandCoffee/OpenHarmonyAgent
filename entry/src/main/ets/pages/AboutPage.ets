@@ -1,0 +1,541 @@
+import { Want, common } from '@kit.AbilityKit'
+import { bundleManager } from '@kit.AbilityKit'
+import { hilog } from '@kit.PerformanceAnalysisKit'
+import {
+  HdsNavigation,
+  HdsNavDestination,
+  HdsNavDestinationTitleMode,
+  HdsNavigationTitleBarOptions,
+  HdsNavigationTitleMode
+} from '@kit.UIDesignKit'
+import { showToast } from '../utils/ToastUtil'
+import { AppStorageKeys } from '../config/AppStorageKeys'
+import { LayoutSizeClass } from '../config/LayoutProfile'
+import { SettingsPagePresentationMode } from '../config/SettingsDetailPresentation'
+import { getSettingsPageContentMaxWidth } from '../utils/SettingsPageLayoutHelper'
+import { getAppUiState } from '../state/AppUiState'
+import { saveRawfileImageToAlbum } from '../utils/RawfileImageSaveUtil'
+import {
+  buildHdsTopNavigationTitleBarOptionsForNativePage,
+  getHdsTopNavigationContentTopPadding,
+  getHdsStatusBarContentColor
+} from '../utils/HdsVisualEffectUtil'
+
+const TAG = 'AboutPage'
+const GITHUB_URL = 'https://github.com/LongLiveY96/chatcube'
+const QQ_GROUP_NUMBER = '752237762'
+const QQ_GROUP_DEEP_LINK = `mqqapi://card/show_pslcard?card_type=group&uin=${QQ_GROUP_NUMBER}`
+const QQ_GROUP_INVITE_URL = 'https://qm.qq.com/q/LtqdPMezoQ'
+
+let aboutPagePathStack: NavPathStack | null = null
+
+@Entry
+@ComponentV2
+struct AboutPage {
+  @Param hostedInNavDestination: boolean = false
+  private get topAvoidHeight(): number {
+    return getAppUiState().topAvoidHeight
+  }
+  private get themePrimary(): string {
+    return getAppUiState().themePrimary
+  }
+  private get themePrimaryLight(): string {
+    return getAppUiState().themePrimaryLight
+  }
+  private get layoutSizeClass(): string {
+    return getAppUiState().layoutSizeClass
+  }
+  private get windowWidthVp(): number {
+    return getAppUiState().windowWidthVp
+  }
+  private get windowHeightVp(): number {
+    return getAppUiState().windowHeightVp
+  }
+  private get settingsDetailPresentationMode(): string {
+    return getAppUiState().settingsDetailPresentationMode
+  }
+  private get materialType(): number {
+    return getAppUiState().materialType
+  }
+  private get materialLevel(): number {
+    return getAppUiState().materialLevel
+  }
+  @Local showQqGroupSheet: boolean = false
+  @Local isSaving: boolean = false
+  @Local isOpeningGroup: boolean = false
+  @Local versionName: string = ''
+  private compactScroller: Scroller = new Scroller()
+  // DEV: 版本号 5 连点进入 CubeSpinnerPreview 动效预览页 (定稿后可移除)
+  private versionTapCount: number = 0
+  private versionTapResetTimer: number = -1
+
+  private handleVersionTap(): void {
+    this.versionTapCount = this.versionTapCount + 1
+    if (this.versionTapResetTimer !== -1) {
+      clearTimeout(this.versionTapResetTimer)
+    }
+    this.versionTapResetTimer = setTimeout((): void => {
+      this.versionTapCount = 0
+      this.versionTapResetTimer = -1
+    }, 1500)
+    if (this.versionTapCount >= 5) {
+      this.versionTapCount = 0
+      if (this.versionTapResetTimer !== -1) {
+        clearTimeout(this.versionTapResetTimer)
+        this.versionTapResetTimer = -1
+      }
+      if (aboutPagePathStack !== null) {
+        aboutPagePathStack.pushPath({ name: 'CubeSpinnerPreview' })
+      }
+    }
+  }
+
+  private px2vp(px: number): number {
+    return px / (this.getUIContext().getHostContext()?.resourceManager.getDeviceCapabilitySync().screenDensity ?? 3) * 160
+  }
+
+  aboutToAppear(): void {
+    try {
+      const info = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT)
+      this.versionName = info.versionName
+    } catch (err) {
+      hilog.error(0x0000, TAG, 'Get version failed: %{public}s', JSON.stringify(err))
+      this.versionName = '1.1.3'
+    }
+  }
+
+  private pageToast(message: string | Resource): void {
+    showToast(this.getUIContext(), message, 2000)
+  }
+
+  private getContentMaxWidth(): number {
+    return getSettingsPageContentMaxWidth(this.layoutSizeClass, this.windowWidthVp, this.settingsDetailPresentationMode,
+      this.windowHeightVp)
+  }
+
+  private isDetailPaneMode(): boolean {
+    return this.settingsDetailPresentationMode === SettingsPagePresentationMode.DETAIL_PANE
+  }
+
+  private handleBack(): void {
+    if (aboutPagePathStack !== null && aboutPagePathStack.size() > 0) {
+      aboutPagePathStack.pop()
+    }
+  }
+
+  private getCompactContentTopPadding(): number {
+    return getHdsTopNavigationContentTopPadding(this.px2vp(this.topAvoidHeight), this.windowWidthVp,
+      this.windowHeightVp)
+  }
+
+  private getCompactTitleBarOptions(): HdsNavigationTitleBarOptions {
+    return buildHdsTopNavigationTitleBarOptionsForNativePage(this.materialType, this.materialLevel, this.windowWidthVp,
+      this.windowHeightVp, $r('app.string.settings_about'), (): void => {
+        this.handleBack()
+      })
+  }
+
+  @Builder
+  private PageContent() {
+    Scroll(this.compactScroller) {
+      Row() {
+        Column() {
+          if (!this.isDetailPaneMode()) {
+            Blank()
+              .width('100%')
+              .height(this.getCompactContentTopPadding())
+          }
+
+          // Header: App icon + name + version + slogan
+          Column({ space: 8 }) {
+            Image($r('app.media.app_icon'))
+              .width(80)
+              .height(80)
+              .borderRadius(20)
+              .shadow({ radius: 12, color: 'rgba(0,0,0,0.1)', offsetY: 4 })
+
+            Text('Cube Chat')
+              .fontSize(24)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+
+            Text(`v${this.versionName}`)
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+              .onClick((): void => {
+                this.handleVersionTap()
+              })
+
+            Text($r('app.string.about_page_slogan'))
+              .fontSize(13)
+              .fontColor($r('app.color.text_tertiary'))
+          }
+          .width('100%')
+          .padding({ top: 24, bottom: 28 })
+          .alignItems(HorizontalAlign.Center)
+
+          Text($r('app.string.about_contact_section'))
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_secondary'))
+            .padding({ left: 16, bottom: 6 })
+            .width('100%')
+
+          Column() {
+            Row() {
+              Column() {
+                SymbolGlyph($r('sys.symbol.person_2'))
+                  .fontSize(20)
+                  .fontColor([this.themePrimary])
+              }
+              .width(36)
+              .height(36)
+              .borderRadius(9)
+              .backgroundColor(this.themePrimaryLight)
+              .justifyContent(FlexAlign.Center)
+              .alignItems(HorizontalAlign.Center)
+
+              Column({ space: 2 }) {
+                Text($r('app.string.about_qq_group'))
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Text($r('app.string.about_qq_group_number'))
+                  .fontSize(12)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              .margin({ left: 12 })
+              .layoutWeight(1)
+
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(18)
+                .fontColor([$r('app.color.text_tertiary')])
+            }
+            .width('100%')
+            .height(64)
+            .padding({ left: 16, right: 16 })
+            .alignItems(VerticalAlign.Center)
+            .onClick(() => {
+              this.showQqGroupSheet = true
+            })
+
+            Divider().color($r('app.color.divider')).margin({ left: 64 })
+
+            Row() {
+              Column() {
+                SymbolGlyph($r('sys.symbol.link'))
+                  .fontSize(20)
+                  .fontColor([this.themePrimary])
+              }
+              .width(36)
+              .height(36)
+              .borderRadius(9)
+              .backgroundColor(this.themePrimaryLight)
+              .justifyContent(FlexAlign.Center)
+              .alignItems(HorizontalAlign.Center)
+
+              Column({ space: 2 }) {
+                Text($r('app.string.about_github'))
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Text($r('app.string.about_github_repo'))
+                  .fontSize(12)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              .margin({ left: 12 })
+              .layoutWeight(1)
+
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(18)
+                .fontColor([$r('app.color.text_tertiary')])
+            }
+            .width('100%')
+            .height(64)
+            .padding({ left: 16, right: 16 })
+            .alignItems(VerticalAlign.Center)
+            .onClick(() => {
+              this.openGitHubInBrowser()
+            })
+          }
+          .width('100%')
+          .backgroundColor(getAppUiState().themeSurface)
+          .borderRadius(16)
+
+          Column({ space: 4 }) {
+            Text($r('app.string.about_open_source'))
+              .fontSize(12)
+              .fontColor($r('app.color.text_tertiary'))
+            Text($r('app.string.about_copyright'))
+              .fontSize(11)
+              .fontColor($r('app.color.text_tertiary'))
+          }
+          .width('100%')
+          .padding({ top: 32, bottom: 40 })
+          .alignItems(HorizontalAlign.Center)
+        }
+        .width('100%')
+        .constraintSize({ maxWidth: this.getContentMaxWidth() })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+      .padding({ left: 16, right: 16 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+  }
+
+  @Builder
+  private DetailPaneHeader() {
+    Column() {
+      Row() {
+        Text($r('app.string.settings_about'))
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .height(64)
+      .padding({ left: 24, right: 24 })
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+    .border({ width: { bottom: 1 }, color: $r('app.color.divider') })
+  }
+
+  build() {
+    if (this.hostedInNavDestination) {
+      this.NavDestinationRoot()
+    } else {
+      this.StandaloneRoot()
+    }
+  }
+
+  @Builder
+  private PageRootContent() {
+    Column() {
+      if (this.isDetailPaneMode()) {
+        Column() {
+          this.DetailPaneHeader()
+          this.PageContent()
+        }
+        .width('100%')
+        .layoutWeight(1)
+      } else {
+        this.PageContent()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+    .bindSheet($$this.showQqGroupSheet, this.QqGroupSheetBuilder(), {
+      height: SheetSize.FIT_CONTENT,
+      showClose: true,
+      dragBar: true,
+      backgroundColor: getAppUiState().themeBackground
+    })
+  }
+
+  @Builder
+  private NavDestinationRoot() {
+    HdsNavDestination() {
+      this.PageRootContent()
+    }
+    .titleBar(this.getCompactTitleBarOptions())
+    .bindToScrollable([this.compactScroller])
+    .titleMode(HdsNavDestinationTitleMode.MINI)
+    .hideTitleBar(this.isDetailPaneMode(), false)
+    .systemBarStyle(
+      { statusBarContentColor: getHdsStatusBarContentColor() },
+      { statusBarContentColor: getHdsStatusBarContentColor() }
+    )
+    .hideBackButton(false)
+    .hideToolBar(true)
+    .backgroundColor(getAppUiState().themeBackground)
+    .onReady((context: NavDestinationContext) => {
+      aboutPagePathStack = context.pathStack
+    })
+    .onBackPressed((): boolean => {
+      this.handleBack()
+      return true
+    })
+  }
+
+  @Builder
+  private StandaloneRoot() {
+    if (this.isDetailPaneMode()) {
+      this.PageRootContent()
+    } else {
+      HdsNavigation() {
+        this.PageRootContent()
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor(getAppUiState().themeBackground)
+      .titleBar(this.getCompactTitleBarOptions())
+      .bindToScrollable([this.compactScroller])
+      .titleMode(HdsNavigationTitleMode.MINI)
+      .systemBarStyle(
+        { statusBarContentColor: getHdsStatusBarContentColor() },
+        { statusBarContentColor: getHdsStatusBarContentColor() }
+      )
+      .hideBackButton(false)
+      .hideToolBar(true)
+      .mode(NavigationMode.Stack)
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP])
+    }
+  }
+
+  @Builder
+  QqGroupSheetBuilder() {
+    Column({ space: 16 }) {
+      Text($r('app.string.about_qq_group'))
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_primary'))
+
+      Text($r('app.string.about_qq_group_number'))
+        .fontSize(14)
+        .fontColor($r('app.color.text_secondary'))
+
+      Image($rawfile('qq_group_qrcode.jpg'))
+        .width('70%')
+        .objectFit(ImageFit.Contain)
+        .borderRadius(12)
+
+      Row({ space: 12 }) {
+        Button($r('app.string.about_join_qq_group'))
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .type(ButtonType.Capsule)
+          .backgroundColor(this.themePrimary)
+          .fontColor(Color.White)
+          .enabled(!this.isOpeningGroup && !this.isSaving)
+          .onClick(() => {
+            this.openQqGroup()
+          })
+
+        Button($r('app.string.about_save_qrcode'))
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .type(ButtonType.Capsule)
+          .backgroundColor(this.themePrimaryLight)
+          .fontColor(this.themePrimary)
+          .enabled(!this.isSaving && !this.isOpeningGroup)
+          .onClick(() => {
+            this.saveQqGroupQrCode()
+          })
+      }
+      .width('70%')
+    }
+    .width('100%')
+    .padding({ top: 16, bottom: 32, left: 24, right: 24 })
+    .alignItems(HorizontalAlign.Center)
+  }
+
+  private async openGitHubInBrowser(): Promise<void> {
+    try {
+      const hostContext = this.getUIContext().getHostContext()
+      if (!hostContext) {
+        throw new Error('UI context unavailable')
+      }
+      const context = hostContext as common.UIAbilityContext
+      await this.startBrowsableAbility(context, GITHUB_URL)
+    } catch (err) {
+      hilog.error(0x0000, TAG, 'Open GitHub failed: %{public}s', JSON.stringify(err))
+      this.pageToast($r('app.string.about_open_qq_group_failed'))
+    }
+  }
+
+  private async saveQqGroupQrCode(): Promise<void> {
+    await this.saveRawfileImage(
+      $r('app.string.about_qrcode_saved'),
+      $r('app.string.about_qrcode_save_failed')
+    )
+  }
+
+  private async saveRawfileImage(successMessage: string | Resource, failMessage: string | Resource): Promise<void> {
+    if (this.isSaving) {
+      return
+    }
+    this.isSaving = true
+    try {
+      const hostContext = this.getUIContext().getHostContext()
+      if (!hostContext) {
+        throw new Error('UI context unavailable')
+      }
+      await saveRawfileImageToAlbum(hostContext as common.UIAbilityContext, 'qq_group_qrcode.jpg', 'CubeChat_QQ_Group')
+      this.pageToast(successMessage)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      hilog.error(0x0000, TAG, 'Save QR code failed: %{public}s', msg)
+      if (!msg.includes('cancelled') && !msg.includes('cancel')) {
+        this.pageToast(failMessage)
+      }
+    } finally {
+      this.isSaving = false
+    }
+  }
+
+  private async openQqGroup(): Promise<void> {
+    if (this.isOpeningGroup) {
+      return
+    }
+    this.isOpeningGroup = true
+    try {
+      const hostContext = this.getUIContext().getHostContext()
+      if (!hostContext) {
+        throw new Error('UI context unavailable')
+      }
+      const context = hostContext as common.UIAbilityContext
+
+      let canOpen = false
+      try {
+        canOpen = bundleManager.canOpenLink(QQ_GROUP_DEEP_LINK)
+      } catch (err) {
+        hilog.error(0x0000, TAG, 'Check QQ deep link failed: %{public}s', JSON.stringify(err))
+      }
+
+      if (canOpen) {
+        await context.openLink(QQ_GROUP_DEEP_LINK)
+        return
+      }
+      await this.startBrowsableAbility(context, QQ_GROUP_INVITE_URL)
+    } catch (err) {
+      hilog.error(0x0000, TAG, 'Open QQ group failed: %{public}s', JSON.stringify(err))
+      this.pageToast($r('app.string.about_open_qq_group_failed'))
+    } finally {
+      this.isOpeningGroup = false
+    }
+  }
+
+  private async startBrowsableAbility(context: common.UIAbilityContext, url: string): Promise<void> {
+    const want: Want = {
+      action: 'ohos.want.action.viewData',
+      entities: ['entity.system.browsable'],
+      uri: url
+    }
+    try {
+      await context.startAbility(want)
+    } catch (error) {
+      hilog.error(0x0000, TAG, 'Start browsable ability failed: %{public}s', JSON.stringify(error))
+      throw new Error(`Start browsable ability failed: ${JSON.stringify(error)}`)
+    }
+  }
+}
+
+@Builder
+export function AboutPageBuilder(name: string, param: Object) {
+  AboutPage({
+    hostedInNavDestination: true
+  })
+}

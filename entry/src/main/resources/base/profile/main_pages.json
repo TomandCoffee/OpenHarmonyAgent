@@ -1,0 +1,22 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/LoginPage",
+    "pages/ModelManagePage",
+    "pages/DefaultModelPage",
+    "pages/ThemeModeSettingsPage",
+    "pages/LanguageSettingsPage",
+    "pages/ColorThemeSettingsPage",
+    "pages/NotificationSettingsPage",
+    "pages/HandAdaptiveSettingsPage",
+    "pages/FontSizeSettingsPage",
+    "pages/SystemPromptSettingsPage",
+    "pages/ChatInputSettingsPage",
+    "pages/ProviderDetailPage",
+    "pages/ExportDataPage",
+    "pages/ImportDataPage",
+    "pages/ToolsCenterPage",
+    "pages/ImageGenerationPage",
+    "pages/AboutPage"
+  ]
+}

@@ -1,0 +1,3029 @@
+import { KeyboardAvoidMode } from '@kit.ArkUI'
+import {
+  HdsNavigation,
+  HdsNavDestination,
+  HdsNavDestinationTitleMode,
+  HdsNavigationMenuItemOptions,
+  HdsNavigationTitleBarOptions,
+  HdsNavigationTitleMode
+} from '@kit.UIDesignKit'
+import {
+  ModelProvider,
+  ModelInfo,
+  ModelInfoExtendedJson,
+  ProviderType,
+  ProviderIconType,
+  ApiStyle,
+  OpenAITransport
+} from '../models/ChatModels'
+import { ModelEditSheet } from '../components/ModelEditSheet'
+import { ModelPickerSheetHost } from '../components/ModelPickerSheetHost'
+import { HelpHintButton } from '../components/HelpHintButton'
+import { ProviderViewModel } from '../viewmodels/ProviderViewModel'
+import { buildIconResourcePath, getModelIconPath, isNetworkIconPath, isSandboxIconPath } from '../utils/ProviderIconUtils'
+import { showToast } from '../utils/ToastUtil'
+import { ProviderIcon } from './ProviderIcon'
+import { generateDefaultTextIcon } from '../utils/IconGeneratorUtils'
+import { applyPresetIconDefaults } from '../config/PresetProviders'
+import { ProviderIconEditSheet, ProviderIconEditConfig } from './ProviderIconEditSheet'
+import { ProviderShareSheet } from './provider/ProviderShareSheet'
+import { ServiceRegistry } from '../services/ServiceRegistry'
+import { buildModelIconRenderData, ModelIconRenderData } from '../utils/ModelIconRenderUtils'
+import { applyDerivedModelDefaults, getEffectiveCapabilities } from '../utils/ModelCapabilityDeriver'
+import {
+  ApiStyleOption,
+  OpenAITransportOption,
+  ProviderModelGroup,
+  getDefaultApiStyleOptions,
+  getDefaultOpenAITransportOptions,
+  buildProviderModelGroups,
+  filterProviderModelsByKeyword
+} from '../config/ProviderDetailShared'
+import {
+  setAllModelsEnabled as applyAllModelsEnabled,
+  setGroupModelsEnabled as applyGroupModelsEnabled,
+  isAllModelsEnabled as areAllModelsEnabled,
+  isGroupAllEnabled as areGroupAllEnabled,
+  removeModelById,
+  buildSelectedModelsWithPreservedConfig
+} from '../config/ProviderModelActions'
+import { getAppUiState } from '../state/AppUiState'
+import { withColorAlpha } from '../utils/ColorAlphaUtils'
+import { applyModelDraft } from '../utils/ModelDraftUtils'
+import { getSettingsPageCompactTabsTotalInset } from '../utils/SettingsPageLayoutHelper'
+import { SettingsPagePresentationMode } from '../config/SettingsDetailPresentation'
+import { pickLocalizedText } from '../utils/LocalizedTextUtils'
+import {
+  buildCustomHeadersJson,
+  isSensitiveCustomHeaderName,
+  parseCustomHeaderEntries,
+  validateCustomHeaderEntries
+} from '../utils/CustomHeaderUtils'
+import {
+  buildHdsTopNavigationTitleBarOptionsForNativePage,
+  createHdsTitleBarSymbolIcon,
+  getHdsTopNavigationContentTopPadding,
+  getHdsStatusBarContentColor
+} from '../utils/HdsVisualEffectUtil'
+
+@ObservedV2
+class ProviderHeaderEntry {
+  @Trace id: string = ''
+  @Trace name: string = ''
+  @Trace value: string = ''
+
+  constructor(id: string = '', name: string = '', value: string = '') {
+    this.id = id
+    this.name = name
+    this.value = value
+  }
+}
+
+export enum ProviderDetailPresentationMode {
+  SHEET = 'sheet',
+  PAGE = 'page',
+  DETAIL_PANE = 'detailPane'
+}
+
+enum ProviderModelRenderRowType {
+  GROUP_HEADER = 0,
+  MODEL = 1
+}
+
+interface ProviderModelRenderRow {
+  type: ProviderModelRenderRowType
+  key: string
+  groupIndex: number
+  groupName: string
+  groupCount: number
+  model: ModelInfo | null
+  showDivider: boolean
+}
+
+let providerDetailInternalBackHandler: (() => boolean) | null = null
+
+@ComponentV2
+export struct ProviderDetailPanel {
+  @Param providerId: string = ''
+  @Param isCreateMode: boolean = false
+  @Param closeOnSave: boolean = true
+  @Param closeOnModelsSelected: boolean = false
+  @Param presentationMode: ProviderDetailPresentationMode = ProviderDetailPresentationMode.SHEET
+  @Param hostedInNavDestination: boolean = false
+  @Event onClose: () => void = () => {}
+  @Event onDestinationReady: (context: NavDestinationContext) => void = (_context: NavDestinationContext) => {}
+  @Event onProviderChanged: (providerId: string, isCreateMode: boolean) => void = (_providerId: string, _isCreateMode: boolean) => {}
+  private get themePrimary(): string {
+    return getAppUiState().themePrimary
+  }
+  private get isDarkMode(): boolean {
+    return getAppUiState().isDarkMode
+  }
+  private get themePrimarySubtleBackground(): string {
+    return withColorAlpha(this.themePrimary, this.isDarkMode ? '28' : '16')
+  }
+  private get sensitiveBadgeColor(): string {
+    return '#D9485F'
+  }
+  private get sensitiveBadgeBackgroundColor(): string {
+    return withColorAlpha(this.sensitiveBadgeColor, this.isDarkMode ? '28' : '12')
+  }
+  private get topAvoidHeight(): number {
+    return getAppUiState().topAvoidHeight
+  }
+  private get bottomAvoidHeight(): number {
+    return getAppUiState().bottomAvoidHeight
+  }
+  private get windowWidthVp(): number {
+    return getAppUiState().windowWidthVp
+  }
+  private get windowHeightVp(): number {
+    return getAppUiState().windowHeightVp
+  }
+  private get materialType(): number {
+    return getAppUiState().materialType
+  }
+  private get materialLevel(): number {
+    return getAppUiState().materialLevel
+  }
+  private get settingsDetailPresentationMode(): string {
+    return getAppUiState().settingsDetailPresentationMode
+  }
+
+  @Local provider: ModelProvider | null = null
+  @Local isLoading: boolean = true
+  @Local isTesting: boolean = false
+  @Local isFetchingModels: boolean = false
+  @Local isSaving: boolean = false
+  @Local showApiKey: boolean = false
+  @Local searchKeywords: string = ''
+  @Local modelGroups: ProviderModelGroup[] = []
+  @Local modelRenderRows: ProviderModelRenderRow[] = []
+  // 模型编辑相关状态
+  @Local showEditSheet: boolean = false
+  @Local editingModel: ModelInfo | null = null
+  // 模型选择器相关状态
+  @Local fetchedModels: string[] = []
+  // 统一的弹窗控制：'none' | 'edit' | 'picker' | 'icon'
+  @Local activeSheet: string = 'none'
+  @Local showSheet: boolean = false
+  // 动效触发器
+  @Local toggleAllEffectTrigger: number = 0
+  // Tab 切换索引
+  @Local currentTabIndex: number = 0
+  // Tab 图标动效触发器
+  @Local configTabEffectTrigger: number = 0
+  @Local modelsTabEffectTrigger: number = 0
+  // 图标编辑相关状态
+  @Local showTextIconEditor: boolean = false
+  @Local providerCustomHeaderEntries: ProviderHeaderEntry[] = []
+  @Local showProviderCustomHeadersEditor: boolean = false
+  @Local isQueryingBalance: boolean = false
+  @Local providerBalanceText: string = ''
+  @Local providerBalanceError: string = ''
+  // 手动添加模型相关状态
+  @Local showAddModelInput: boolean = false
+  @Local addModelIdText: string = ''
+  // 服务商 QR 分享
+  @Local showShareSheet: boolean = false
+
+  private providerViewModel: ProviderViewModel = ServiceRegistry.provider()
+  private pageConfigScroller: Scroller = new Scroller()
+  private pageModelListScroller: ListScroller = new ListScroller()
+
+  // API 风格选项（仅用于自定义服务商）
+  private apiStyleOptions: ApiStyleOption[] = getDefaultApiStyleOptions()
+  private openaiTransportOptions: OpenAITransportOption[] = getDefaultOpenAITransportOptions()
+  private readonly reservedProviderHeaderNames: string[] = [
+    'authorization',
+    'content-type',
+    'accept',
+    'api-key',
+    'x-api-key',
+    'anthropic-version'
+  ]
+
+  aboutToAppear(): void {
+    providerDetailInternalBackHandler = (): boolean => {
+      return this.handleInternalBackPressed()
+    }
+    if (this.isStandalonePagePresentation()) {
+      this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE)
+    }
+    this.loadProviderData()
+  }
+
+  aboutToDisappear(): void {
+    providerDetailInternalBackHandler = null
+    if (this.isStandalonePagePresentation()) {
+      this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.OFFSET)
+    }
+  }
+
+  @Monitor('providerId', 'isCreateMode')
+  onProviderInputChanged(): void {
+    this.searchKeywords = ''
+    this.modelGroups = []
+    this.provider = null
+    this.showEditSheet = false
+    this.editingModel = null
+    this.showSheet = false
+    this.showShareSheet = false
+    this.activeSheet = 'none'
+    this.fetchedModels = []
+    this.providerCustomHeaderEntries = []
+    this.showProviderCustomHeadersEditor = false
+    this.isQueryingBalance = false
+    this.providerBalanceText = ''
+    this.providerBalanceError = ''
+    this.showAddModelInput = false
+    this.addModelIdText = ''
+    this.loadProviderData()
+  }
+
+  async loadProviderData(): Promise<void> {
+    this.isLoading = true
+
+    if (this.isCreateMode) {
+      // 新建模式：创建空白 Provider
+      const providerId = `custom_${Date.now()}`
+      const provider = new ModelProvider(
+        providerId,
+        '',
+        ProviderType.CUSTOM,
+        'message',
+        $r('app.color.brand_custom'),
+        '',
+        ApiStyle.OPENAI
+      )
+      provider.isConnected = true
+      provider.isPreset = false
+      provider.openaiTransport = OpenAITransport.CHAT_COMPLETIONS
+      // 生成默认文字图标
+      const iconConfig = generateDefaultTextIcon('')
+      provider.iconType = 'text' as ProviderIconType
+      provider.textIcon = iconConfig.text
+      provider.textIconBgColor = iconConfig.bgColor
+      this.provider = provider
+      this.providerCustomHeaderEntries = this.parseProviderHeaderEntries(provider.customHeadersJson)
+      this.showProviderCustomHeadersEditor = this.providerCustomHeaderEntries.length > 0
+      this.isLoading = false
+      return
+    }
+
+    // 编辑模式：从数据库加载
+    await this.providerViewModel.loadAllProviders()
+    const provider = this.providerViewModel.getProviderById(this.providerId)
+    if (provider !== null) {
+      this.provider = provider
+      this.providerCustomHeaderEntries = this.parseProviderHeaderEntries(provider.customHeadersJson)
+      this.showProviderCustomHeadersEditor = this.providerCustomHeaderEntries.length > 0
+      this.buildModelGroups()
+    }
+    this.isLoading = false
+  }
+
+  // 构建模型分组
+  private buildModelGroups(): void {
+    if (this.provider === null) {
+      this.modelRenderRows = []
+      return
+    }
+    const models = filterProviderModelsByKeyword(this.provider.models, this.searchKeywords)
+    this.modelGroups = buildProviderModelGroups(models)
+    this.rebuildModelRenderRows()
+  }
+
+  private showProviderToast(message: string | Resource, duration: number = 2000): void {
+    showToast(this.getUIContext(), message, duration)
+  }
+
+  private buildNewProviderHeaderEntryId(): string {
+    return `provider_header_${Date.now()}_${Math.floor(Math.random() * 100000)}`
+  }
+
+  private createProviderHeaderEntry(name: string = '', value: string = ''): ProviderHeaderEntry {
+    return new ProviderHeaderEntry(this.buildNewProviderHeaderEntryId(), name, value)
+  }
+
+  private parseProviderHeaderEntries(raw: string): ProviderHeaderEntry[] {
+    const parsedEntries = parseCustomHeaderEntries(raw)
+    const entries: ProviderHeaderEntry[] = []
+    for (let i = 0; i < parsedEntries.length; i++) {
+      entries.push(this.createProviderHeaderEntry(parsedEntries[i].name, parsedEntries[i].value))
+    }
+    return entries
+  }
+
+  private syncProviderCustomHeadersJsonFromEntries(): void {
+    if (this.provider === null) {
+      return
+    }
+    this.provider.customHeadersJson = buildCustomHeadersJson(this.providerCustomHeaderEntries)
+  }
+
+  private validateProviderHeaderEntries(): string {
+    return validateCustomHeaderEntries(this.providerCustomHeaderEntries, this.reservedProviderHeaderNames, {
+      emptyEntryMessage: pickLocalizedText(
+        '自定义请求头的名称和值都不能为空',
+        'Custom header name and value are both required'
+      ),
+      reservedHeaderMessage: (name: string): string => pickLocalizedText(
+        `请求头 ${name} 由系统管理，请勿手动填写`,
+        `Header ${name} is managed by the system and should not be set manually`
+      ),
+      duplicateHeaderMessage: (name: string): string => pickLocalizedText(
+        `请求头 ${name} 重复，请保留一项`,
+        `Header ${name} is duplicated; keep only one entry`
+      )
+    })
+  }
+
+  private addProviderHeaderEntry(): void {
+    this.showProviderCustomHeadersEditor = true
+    this.providerCustomHeaderEntries = [...this.providerCustomHeaderEntries, this.createProviderHeaderEntry()]
+    this.syncProviderCustomHeadersJsonFromEntries()
+  }
+
+  private removeProviderHeaderEntry(entryId: string): void {
+    const nextEntries: ProviderHeaderEntry[] = []
+    for (let i = 0; i < this.providerCustomHeaderEntries.length; i++) {
+      if (this.providerCustomHeaderEntries[i].id !== entryId) {
+        nextEntries.push(this.providerCustomHeaderEntries[i])
+      }
+    }
+    this.providerCustomHeaderEntries = nextEntries
+    if (this.providerCustomHeaderEntries.length === 0) {
+      this.showProviderCustomHeadersEditor = false
+    }
+    this.syncProviderCustomHeadersJsonFromEntries()
+  }
+
+  private updateProviderHeaderEntryName(entryId: string, value: string): void {
+    for (let i = 0; i < this.providerCustomHeaderEntries.length; i++) {
+      if (this.providerCustomHeaderEntries[i].id === entryId) {
+        this.providerCustomHeaderEntries[i].name = value
+        break
+      }
+    }
+    this.providerCustomHeaderEntries = [...this.providerCustomHeaderEntries]
+    this.syncProviderCustomHeadersJsonFromEntries()
+  }
+
+  private updateProviderHeaderEntryValue(entryId: string, value: string): void {
+    for (let i = 0; i < this.providerCustomHeaderEntries.length; i++) {
+      if (this.providerCustomHeaderEntries[i].id === entryId) {
+        this.providerCustomHeaderEntries[i].value = value
+        break
+      }
+    }
+    this.providerCustomHeaderEntries = [...this.providerCustomHeaderEntries]
+    this.syncProviderCustomHeadersJsonFromEntries()
+  }
+
+  private isSensitiveProviderHeaderName(name: string): boolean {
+    return isSensitiveCustomHeaderName(name)
+  }
+
+  private async saveCurrentProvider(): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+    await this.providerViewModel.saveProvider(this.provider, this.isCreateMode)
+  }
+
+  private notifyProviderChanged(): void {
+    if (this.provider === null) {
+      return
+    }
+    this.onProviderChanged(this.provider.id, this.isCreateMode)
+  }
+
+  private refreshModelGroups(): void {
+    this.modelRenderRows = []
+    this.modelGroups = []
+    this.buildModelGroups()
+  }
+
+  private rebuildModelRenderRows(): void {
+    const rows: ProviderModelRenderRow[] = []
+    for (let groupIndex = 0; groupIndex < this.modelGroups.length; groupIndex++) {
+      const group = this.modelGroups[groupIndex]
+      rows.push({
+        type: ProviderModelRenderRowType.GROUP_HEADER,
+        key: `group_${groupIndex}_${group.name}`,
+        groupIndex: groupIndex,
+        groupName: group.name,
+        groupCount: group.models.length,
+        model: null,
+        showDivider: false
+      })
+      if (!group.isExpanded) {
+        continue
+      }
+      for (let modelIndex = 0; modelIndex < group.models.length; modelIndex++) {
+        rows.push({
+          type: ProviderModelRenderRowType.MODEL,
+          key: `model_${groupIndex}_${group.models[modelIndex].id}`,
+          groupIndex: groupIndex,
+          groupName: group.name,
+          groupCount: group.models.length,
+          model: group.models[modelIndex],
+          showDivider: modelIndex < group.models.length - 1
+        })
+      }
+    }
+    this.modelRenderRows = rows
+  }
+
+  private getModelListCachedCount(): number {
+    if (this.modelRenderRows.length >= 120) {
+      return 2
+    }
+    if (this.modelRenderRows.length >= 40) {
+      return 3
+    }
+    return 4
+  }
+
+  private getModelIconPathForRender(modelId: string): string {
+    return getModelIconPath(modelId, this.provider?.id ?? '', '')
+  }
+
+  private getModelIconResourcePath(modelId: string): string {
+    const iconPath = this.getModelIconPathForRender(modelId)
+    if (iconPath === '') {
+      return ''
+    }
+    return buildIconResourcePath(iconPath)
+  }
+
+  private hasModelIcon(modelId: string): boolean {
+    return this.getModelIconResourcePath(modelId) !== ''
+  }
+
+  private isRawfileModelIcon(modelId: string): boolean {
+    const resourcePath = this.getModelIconResourcePath(modelId)
+    return resourcePath !== '' && !isNetworkIconPath(resourcePath) && !isSandboxIconPath(resourcePath)
+  }
+
+  // 测试连接
+  async testConnection(): Promise<void> {
+    if (this.provider === null || this.isTesting) {
+      return
+    }
+
+    this.isTesting = true
+    this.showProviderToast($r('app.string.provider_testing_connection'), 1500)
+
+    try {
+      const result = await this.providerViewModel.testConnection(this.provider)
+      if (result.success) {
+        this.showProviderToast($r('app.string.connection_success'), 2000)
+      } else {
+        console.error('ProviderDetailSheet', `[testConnection] failed: ${result.errorMessage}`)
+        this.showProviderToast(result.errorMessage !== '' ? result.errorMessage : $r('app.string.connection_failed'), 3000)
+      }
+    } finally {
+      this.isTesting = false
+    }
+  }
+
+  private canQueryBalance(): boolean {
+    if (this.provider === null) {
+      return false
+    }
+    return this.provider.id === 'deepseek'
+      || this.provider.id === 'siliconflow'
+      || this.provider.id === 'openrouter'
+      || this.provider.id === 'kimi'
+  }
+
+  async queryBalance(): Promise<void> {
+    if (this.provider === null || this.isQueryingBalance || !this.canQueryBalance()) {
+      return
+    }
+
+    this.isQueryingBalance = true
+    this.providerBalanceError = ''
+    this.providerBalanceText = ''
+    this.showProviderToast($r('app.string.provider_querying_balance'), 1200)
+
+    try {
+      const result = await this.providerViewModel.queryProviderBalance(this.provider.id)
+      if (result === null) {
+        this.providerBalanceText = ''
+        this.providerBalanceError = pickLocalizedText('当前服务商暂不支持余额查询', 'Balance is not supported for this provider')
+        this.showProviderToast($r('app.string.provider_balance_not_supported'), 2000)
+        return
+      }
+      this.providerBalanceText = `${result.amount} ${result.currency}`.trim()
+      this.showProviderToast($r('app.string.provider_balance_loaded'), 2000)
+    } catch (err) {
+      const message = err instanceof Error && err.message !== ''
+        ? err.message
+        : pickLocalizedText('查询余额失败', 'Failed to query balance')
+      this.providerBalanceError = message
+      this.showProviderToast(message, 3000)
+    } finally {
+      this.isQueryingBalance = false
+    }
+  }
+
+  // 获取模型列表
+  async fetchModels(): Promise<void> {
+    if (this.provider === null || this.isFetchingModels) {
+      return
+    }
+
+    this.isFetchingModels = true
+    this.showProviderToast($r('app.string.provider_fetching_models'), 1500)
+
+    try {
+      const result = await this.providerViewModel.refreshModels(this.provider)
+      if (!result.success) {
+        console.error('ProviderDetailSheet', `[fetchModels] failed: ${result.errorMessage}`)
+        this.showProviderToast(result.errorMessage !== '' ? result.errorMessage : $r('app.string.provider_fetch_models_failed'), 3000)
+        return
+      }
+
+      if (result.models.length === 0) {
+        this.showProviderToast($r('app.string.provider_no_models'), 2000)
+        return
+      }
+
+      // 打开选择器让用户选择需要保留的模型
+      this.fetchedModels = result.models
+      this.activeSheet = 'picker'
+      this.showSheet = true
+      this.showProviderToast($r('app.string.provider_models_refreshed'), 2000)
+    } catch (err) {
+      console.error('ProviderDetailSheet', `fetchModels error: ${JSON.stringify(err)}`)
+      this.showProviderToast($r('app.string.provider_fetch_models_failed'), 3000)
+    } finally {
+      this.isFetchingModels = false
+    }
+  }
+
+  // 保存选中的模型
+  async saveSelectedModels(selectedIds: string[]): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+
+    const newModels = buildSelectedModelsWithPreservedConfig(this.provider.models, selectedIds)
+
+    // 保留不在 API 列表中的已有模型（如手动添加的模型）
+    const fetchedSet = new Set<string>(this.fetchedModels)
+    const newModelIdSet = new Set<string>()
+    for (let i = 0; i < newModels.length; i++) {
+      newModelIdSet.add(newModels[i].id)
+    }
+    for (let i = 0; i < this.provider.models.length; i++) {
+      const model = this.provider.models[i]
+      if (!fetchedSet.has(model.id) && !newModelIdSet.has(model.id)) {
+        newModels.push(model)
+      }
+    }
+
+    this.provider.models = newModels
+
+    await this.saveCurrentProvider()
+
+    this.refreshModelGroups()
+
+    // 先关闭内部弹窗
+    this.showSheet = false
+    this.activeSheet = 'none'
+
+    // 显示提示
+    this.showProviderToast($r('app.string.provider_models_selected'), 2000)
+
+    this.notifyProviderChanged()
+
+    if (this.closeOnModelsSelected) {
+      // 延迟通知父页面关闭并刷新数据（等待内部弹窗关闭动画完成）
+      setTimeout(() => {
+        this.onClose()
+      }, 200)
+    }
+  }
+
+  // 手动添加模型
+  async addManualModel(): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+    const modelId = this.addModelIdText.trim()
+    if (modelId.length === 0) {
+      this.showProviderToast($r('app.string.provider_add_model_id_required'), 2000)
+      return
+    }
+    // 检查重复
+    for (let i = 0; i < this.provider.models.length; i++) {
+      if (this.provider.models[i].id === modelId) {
+        this.showProviderToast($r('app.string.provider_model_id_duplicate'), 2000)
+        return
+      }
+    }
+    const model = new ModelInfo(modelId, modelId, 4096, true, false)
+    applyDerivedModelDefaults(model)
+    this.provider.models.push(model)
+    await this.saveCurrentProvider()
+    this.refreshModelGroups()
+    this.showAddModelInput = false
+    this.addModelIdText = ''
+    this.getUIContext().getFocusController().clearFocus()
+    this.notifyProviderChanged()
+    // 自动打开编辑面板,能力由派生路径自动给出
+    this.editingModel = model
+    this.activeSheet = 'edit'
+    this.showSheet = true
+  }
+
+  // 删除单个模型
+  async deleteModel(model: ModelInfo): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+
+    this.provider.models = removeModelById(this.provider.models, model.id)
+
+    await this.saveCurrentProvider()
+    this.refreshModelGroups()
+    this.notifyProviderChanged()
+
+    console.info('ProviderDetailSheet', `[deleteModel] deleted model: ${model.name}`)
+    this.showProviderToast($r('app.string.provider_model_deleted'))
+  }
+
+  // 保存配置并关闭
+  async saveConfigAndClose(): Promise<void> {
+    if (this.provider === null || this.isSaving) {
+      return
+    }
+
+    // 新建模式校验
+    if (this.isCreateMode) {
+      if (this.provider.name.trim() === '') {
+        this.showProviderToast($r('app.string.provider_name_required'), 3000)
+        return
+      }
+      if (this.provider.baseUrl.trim() === '') {
+        this.showProviderToast($r('app.string.base_url_required'), 3000)
+        return
+      }
+    }
+
+    const customHeadersError = this.validateProviderHeaderEntries()
+    if (customHeadersError !== '') {
+      this.showProviderToast(customHeadersError, 3000)
+      return
+    }
+
+    this.isSaving = true
+    try {
+      await this.saveCurrentProvider()
+      if (this.isCreateMode) {
+        this.showProviderToast($r('app.string.provider_added'), 1500)
+      } else {
+        this.showProviderToast($r('app.string.config_saved'), 1500)
+      }
+      this.notifyProviderChanged()
+      if (this.closeOnSave) {
+        this.onClose()
+      }
+    } finally {
+      this.isSaving = false
+    }
+  }
+
+  // 切换供应商启用状态
+  async toggleEnabled(): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+
+    this.provider.isConnected = !this.provider.isConnected
+    await this.providerViewModel.updateProviderEnabled(this.provider.id, this.provider.isConnected)
+    this.notifyProviderChanged()
+
+    this.showProviderToast(
+      this.provider.isConnected ? $r('app.string.provider_enabled') : $r('app.string.provider_disabled'),
+      2000
+    )
+  }
+
+  // 切换分组展开状态
+  private toggleGroupExpansion(index: number): void {
+    if (index >= 0 && index < this.modelGroups.length) {
+      // 使用 animateTo 实现平滑动画
+      this.getUIContext().animateTo({
+        duration: 300,
+        curve: Curve.EaseInOut
+      }, () => {
+        this.modelGroups[index] = {
+          name: this.modelGroups[index].name,
+          models: this.modelGroups[index].models,
+          isExpanded: !this.modelGroups[index].isExpanded
+        }
+        this.rebuildModelRenderRows()
+      })
+    }
+  }
+
+  // 一键开启所有模型
+  private async enableAllModels(): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+    this.provider.models = applyAllModelsEnabled(this.provider.models, true)
+    await this.saveCurrentProvider()
+    this.refreshModelGroups()
+    this.showProviderToast($r('app.string.provider_all_models_enabled'))
+  }
+
+  // 一键关闭所有模型
+  private async disableAllModels(): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+    this.provider.models = applyAllModelsEnabled(this.provider.models, false)
+    await this.saveCurrentProvider()
+    this.refreshModelGroups()
+    this.showProviderToast($r('app.string.provider_all_models_disabled'))
+  }
+
+  // 一键开启分组内所有模型
+  private async enableGroupModels(groupIndex: number): Promise<void> {
+    if (this.provider === null || groupIndex < 0 || groupIndex >= this.modelGroups.length) {
+      return
+    }
+    const group = this.modelGroups[groupIndex]
+    applyGroupModelsEnabled(group, true)
+    await this.saveCurrentProvider()
+    this.refreshModelGroups()
+    this.showProviderToast($r('app.string.provider_group_models_enabled'))
+  }
+
+  // 一键关闭分组内所有模型
+  private async disableGroupModels(groupIndex: number): Promise<void> {
+    if (this.provider === null || groupIndex < 0 || groupIndex >= this.modelGroups.length) {
+      return
+    }
+    const group = this.modelGroups[groupIndex]
+    applyGroupModelsEnabled(group, false)
+    await this.saveCurrentProvider()
+    this.refreshModelGroups()
+    this.showProviderToast($r('app.string.provider_group_models_disabled'))
+  }
+
+  // 检查是否所有模型都已开启
+  private isAllModelsEnabled(): boolean {
+    if (this.provider === null) {
+      return false
+    }
+    return areAllModelsEnabled(this.provider.models)
+  }
+
+  // 检查分组内是否所有模型都已开启
+  private isGroupAllEnabled(groupIndex: number): boolean {
+    if (groupIndex < 0 || groupIndex >= this.modelGroups.length) {
+      return false
+    }
+    return areGroupAllEnabled(this.modelGroups[groupIndex])
+  }
+
+  private updateModelEnabled(modelId: string, isEnabled: boolean): void {
+    this.updateModelEnabledAsync(modelId, isEnabled).catch((error: Object) => {
+      console.error('ProviderDetailSheet', `[updateModelEnabled] failed: ${JSON.stringify(error)}`)
+      this.showProviderToast($r('app.string.action_failed_retry'))
+      this.refreshModelGroups()
+    })
+  }
+
+  private async updateModelEnabledAsync(modelId: string, isEnabled: boolean): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+
+    let changed = false
+    for (let i = 0; i < this.provider.models.length; i++) {
+      const model = this.provider.models[i]
+      if (model.id === modelId) {
+        if (model.isEnabled !== isEnabled) {
+          model.isEnabled = isEnabled
+          changed = true
+        }
+        break
+      }
+    }
+
+    if (!changed) {
+      return
+    }
+
+    await this.saveCurrentProvider()
+    this.refreshModelGroups()
+    this.notifyProviderChanged()
+  }
+
+  // 打开模型编辑弹窗
+  private openModelEditSheet(model: ModelInfo): void {
+    this.editingModel = model
+    this.activeSheet = 'edit'
+    this.showSheet = true
+  }
+
+  // 保存模型编辑
+  private async saveModelEdit(draft: ModelInfoExtendedJson): Promise<void> {
+    if (this.provider === null || this.editingModel === null) {
+      return
+    }
+
+    applyModelDraft(this.editingModel, draft)
+    await this.saveCurrentProvider()
+    this.showProviderToast($r('app.string.provider_model_saved'))
+    this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
+      this.showSheet = false
+      this.activeSheet = 'none'
+    })
+    this.editingModel = null
+    this.refreshModelGroups()
+    this.notifyProviderChanged()
+  }
+
+  // 取消模型编辑
+  private cancelModelEdit(): void {
+    this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
+      this.showSheet = false
+      this.activeSheet = 'none'
+    })
+    this.editingModel = null
+  }
+
+  // 显示删除确认对话框
+  private showDeleteConfirmDialog(): void {
+    if (this.provider === null) {
+      return
+    }
+    const providerId = this.provider.id
+    this.getUIContext().showAlertDialog({
+      title: $r('app.string.delete_provider_title'),
+      message: $r('app.string.delete_provider_confirm'),
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      primaryButton: {
+        value: $r('app.string.cancel'),
+        action: () => {
+          // 取消操作
+        }
+      },
+      secondaryButton: {
+        value: $r('app.string.delete'),
+        fontColor: Color.Red,
+        action: async () => {
+          await this.providerViewModel.deleteProvider(providerId)
+          showToast(this.getUIContext(), $r('app.string.provider_deleted'))
+          this.onProviderChanged(providerId, false)
+          this.onClose()
+        }
+      }
+    })
+  }
+
+  // 清理编辑状态
+  private clearEditState(): void {
+    this.editingModel = null
+    this.activeSheet = 'none'
+    this.fetchedModels = []
+  }
+
+  private px2vp(px: number): number {
+    return px / (this.getUIContext().getHostContext()?.resourceManager.getDeviceCapabilitySync().screenDensity ?? 3) * 160
+  }
+
+  private isStandalonePagePresentation(): boolean {
+    return this.presentationMode === ProviderDetailPresentationMode.PAGE
+  }
+
+  private isDetailPanePresentation(): boolean {
+    return this.presentationMode === ProviderDetailPresentationMode.DETAIL_PANE
+  }
+
+  private usesLargeProviderHeaderCard(): boolean {
+    return this.presentationMode !== ProviderDetailPresentationMode.SHEET
+  }
+
+  private getBottomAvoidHeightVp(): number {
+    return this.px2vp(this.bottomAvoidHeight)
+  }
+
+  private getStandaloneContentTopPadding(): number {
+    return getHdsTopNavigationContentTopPadding(this.px2vp(this.topAvoidHeight), this.windowWidthVp,
+      this.windowHeightVp)
+  }
+
+  private getStandaloneTitleBarMenuItems(): Array<HdsNavigationMenuItemOptions> {
+    const menus: Array<HdsNavigationMenuItemOptions> = []
+    if (!this.isCreateMode && this.provider !== null) {
+      menus.push({
+        content: {
+          label: $r('app.string.share_button'),
+          icon: createHdsTitleBarSymbolIcon($r('sys.symbol.arrow_right_up_and_square'), 20),
+          action: () => {
+            this.showShareSheet = true
+          }
+        }
+      })
+    }
+    if (!this.isCreateMode && this.provider !== null && !this.provider.isPreset) {
+      menus.push({
+        content: {
+          label: $r('app.string.delete'),
+          icon: createHdsTitleBarSymbolIcon($r('sys.symbol.clean'), 20),
+          action: () => {
+            this.showDeleteConfirmDialog()
+          }
+        }
+      })
+    }
+    menus.push({
+      content: {
+        label: $r('app.string.save'),
+        icon: createHdsTitleBarSymbolIcon(this.headerSaveSymbol(), 20),
+        isEnabled: this.provider !== null && !this.isSaving,
+        action: () => {
+          this.saveConfigAndClose()
+        }
+      }
+    })
+    return menus
+  }
+
+  private getStandaloneTitleBarOptions(): HdsNavigationTitleBarOptions {
+    return buildHdsTopNavigationTitleBarOptionsForNativePage(this.materialType, this.materialLevel, this.windowWidthVp,
+      this.windowHeightVp, $r('app.string.provider_detail_title'), (): void => {
+        this.onClose()
+      }, this.getStandaloneTitleBarMenuItems(), 3)
+  }
+
+  private getCompactSettingsTabsInset(): number {
+    return getSettingsPageCompactTabsTotalInset(this.getBottomAvoidHeightVp(), this.settingsDetailPresentationMode)
+  }
+
+  private shouldAvoidCompactSettingsTabs(): boolean {
+    return this.presentationMode === ProviderDetailPresentationMode.PAGE &&
+      this.settingsDetailPresentationMode !== SettingsPagePresentationMode.DETAIL_PANE
+  }
+
+  private getConfigContentBottomSpacerHeight(): number {
+    if (this.isDetailPanePresentation()) {
+      return 12 + this.getBottomAvoidHeightVp()
+    }
+    if (this.shouldAvoidCompactSettingsTabs()) {
+      return 24 + this.getCompactSettingsTabsInset()
+    }
+    return this.isStandalonePagePresentation() ? 12 : 20
+  }
+
+  private getModelsListBottomSpacerHeight(): number {
+    if (this.isDetailPanePresentation()) {
+      return 12 + this.getBottomAvoidHeightVp()
+    }
+    if (this.shouldAvoidCompactSettingsTabs()) {
+      return 24 + this.getCompactSettingsTabsInset()
+    }
+    return 16
+  }
+
+  private getCurrentApiStyleName(): string {
+    const currentStyle = this.provider?.apiStyle
+    for (let i = 0; i < this.apiStyleOptions.length; i++) {
+      if (this.apiStyleOptions[i].style === currentStyle) {
+        return this.apiStyleOptions[i].name
+      }
+    }
+    return 'OpenAI'
+  }
+
+  private getCurrentOpenAITransportName(): string {
+    if (this.provider?.openaiTransport === OpenAITransport.RESPONSES) {
+      return 'Responses'
+    }
+    return 'Chat Completions'
+  }
+
+  private headerLeadingSymbol(): Resource {
+    if (this.isStandalonePagePresentation()) {
+      return $r('sys.symbol.chevron_left')
+    }
+    return $r('sys.symbol.xmark')
+  }
+
+  private headerSaveSymbol(): Resource {
+    if (this.isStandalonePagePresentation()) {
+      return $r('sys.symbol.save')
+    }
+    return $r('sys.symbol.checkmark')
+  }
+
+  private closeActionLabel(): Resource {
+    if (this.isStandalonePagePresentation()) {
+      return $r('app.string.action_back')
+    }
+    return $r('app.string.action_close')
+  }
+
+  private handleInternalBackPressed(): boolean {
+    if (this.showTextIconEditor) {
+      this.showTextIconEditor = false
+      return true
+    }
+    if (this.showSheet) {
+      this.showSheet = false
+      this.activeSheet = 'none'
+      return true
+    }
+    return false
+  }
+
+  build() {
+    if (this.isStandalonePagePresentation()) {
+      if (this.hostedInNavDestination) {
+        this.StandaloneNavDestinationRoot()
+      } else {
+        this.StandaloneNavigationRoot()
+      }
+    } else {
+      Column() {
+        this.SheetHeader()
+        this.PanelMainContent()
+        this.UnifiedSheetHost()
+        this.ShareSheetHost()
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor(this.presentationMode === ProviderDetailPresentationMode.SHEET ? Color.Transparent
+        : getAppUiState().themeBackground)
+    }
+  }
+
+  @Builder
+  private StandalonePageContent() {
+    Column() {
+      Blank()
+        .width('100%')
+        .height(this.getStandaloneContentTopPadding())
+
+      this.PanelMainContent()
+      this.UnifiedSheetHost()
+      this.ShareSheetHost()
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  @Builder
+  private StandaloneNavDestinationRoot() {
+    HdsNavDestination() {
+      this.StandalonePageContent()
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+    .titleBar(this.getStandaloneTitleBarOptions())
+    .bindToScrollable([this.pageConfigScroller, this.pageModelListScroller])
+    .titleMode(HdsNavDestinationTitleMode.MINI)
+    .systemBarStyle(
+      { statusBarContentColor: getHdsStatusBarContentColor() },
+      { statusBarContentColor: getHdsStatusBarContentColor() }
+    )
+    .hideBackButton(false)
+    .hideToolBar(true)
+    .onReady((context: NavDestinationContext) => {
+      this.onDestinationReady(context)
+    })
+    .onBackPressed((): boolean => {
+      if (this.handleInternalBackPressed()) {
+        return true
+      }
+      this.onClose()
+      return true
+    })
+  }
+
+  @Builder
+  private StandaloneNavigationRoot() {
+    HdsNavigation() {
+      this.StandalonePageContent()
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+    .titleBar(this.getStandaloneTitleBarOptions())
+    .bindToScrollable([this.pageConfigScroller, this.pageModelListScroller])
+    .titleMode(HdsNavigationTitleMode.MINI)
+    .systemBarStyle(
+      { statusBarContentColor: getHdsStatusBarContentColor() },
+      { statusBarContentColor: getHdsStatusBarContentColor() }
+    )
+    .hideBackButton(false)
+    .hideToolBar(true)
+    .mode(NavigationMode.Stack)
+    .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP])
+  }
+
+  @Builder
+  private PanelMainContent() {
+    if (this.isLoading) {
+      this.LoadingView()
+    } else if (this.provider === null) {
+      this.ErrorView()
+    } else {
+      this.ProviderHeaderCard()
+
+      if (this.isStandalonePagePresentation()) {
+        this.PageSectionTabs()
+
+        if (this.currentTabIndex === 0) {
+          Scroll(this.pageConfigScroller) {
+            Column() {
+              this.ApiConfigCard()
+
+              Column().height(this.getConfigContentBottomSpacerHeight())
+            }
+            .width('100%')
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .align(Alignment.Top)
+          .expandSafeArea([SafeAreaType.KEYBOARD], [SafeAreaEdge.BOTTOM])
+        } else {
+          Column() {
+            this.ModelsCard()
+          }
+          .width('100%')
+          .layoutWeight(1)
+        }
+      } else if (this.isDetailPanePresentation()) {
+        this.PageSectionTabs()
+
+        if (this.currentTabIndex === 0) {
+          this.DetailPaneConfigContent()
+        } else {
+          this.DetailPaneModelsContent()
+        }
+      } else {
+        Tabs({ barPosition: BarPosition.End, index: this.currentTabIndex }) {
+          TabContent() {
+            Scroll() {
+              Column() {
+                this.ApiConfigCard()
+
+                Column().height(this.getConfigContentBottomSpacerHeight())
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .height('100%')
+            .scrollBar(BarState.Off)
+            .edgeEffect(EdgeEffect.Spring)
+            .align(Alignment.Top)
+          }
+          .tabBar(this.ConfigTabBuilder())
+
+          TabContent() {
+            Column() {
+              this.ModelsCard()
+            }
+            .width('100%')
+            .height('100%')
+          }
+          .tabBar(this.ModelsTabBuilder())
+        }
+        .layoutWeight(1)
+        .barOverlap(false)
+        .barBackgroundBlurStyle(BlurStyle.Thin)
+        .animationDuration(300)
+        .onChange((index: number) => {
+          this.currentTabIndex = index
+          if (index === 0) {
+            this.configTabEffectTrigger++
+          } else {
+            this.modelsTabEffectTrigger++
+          }
+        })
+      }
+    }
+  }
+
+  @Builder
+  private UnifiedSheetHost() {
+    Column()
+      .width(0)
+      .height(0)
+      .bindSheet($$this.showSheet, this.UnifiedSheetBuilder(), {
+        height: SheetSize.LARGE,
+        showClose: false,
+        dragBar: true,
+        blurStyle: BlurStyle.Regular,
+        shouldDismiss: (dismissAction: SheetDismiss) => {
+          dismissAction.dismiss()
+        },
+        onDisappear: () => {
+          this.clearEditState()
+        }
+      })
+  }
+
+  @Builder
+  private ShareSheetBuilder() {
+    ProviderShareSheet({
+      provider: this.provider,
+      onClose: () => {
+        this.showShareSheet = false
+      }
+    })
+  }
+
+  @Builder
+  private ShareSheetHost() {
+    Column()
+      .width(0)
+      .height(0)
+      .bindSheet($$this.showShareSheet, this.ShareSheetBuilder(), {
+        height: SheetSize.LARGE,
+        showClose: false,
+        dragBar: true,
+        blurStyle: BlurStyle.Regular,
+        shouldDismiss: (dismissAction: SheetDismiss) => {
+          dismissAction.dismiss()
+        }
+      })
+  }
+
+  @Builder
+  ConfigTabBuilder() {
+    Row({ space: 6 }) {
+      SymbolGlyph($r('sys.symbol.gearshape'))
+        .fontSize(16)
+        .fontColor([this.currentTabIndex === 0 ? $r('app.color.text_primary') : $r('app.color.text_tertiary')])
+        .symbolEffect(new ScaleSymbolEffect(EffectScope.WHOLE), this.configTabEffectTrigger)
+      Text($r('app.string.provider_tab_config'))
+        .fontSize(14)
+        .fontColor(this.currentTabIndex === 0 ? $r('app.color.text_primary') : $r('app.color.text_tertiary'))
+        .fontWeight(this.currentTabIndex === 0 ? FontWeight.Bold : FontWeight.Normal)
+    }
+    .justifyContent(FlexAlign.Center)
+    .height('100%')
+    .padding({ left: 16, right: 16 })
+  }
+
+  @Builder
+  ModelsTabBuilder() {
+    Row({ space: 6 }) {
+      SymbolGlyph($r('sys.symbol.satellite_map'))
+        .fontSize(16)
+        .fontColor([this.currentTabIndex === 1 ? $r('app.color.text_primary') : $r('app.color.text_tertiary')])
+        .symbolEffect(new ScaleSymbolEffect(EffectScope.WHOLE), this.modelsTabEffectTrigger)
+      Text($r('app.string.provider_tab_models'))
+        .fontSize(14)
+        .fontColor(this.currentTabIndex === 1 ? $r('app.color.text_primary') : $r('app.color.text_tertiary'))
+        .fontWeight(this.currentTabIndex === 1 ? FontWeight.Bold : FontWeight.Normal)
+    }
+    .justifyContent(FlexAlign.Center)
+    .height('100%')
+    .padding({ left: 16, right: 16 })
+  }
+
+  @Builder
+  private DetailPaneConfigContent() {
+    Scroll(this.pageConfigScroller) {
+      Column() {
+        this.ApiConfigCard()
+
+        Column().height(this.getConfigContentBottomSpacerHeight())
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
+    .align(Alignment.Top)
+    .expandSafeArea([SafeAreaType.KEYBOARD], [SafeAreaEdge.BOTTOM])
+  }
+
+  @Builder
+  private DetailPaneModelsContent() {
+    Column() {
+      this.ModelsCard()
+    }
+    .width('100%')
+    .layoutWeight(1)
+  }
+
+  @Builder
+  PageSectionTabs() {
+    Row({ space: 20 }) {
+      this.PageSectionTabButton(0, $r('app.string.provider_tab_config'))
+      this.PageSectionTabButton(1, $r('app.string.provider_tab_models'))
+      Blank()
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 2, bottom: 2 })
+  }
+
+  @Builder
+  PageSectionTabButton(index: number, title: Resource) {
+    Button() {
+      Column({ space: 6 }) {
+        Text(title)
+          .fontSize(15)
+          .fontWeight(this.currentTabIndex === index ? FontWeight.Bold : FontWeight.Medium)
+          .fontColor(this.currentTabIndex === index ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+
+        Column()
+          .width(this.currentTabIndex === index ? 24 : 14)
+          .height(3)
+          .borderRadius(2)
+          .backgroundColor(this.currentTabIndex === index ? this.themePrimary : Color.Transparent)
+      }
+      .alignItems(HorizontalAlign.Start)
+    }
+    .type(ButtonType.Normal)
+    .stateEffect(false)
+    .padding({ left: 0, right: 0, top: 4, bottom: 4 })
+    .backgroundColor(Color.Transparent)
+    .onClick(() => {
+      if (this.currentTabIndex === index) {
+        return
+      }
+      this.currentTabIndex = index
+    })
+  }
+
+  @Builder
+  SheetHeader() {
+    if (this.isStandalonePagePresentation()) {
+      Column({ space: 6 }) {
+        Column()
+          .width('100%')
+          .height(this.px2vp(this.topAvoidHeight))
+
+        Row({ space: 8 }) {
+          Button() {
+            SymbolGlyph(this.headerLeadingSymbol())
+              .fontSize(18)
+              .fontColor([$r('app.color.text_primary')])
+          }
+          .type(ButtonType.Normal)
+          .stateEffect(false)
+          .width(32)
+          .height(32)
+          .padding(0)
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            this.onClose()
+          })
+
+          Column({ space: 2 }) {
+            Text($r('app.string.provider_detail_title'))
+              .fontSize(18)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+              .width('100%')
+            Text(this.currentTabIndex === 0 ? $r('app.string.provider_api_config') : $r('app.string.provider_models_manage'))
+              .fontSize(11)
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          if (!this.isCreateMode && this.provider !== null) {
+            Button() {
+              SymbolGlyph($r('sys.symbol.arrow_right_up_and_square'))
+                .fontSize(18)
+                .fontColor([$r('app.color.text_secondary')])
+            }
+            .type(ButtonType.Circle)
+            .width(36)
+            .height(36)
+            .backgroundColor($r('app.color.divider'))
+            .onClick(() => {
+              this.showShareSheet = true
+            })
+          }
+
+          if (!this.isCreateMode && this.provider !== null && !this.provider.isPreset) {
+            Button() {
+              SymbolGlyph($r('sys.symbol.clean'))
+                .fontSize(18)
+                .fontColor([$r('app.color.status_error')])
+            }
+            .type(ButtonType.Circle)
+            .width(36)
+            .height(36)
+            .backgroundColor($r('app.color.divider'))
+            .onClick(() => {
+              this.showDeleteConfirmDialog()
+            })
+          }
+
+          Button() {
+            SymbolGlyph(this.headerSaveSymbol())
+              .fontSize(18)
+              .fontColor([Color.White])
+          }
+          .type(ButtonType.Circle)
+          .width(36)
+          .height(36)
+          .backgroundColor(this.themePrimary)
+          .onClick(() => {
+            this.saveConfigAndClose()
+          })
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, bottom: 6 })
+      .backgroundColor(getAppUiState().themeBackground)
+    } else if (this.isDetailPanePresentation()) {
+      Column() {
+        Row({ space: 10 }) {
+          Button() {
+            SymbolGlyph(this.headerLeadingSymbol())
+              .fontSize(18)
+              .fontColor([$r('app.color.text_secondary')])
+          }
+          .type(ButtonType.Circle)
+          .width(36)
+          .height(36)
+          .backgroundColor($r('app.color.divider'))
+          .onClick(() => {
+            this.onClose()
+          })
+
+          Column({ space: 2 }) {
+            Text(this.isCreateMode ? $r('app.string.add_custom_provider') :
+              (this.provider?.name ?? $r('app.string.provider_detail_title')))
+              .fontSize(18)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+              .width('100%')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+            Text(this.currentTabIndex === 0 ? $r('app.string.provider_api_config') :
+              $r('app.string.provider_models_manage'))
+              .fontSize(11)
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          if (!this.isCreateMode && this.provider !== null) {
+            Button() {
+              SymbolGlyph($r('sys.symbol.arrow_right_up_and_square'))
+                .fontSize(18)
+                .fontColor([$r('app.color.text_secondary')])
+            }
+            .type(ButtonType.Circle)
+            .width(36)
+            .height(36)
+            .backgroundColor($r('app.color.divider'))
+            .onClick(() => {
+              this.showShareSheet = true
+            })
+          }
+
+          if (!this.isCreateMode && this.provider !== null && !this.provider.isPreset) {
+            Button() {
+              SymbolGlyph($r('sys.symbol.clean'))
+                .fontSize(18)
+                .fontColor([$r('app.color.status_error')])
+            }
+            .type(ButtonType.Circle)
+            .width(36)
+            .height(36)
+            .backgroundColor($r('app.color.divider'))
+            .onClick(() => {
+              this.showDeleteConfirmDialog()
+            })
+          }
+
+          Button() {
+            SymbolGlyph(this.headerSaveSymbol())
+              .fontSize(18)
+              .fontColor([Color.White])
+          }
+          .type(ButtonType.Circle)
+          .width(36)
+          .height(36)
+          .backgroundColor(this.themePrimary)
+          .onClick(() => {
+            this.saveConfigAndClose()
+          })
+        }
+        .width('100%')
+        .height(64)
+        .padding({ left: 24, right: 24 })
+        .alignItems(VerticalAlign.Center)
+      }
+      .width('100%')
+      .backgroundColor(getAppUiState().themeBackground)
+      .border({ width: { bottom: 1 }, color: $r('app.color.divider') })
+    } else {
+      Row() {
+        // 关闭按钮
+        Button() {
+          SymbolGlyph(this.headerLeadingSymbol())
+            .fontSize(18)
+            .fontColor([$r('app.color.text_secondary')])
+        }
+        .type(ButtonType.Circle)
+        .width(36)
+        .height(36)
+        .backgroundColor($r('app.color.divider'))
+        .onClick(() => {
+          this.onClose()
+        })
+
+        // 标题
+        Text(this.isCreateMode ? $r('app.string.add_custom_provider') :
+          (this.provider?.name ?? $r('app.string.provider_detail_title')))
+          .fontSize(17)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+
+        // 分享按钮（非创建模式）
+        if (!this.isCreateMode && this.provider !== null) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.arrow_right_up_and_square'))
+              .fontSize(18)
+              .fontColor([$r('app.color.text_secondary')])
+          }
+          .type(ButtonType.Circle)
+          .width(36)
+          .height(36)
+          .backgroundColor($r('app.color.divider'))
+          .margin({ right: 8 })
+          .onClick(() => {
+            this.showShareSheet = true
+          })
+        }
+
+        // 删除按钮（非创建模式且非预置服务商）
+        if (!this.isCreateMode && this.provider !== null && !this.provider.isPreset) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.clean'))
+              .fontSize(18)
+              .fontColor([$r('app.color.status_error')])
+          }
+          .type(ButtonType.Circle)
+          .width(36)
+          .height(36)
+          .backgroundColor($r('app.color.divider'))
+          .margin({ right: 8 })
+          .onClick(() => {
+            this.showDeleteConfirmDialog()
+          })
+        }
+
+        // 保存按钮
+        Button() {
+          SymbolGlyph(this.headerSaveSymbol())
+            .fontSize(18)
+            .fontColor([Color.White])
+        }
+        .type(ButtonType.Circle)
+        .width(36)
+        .height(36)
+        .backgroundColor(this.themePrimary)
+        .onClick(() => {
+          this.saveConfigAndClose()
+        })
+      }
+      .width('100%')
+      .height(52)
+      .padding({ left: 16, right: 16 })
+    }
+  }
+
+  @Builder
+  LoadingView() {
+    Column() {
+      LoadingProgress()
+        .width(48)
+        .height(48)
+        .color(this.themePrimary)
+
+      Text($r('app.string.loading'))
+        .fontSize(14)
+        .fontColor($r('app.color.text_secondary'))
+        .margin({ top: 16 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
+  ErrorView() {
+    Column() {
+      SymbolGlyph($r('sys.symbol.xmark_circle'))
+        .fontSize(48)
+        .fontColor([$r('app.color.text_tertiary')])
+
+      Text($r('app.string.provider_detail_not_found'))
+        .fontSize(16)
+        .fontColor($r('app.color.text_secondary'))
+        .margin({ top: 16 })
+
+      Button() {
+        Text(this.closeActionLabel())
+          .fontSize(14)
+          .fontColor(this.themePrimary)
+      }
+        .backgroundColor(this.themePrimarySubtleBackground)
+        .borderRadius(20)
+        .height(40)
+        .padding({ left: 24, right: 24 })
+        .margin({ top: 24 })
+        .onClick(() => {
+          this.onClose()
+        })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
+  ProviderHeaderCard() {
+    if (this.usesLargeProviderHeaderCard()) {
+      Stack({ alignContent: Alignment.TopStart }) {
+        Column({ space: 12 }) {
+          Row({ space: 12 }) {
+            if (this.provider !== null) {
+              ProviderIcon({
+                iconType: this.provider.iconType,
+                iconPath: this.provider.iconPath,
+                textIcon: this.provider.textIcon,
+                textIconBgColor: this.provider.textIconBgColor,
+                customImagePath: this.provider.customImagePath,
+                iconSize: 48,
+                radius: 12,
+                bgColor: $r('app.color.divider'),
+                brandColor: this.provider.brandColor,
+                fallbackSymbol: $r('sys.symbol.cloud'),
+                fallbackColor: $r('app.color.text_secondary')
+              })
+                .onClick(() => {
+                  this.openIconEditor()
+                })
+                .bindSheet($$this.showTextIconEditor, this.IconEditSheetBuilder(), {
+                  height: SheetSize.FIT_CONTENT,
+                  dragBar: true,
+                  showClose: false,
+                  backgroundColor: getAppUiState().themeBackground,
+                  onDisappear: () => {
+                    this.showTextIconEditor = false
+                  }
+                })
+            }
+
+            Column({ space: 2 }) {
+              if (this.isCreateMode) {
+                TextInput({ text: this.provider?.name ?? '', placeholder: $r('app.string.provider_name_placeholder') })
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+                  .backgroundColor(Color.Transparent)
+                  .borderRadius(0)
+                  .padding({ left: 8, right: 4, top: 0, bottom: 0 })
+                  .onChange((value: string) => {
+                    if (this.provider !== null) {
+                      this.provider.name = value
+                      if (this.provider.iconType === 'text') {
+                        const config = generateDefaultTextIcon(value)
+                        this.provider.textIcon = config.text
+                      }
+                    }
+                  })
+              } else if (this.provider !== null && !this.provider.isPreset) {
+                TextInput({ text: this.provider?.name ?? '', placeholder: $r('app.string.provider_name_placeholder') })
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+                  .backgroundColor(Color.Transparent)
+                  .borderRadius(0)
+                  .padding({ left: 8, right: 4, top: 0, bottom: 0 })
+                  .onChange((value: string) => {
+                    if (this.provider !== null) {
+                      this.provider.name = value
+                    }
+                  })
+              } else {
+                Text(this.provider?.name ?? '')
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.text_primary'))
+                  .margin({ left: 8 })
+                  .maxLines(1)
+              }
+
+              Text(this.provider?.baseUrl ?? '')
+                .fontSize(12)
+                .fontColor($r('app.color.text_secondary'))
+                .margin({ left: 8 })
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            if (this.provider?.id !== 'siliconflow') {
+              Toggle({ type: ToggleType.Switch, isOn: this.provider?.isConnected ?? false })
+                .selectedColor(this.themePrimary)
+                .onChange((isOn: boolean) => {
+                  if (this.provider !== null && this.provider.isConnected !== isOn) {
+                    this.toggleEnabled()
+                  }
+                })
+            }
+          }
+          .alignItems(VerticalAlign.Top)
+          .width('100%')
+
+          Row({ space: 8 }) {
+            Row({ space: 6 }) {
+              SymbolGlyph((this.provider?.isConnected ?? false) ? $r('sys.symbol.checkmark_circle_fill') : $r('sys.symbol.xmark_circle'))
+                .fontSize(12)
+                .fontColor([(this.provider?.isConnected ?? false) ? this.themePrimary : $r('app.color.text_secondary')])
+              Text((this.provider?.isConnected ?? false) ? $r('app.string.provider_enabled') : $r('app.string.provider_disabled'))
+                .fontSize(11)
+                .fontWeight(FontWeight.Medium)
+                .fontColor((this.provider?.isConnected ?? false) ? this.themePrimary : $r('app.color.text_secondary'))
+            }
+            .padding({ left: 8, right: 8, top: 5, bottom: 5 })
+            .backgroundColor((this.provider?.isConnected ?? false) ? this.themePrimarySubtleBackground : getAppUiState().themeBackground)
+            .borderRadius(14)
+
+            Row({ space: 6 }) {
+              SymbolGlyph($r('sys.symbol.AI_model'))
+                .fontSize(12)
+                .fontColor([$r('app.color.text_secondary')])
+              Text(this.getCurrentApiStyleName())
+                .fontSize(11)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_secondary'))
+            }
+            .padding({ left: 8, right: 8, top: 5, bottom: 5 })
+            .backgroundColor(getAppUiState().themeBackground)
+            .borderRadius(14)
+
+            Row({ space: 6 }) {
+              SymbolGlyph($r('sys.symbol.satellite_map'))
+                .fontSize(12)
+                .fontColor([$r('app.color.text_secondary')])
+              Text(`${this.provider?.models.length ?? 0}`)
+                .fontSize(11)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_secondary'))
+            }
+            .padding({ left: 8, right: 8, top: 5, bottom: 5 })
+            .backgroundColor(getAppUiState().themeBackground)
+            .borderRadius(14)
+
+            if (this.provider?.apiStyle === ApiStyle.OPENAI) {
+              Row({ space: 6 }) {
+                SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+                  .fontSize(12)
+                  .fontColor([$r('app.color.text_secondary')])
+                Text(this.getCurrentOpenAITransportName())
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .padding({ left: 8, right: 8, top: 5, bottom: 5 })
+              .backgroundColor(getAppUiState().themeBackground)
+              .borderRadius(14)
+            }
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 16, bottom: 14 })
+      }
+      .width('100%')
+      .backgroundColor(getAppUiState().themeSurface)
+      .borderRadius(20)
+      .clip(true)
+      .margin({ left: 16, right: 16, top: 2, bottom: 4 })
+    } else {
+      Column() {
+        Row() {
+          // 供应商图标（使用 ProviderIcon 组件支持所有图标类型）
+          if (this.provider !== null) {
+            ProviderIcon({
+              iconType: this.provider.iconType,
+              iconPath: this.provider.iconPath,
+              textIcon: this.provider.textIcon,
+              textIconBgColor: this.provider.textIconBgColor,
+              customImagePath: this.provider.customImagePath,
+              iconSize: 44,
+              radius: 11,
+              bgColor: $r('app.color.divider'),
+              brandColor: this.provider.brandColor,
+              fallbackSymbol: $r('sys.symbol.cloud'),
+              fallbackColor: $r('app.color.text_secondary')
+            })
+              .onClick(() => {
+                this.openIconEditor()
+              })
+              .bindSheet($$this.showTextIconEditor, this.IconEditSheetBuilder(), {
+                height: SheetSize.FIT_CONTENT,
+                dragBar: true,
+                showClose: false,
+                backgroundColor: getAppUiState().themeBackground,
+                onDisappear: () => {
+                  this.showTextIconEditor = false
+                }
+              })
+          }
+
+          Column() {
+            if (this.isCreateMode) {
+              TextInput({ text: this.provider?.name ?? '', placeholder: $r('app.string.provider_name_placeholder') })
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary'))
+                .backgroundColor(Color.Transparent)
+                .borderRadius(0)
+                .padding({ left: 8, right: 4, top: 0, bottom: 0 })
+                .onChange((value: string) => {
+                  if (this.provider !== null) {
+                    this.provider.name = value
+                    // 自动更新文字图标
+                    if (this.provider.iconType === 'text') {
+                      const config = generateDefaultTextIcon(value)
+                      this.provider.textIcon = config.text
+                    }
+                  }
+                })
+            } else if (this.provider !== null && !this.provider.isPreset) {
+              TextInput({ text: this.provider?.name ?? '', placeholder: $r('app.string.provider_name_placeholder') })
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary'))
+                .backgroundColor(Color.Transparent)
+                .borderRadius(0)
+                .padding({ left: 8, right: 4, top: 0, bottom: 0 })
+                .onChange((value: string) => {
+                  if (this.provider !== null) {
+                    this.provider.name = value
+                  }
+                })
+            } else {
+              Text(this.provider?.name ?? '')
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary'))
+                .margin({ left: 8 })
+            }
+
+            Text(this.provider?.baseUrl ?? '')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .margin({ left: 8, top: 2 })
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .alignItems(HorizontalAlign.Start)
+          .margin({ left: 10 })
+          .layoutWeight(1)
+
+          // 启用开关（系统服务不可禁用）
+          if (this.provider?.id !== 'siliconflow') {
+            Toggle({ type: ToggleType.Switch, isOn: this.provider?.isConnected ?? false })
+              .selectedColor(this.themePrimary)
+              .onChange((isOn: boolean) => {
+                // 只有当状态真正改变时才处理（避免重复触发）
+                if (this.provider !== null && this.provider.isConnected !== isOn) {
+                  this.toggleEnabled()
+                }
+              })
+          }
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+      }
+      .width('100%')
+      .backgroundColor(getAppUiState().themeSurface)
+      .borderRadius(16)
+      .margin({ left: 16, right: 16, top: 4 })
+    }
+  }
+
+  @Builder
+  PageMetaBadge(symbol: Resource, label: string | Resource, accent: boolean = false) {
+    Row({ space: 6 }) {
+      SymbolGlyph(symbol)
+        .fontSize(12)
+        .fontColor([accent ? this.themePrimary : $r('app.color.text_secondary')])
+      Text(label)
+        .fontSize(11)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(accent ? this.themePrimary : $r('app.color.text_secondary'))
+    }
+    .padding({ left: 8, right: 8, top: 5, bottom: 5 })
+    .backgroundColor(accent ? this.themePrimarySubtleBackground : getAppUiState().themeBackground)
+    .borderRadius(14)
+  }
+
+  @Builder
+  ApiConfigCard() {
+    Column() {
+      // 标题
+      Text($r('app.string.provider_api_config'))
+        .fontSize(15)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_primary'))
+        .width('100%')
+        .padding({ left: 16, top: 16, bottom: 12 })
+
+      // API 风格选择
+      if (this.provider !== null) {
+        Column() {
+          Text($r('app.string.api_style'))
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+            .width('100%')
+
+          Column() {
+            ForEach(this.apiStyleOptions, (option: ApiStyleOption, index: number) => {
+              Row() {
+                Radio({ value: option.style, group: 'apiStyleSheet' })
+                  .checked(this.provider?.apiStyle === option.style)
+                  .onChange((isChecked: boolean) => {
+                    if (isChecked && this.provider !== null) {
+                      this.provider.apiStyle = option.style
+                    }
+                  })
+
+                Column() {
+                  Text(option.name)
+                    .fontSize(14)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.text_primary'))
+
+                  Text(option.description)
+                    .fontSize(11)
+                    .fontColor($r('app.color.text_secondary'))
+                    .margin({ top: 2 })
+                }
+                .alignItems(HorizontalAlign.Start)
+                .margin({ left: 8 })
+                .layoutWeight(1)
+              }
+              .width('100%')
+              .padding({ left: 8, right: 8, top: 10, bottom: 10 })
+              .onClick(() => {
+                if (this.provider !== null) {
+                  this.provider.apiStyle = option.style
+                }
+              })
+
+              if (index < this.apiStyleOptions.length - 1) {
+                Divider().color($r('app.color.divider')).margin({ left: 40 })
+              }
+            })
+          }
+          .width('100%')
+          .backgroundColor(getAppUiState().themeBackground)
+          .borderRadius(8)
+          .margin({ top: 8 })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16 })
+
+        Divider()
+          .color($r('app.color.divider'))
+          .margin({ left: 16, right: 16, top: 16, bottom: 16 })
+
+        if (this.provider?.apiStyle === ApiStyle.OPENAI) {
+          Column() {
+            Text('OpenAI 协议')
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+              .width('100%')
+
+            Column() {
+              ForEach(this.openaiTransportOptions, (option: OpenAITransportOption, index: number) => {
+                Row() {
+                  Radio({ value: option.transport, group: 'openaiTransportSheet' })
+                    .checked(this.provider?.openaiTransport === option.transport)
+                    .onChange((isChecked: boolean) => {
+                      if (isChecked && this.provider !== null) {
+                        this.provider.openaiTransport = option.transport
+                      }
+                    })
+
+                  Column() {
+                    Text(option.name)
+                      .fontSize(14)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor($r('app.color.text_primary'))
+
+                    Text(option.description)
+                      .fontSize(11)
+                      .fontColor($r('app.color.text_secondary'))
+                      .margin({ top: 2 })
+                  }
+                  .alignItems(HorizontalAlign.Start)
+                  .margin({ left: 8 })
+                  .layoutWeight(1)
+                }
+                .width('100%')
+                .padding({ left: 8, right: 8, top: 10, bottom: 10 })
+                .onClick(() => {
+                  if (this.provider !== null) {
+                    this.provider.openaiTransport = option.transport
+                  }
+                })
+
+                if (index < this.openaiTransportOptions.length - 1) {
+                  Divider().color($r('app.color.divider')).margin({ left: 40 })
+                }
+              })
+            }
+            .width('100%')
+            .backgroundColor(getAppUiState().themeBackground)
+            .borderRadius(8)
+            .margin({ top: 8 })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+
+          Divider()
+            .color($r('app.color.divider'))
+            .margin({ left: 16, right: 16, top: 16, bottom: 16 })
+        }
+
+        if (this.provider !== null && !this.provider.isPreset) {
+          Column() {
+            Row() {
+              Column() {
+                Text($r('app.string.provider_requires_api_key'))
+                  .fontSize(13)
+                  .fontColor($r('app.color.text_secondary'))
+
+                Text($r('app.string.provider_requires_api_key_desc'))
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_tertiary'))
+                  .margin({ top: 2 })
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              Toggle({ type: ToggleType.Switch, isOn: this.provider.requiresApiKey })
+                .selectedColor(this.themePrimary)
+                .onChange((isOn: boolean) => {
+                  if (this.provider !== null) {
+                    this.provider.requiresApiKey = isOn
+                  }
+                })
+            }
+            .width('100%')
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+
+          Divider()
+            .color($r('app.color.divider'))
+            .margin({ left: 16, right: 16, top: 16, bottom: 16 })
+        }
+      }
+
+      // API Key
+      Column() {
+        Row() {
+          Text($r('app.string.api_key'))
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+          if (this.provider?.requiresApiKey ?? true) {
+            Text(' *')
+              .fontSize(13)
+              .fontColor(Color.Red)
+          }
+          Blank()
+          HelpHintButton({
+            title: $r('app.string.help_hint_provider_title'),
+            body: $r('app.string.help_hint_provider_body'),
+            iconSize: 15
+          })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        Row() {
+          TextInput({ text: this.provider?.apiKey ?? '', placeholder: $r('app.string.provider_api_key_placeholder') })
+            .type(InputType.Password)
+            .enableAutoFill(false)
+            .showPasswordIcon(true)
+            .fontSize(14)
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor(Color.Transparent)
+            .layoutWeight(1)
+            .onChange((value: string) => {
+              if (this.provider !== null) {
+                this.provider.apiKey = value
+              }
+            })
+
+          // 测试按钮
+          Button() {
+            if (this.isTesting) {
+              LoadingProgress()
+                .width(16)
+                .height(16)
+                .color(this.themePrimary)
+            } else {
+              Text($r('app.string.test_connection'))
+                .fontSize(13)
+                .fontColor(this.themePrimary)
+            }
+          }
+          .height(32)
+          .padding({ left: 12, right: 12 })
+          .backgroundColor(this.themePrimarySubtleBackground)
+          .borderRadius(16)
+          .margin({ left: 8 })
+          .enabled(!this.isTesting)
+          .onClick(() => {
+            this.testConnection()
+          })
+        }
+        .width('100%')
+        .height(48)
+        .backgroundColor(getAppUiState().themeBackground)
+        .borderRadius(8)
+        .padding({ left: 12, right: 8 })
+        .margin({ top: 8 })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16 })
+
+      Divider()
+        .color($r('app.color.divider'))
+        .margin({ left: 16, right: 16, top: 16, bottom: 16 })
+
+      // API Base URL
+      Column() {
+        Row() {
+          Text($r('app.string.base_url'))
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+          Text(' *')
+            .fontSize(13)
+            .fontColor(Color.Red)
+        }
+        .width('100%')
+
+        TextInput({ text: this.provider?.baseUrl ?? '', placeholder: $r('app.string.provider_base_url_placeholder') })
+          .fontSize(14)
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor(getAppUiState().themeBackground)
+          .borderRadius(8)
+          .height(48)
+          .width('100%')
+          .padding({ left: 12, right: 12 })
+          .margin({ top: 8 })
+          .onChange((value: string) => {
+            if (this.provider !== null) {
+              this.provider.baseUrl = value
+            }
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16 })
+
+      Divider()
+        .color($r('app.color.divider'))
+        .margin({ left: 16, right: 16, top: 16, bottom: 16 })
+
+      // API 路径（可选）
+      Column() {
+        Text($r('app.string.api_path_optional'))
+          .fontSize(13)
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+
+        TextInput({ text: this.provider?.apiPath ?? '', placeholder: $r('app.string.provider_api_path_placeholder') })
+          .fontSize(14)
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor(getAppUiState().themeBackground)
+          .borderRadius(8)
+          .height(48)
+          .width('100%')
+          .padding({ left: 12, right: 12 })
+          .margin({ top: 8 })
+          .onChange((value: string) => {
+            if (this.provider !== null) {
+              this.provider.apiPath = value
+            }
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16 })
+
+      Divider()
+        .color($r('app.color.divider'))
+        .margin({ left: 16, right: 16, top: 16, bottom: 16 })
+
+      Column({ space: 12 }) {
+        Row({ space: 8 }) {
+          Text($r('app.string.provider_custom_headers_title'))
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_secondary'))
+            .layoutWeight(1)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+          Toggle({ type: ToggleType.Switch, isOn: this.showProviderCustomHeadersEditor })
+            .selectedColor(this.themePrimary)
+            .onChange((isOn: boolean) => {
+              this.showProviderCustomHeadersEditor = isOn
+            })
+        }
+        .width('100%')
+
+        if (this.showProviderCustomHeadersEditor) {
+          Row() {
+            Button() {
+              Row({ space: 4 }) {
+                SymbolGlyph($r('sys.symbol.plus'))
+                  .fontSize(13)
+                  .fontColor([Color.White])
+                Text($r('app.string.provider_custom_headers_add'))
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(Color.White)
+              }
+            }
+            .height(32)
+            .padding({ left: 14, right: 14 })
+            .type(ButtonType.Capsule)
+            .stateEffect(false)
+            .backgroundColor(this.themePrimary)
+            .onClick(() => {
+              this.addProviderHeaderEntry()
+            })
+            Blank()
+          }
+          .width('100%')
+        }
+
+        if (this.showProviderCustomHeadersEditor) {
+          ForEach(this.providerCustomHeaderEntries, (entry: ProviderHeaderEntry, index: number) => {
+            Column({ space: 10 }) {
+              Row() {
+                Text(`${pickLocalizedText('请求头 ', 'Header ')}${index + 1}`)
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                  .layoutWeight(1)
+
+                if (this.isSensitiveProviderHeaderName(entry.name)) {
+                  Text($r('app.string.provider_custom_header_sensitive'))
+                    .fontSize(10)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(this.sensitiveBadgeColor)
+                    .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                    .borderRadius(999)
+                    .backgroundColor(this.sensitiveBadgeBackgroundColor)
+                    .margin({ right: 8 })
+                }
+
+                Button($r('app.string.delete'))
+                  .height(28)
+                  .fontSize(11)
+                  .type(ButtonType.Capsule)
+                  .stateEffect(false)
+                  .backgroundColor(getAppUiState().themeSurface)
+                  .border({ width: 1, color: this.isDarkMode ? '#6A3139' : '#F2CBD2' })
+                  .fontColor('#D9485F')
+                  .onClick(() => {
+                    this.removeProviderHeaderEntry(entry.id)
+                  })
+              }
+              .width('100%')
+
+              Column({ space: 6 }) {
+                Text($r('app.string.provider_custom_header_name'))
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_tertiary'))
+                  .width('100%')
+
+                TextInput({ text: entry.name, placeholder: $r('app.string.provider_custom_header_name_placeholder') })
+                  .onChange((value: string) => {
+                    this.updateProviderHeaderEntryName(entry.id, value)
+                  })
+                  .fontSize(14)
+                  .width('100%')
+                  .height(44)
+                  .borderRadius(14)
+                  .backgroundColor(getAppUiState().themeBackground)
+                  .border({ width: 1, color: $r('app.color.divider') })
+                  .padding({ left: 14, right: 14 })
+              }
+              .width('100%')
+
+              Column({ space: 6 }) {
+                Text($r('app.string.provider_custom_header_value'))
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_tertiary'))
+                  .width('100%')
+
+                if (this.isSensitiveProviderHeaderName(entry.name)) {
+                  TextInput({ text: entry.value, placeholder: $r('app.string.provider_custom_header_value_placeholder') })
+                    .onChange((value: string) => {
+                      this.updateProviderHeaderEntryValue(entry.id, value)
+                    })
+                    .type(InputType.Password)
+                    .enableAutoFill(false)
+                    .fontSize(14)
+                    .width('100%')
+                    .height(44)
+                    .borderRadius(14)
+                    .backgroundColor(getAppUiState().themeBackground)
+                    .border({ width: 1, color: $r('app.color.divider') })
+                    .padding({ left: 14, right: 14 })
+                } else {
+                  TextInput({ text: entry.value, placeholder: $r('app.string.provider_custom_header_value_placeholder') })
+                    .onChange((value: string) => {
+                      this.updateProviderHeaderEntryValue(entry.id, value)
+                    })
+                    .fontSize(14)
+                    .width('100%')
+                    .height(44)
+                    .borderRadius(14)
+                    .backgroundColor(getAppUiState().themeBackground)
+                    .border({ width: 1, color: $r('app.color.divider') })
+                    .padding({ left: 14, right: 14 })
+                }
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .padding(14)
+            .borderRadius(18)
+            .backgroundColor(getAppUiState().themeBackground)
+            .border({ width: 1, color: $r('app.color.divider') })
+          }, (entry: ProviderHeaderEntry) => entry.id)
+        }
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, bottom: 16 })
+
+      if (this.canQueryBalance()) {
+        Column({ space: 8 }) {
+          Row() {
+            Text($r('app.string.provider_balance_title'))
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_secondary'))
+              .layoutWeight(1)
+
+            Button() {
+              if (this.isQueryingBalance) {
+                LoadingProgress()
+                  .width(14)
+                  .height(14)
+                  .color(this.themePrimary)
+              } else {
+                Text($r('app.string.provider_query_balance'))
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.themePrimary)
+              }
+            }
+            .height(30)
+            .padding({ left: 12, right: 12 })
+            .borderRadius(15)
+            .backgroundColor(this.themePrimarySubtleBackground)
+            .enabled(!this.isQueryingBalance)
+            .onClick(() => {
+              this.queryBalance()
+            })
+          }
+          .width('100%')
+
+          if (this.providerBalanceText !== '') {
+            Text(this.providerBalanceText)
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+              .width('100%')
+          }
+
+          if (this.providerBalanceError !== '') {
+            Text(this.providerBalanceError)
+              .fontSize(12)
+              .fontColor('#D9485F')
+              .width('100%')
+          }
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, bottom: 16 })
+        .backgroundColor(getAppUiState().themeSurface)
+        .borderRadius(16)
+        .margin({ left: 16, right: 16, top: 8 })
+      }
+  }
+  .width('100%')
+  .backgroundColor(getAppUiState().themeSurface)
+  .borderRadius(16)
+  .margin({ left: 16, right: 16, top: 8 })
+}
+
+@Builder
+ModelsCard() {
+    Column() {
+      // 标题行
+      Row() {
+        Text($r('app.string.provider_models_manage'))
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+
+        Text(` (${this.provider?.models.length ?? 0})`)
+          .fontSize(13)
+          .fontColor($r('app.color.text_secondary'))
+
+        Blank()
+
+        // 一键开关按钮
+        if (this.provider !== null && this.provider.models.length > 0) {
+          Button() {
+            Row() {
+              SymbolGlyph(this.isAllModelsEnabled() ? $r('sys.symbol.xmark_circle') : $r('sys.symbol.checkmark_circle'))
+                .fontSize(14)
+                .fontColor([this.isAllModelsEnabled() ? $r('app.color.text_tertiary') : this.themePrimary])
+                .symbolEffect(new ReplaceSymbolEffect(EffectScope.WHOLE), this.toggleAllEffectTrigger)
+              Text(this.isAllModelsEnabled() ? $r('app.string.provider_disable_all') : $r('app.string.provider_enable_all'))
+                .fontSize(13)
+                .fontColor(this.isAllModelsEnabled() ? $r('app.color.text_tertiary') : this.themePrimary)
+                .margin({ left: 4 })
+            }
+          }
+          .height(32)
+          .padding({ left: 10, right: 10 })
+          .backgroundColor(this.isAllModelsEnabled() ? getAppUiState().themeBackground : this.themePrimarySubtleBackground)
+          .borderRadius(16)
+          .margin({ right: 8 })
+          .onClick(() => {
+            // 触发切换动效
+            this.toggleAllEffectTrigger++
+            if (this.isAllModelsEnabled()) {
+              this.disableAllModels()
+            } else {
+              this.enableAllModels()
+            }
+          })
+        }
+
+        // 手动添加模型按钮
+        Button() {
+          SymbolGlyph($r('sys.symbol.plus'))
+            .fontSize(14)
+            .fontColor([this.themePrimary])
+        }
+        .type(ButtonType.Circle)
+        .width(32)
+        .height(32)
+        .backgroundColor(this.themePrimarySubtleBackground)
+        .margin({ right: 8 })
+        .onClick(() => {
+          this.showAddModelInput = !this.showAddModelInput
+          if (!this.showAddModelInput) {
+            this.addModelIdText = ''
+          }
+        })
+
+        // 获取模型按钮
+        Button() {
+          Row() {
+            if (this.isFetchingModels) {
+              LoadingProgress()
+                .width(14)
+                .height(14)
+                .color(this.themePrimary)
+            } else {
+              SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+                .fontSize(14)
+                .fontColor([this.themePrimary])
+            }
+            Text(this.isFetchingModels ? $r('app.string.provider_fetching') : $r('app.string.provider_fetch_models'))
+              .fontSize(13)
+              .fontColor(this.themePrimary)
+              .margin({ left: 4 })
+          }
+        }
+        .height(32)
+        .padding({ left: 12, right: 12 })
+        .backgroundColor(this.themePrimarySubtleBackground)
+        .borderRadius(16)
+        .enabled(!this.isFetchingModels)
+        .onClick(() => {
+          this.fetchModels()
+        })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 12, bottom: 8 })
+
+      // 搜索框
+      Search({ value: this.searchKeywords, placeholder: $r('app.string.filter_models_placeholder') })
+        .width('100%')
+        .height(40)
+        .backgroundColor(getAppUiState().themeBackground)
+        .margin({ left: 16, right: 16 })
+        .padding({ left: 16, right: 16 })
+        .onChange((value: string) => {
+          this.searchKeywords = value
+          this.buildModelGroups()
+        })
+
+      // 手动添加模型输入行
+      if (this.showAddModelInput) {
+        Row({ space: 8 }) {
+          TextInput({ text: this.addModelIdText, placeholder: $r('app.string.provider_add_model_placeholder') })
+            .layoutWeight(1)
+            .height(36)
+            .fontSize(14)
+            .backgroundColor(getAppUiState().themeBackground)
+            .borderRadius(8)
+            .onChange((value: string) => {
+              this.addModelIdText = value
+            })
+            .onSubmit(() => {
+              this.addManualModel()
+            })
+
+          Button() {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(16)
+              .fontColor([this.themePrimary])
+          }
+          .type(ButtonType.Circle)
+          .width(36)
+          .height(36)
+          .backgroundColor(this.themePrimarySubtleBackground)
+          .onClick(() => {
+            this.addManualModel()
+          })
+
+          Button() {
+            SymbolGlyph($r('sys.symbol.xmark'))
+              .fontSize(16)
+              .fontColor([$r('app.color.text_tertiary')])
+          }
+          .type(ButtonType.Circle)
+          .width(36)
+          .height(36)
+          .backgroundColor(getAppUiState().themeBackground)
+          .onClick(() => {
+            this.showAddModelInput = false
+            this.addModelIdText = ''
+            this.getUIContext().getFocusController().clearFocus()
+          })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 8 })
+      }
+
+      // 模型分组列表
+      if (this.modelRenderRows.length > 0) {
+        List({ scroller: this.pageModelListScroller }) {
+          Repeat<ProviderModelRenderRow>(this.modelRenderRows)
+            .each((ri: RepeatItem<ProviderModelRenderRow>) => {
+              if (ri.item.type === ProviderModelRenderRowType.GROUP_HEADER) {
+                ListItem() {
+                  Row() {
+                    Row() {
+                      SymbolGlyph($r('sys.symbol.chevron_right'))
+                        .fontSize(14)
+                        .fontColor([$r('app.color.text_tertiary')])
+                        .rotate({ angle: (ri.item.groupIndex < this.modelGroups.length &&
+                          this.modelGroups[ri.item.groupIndex].isExpanded) ? 90 : 0 })
+                        .animation({ duration: 200 })
+
+                      Text(ri.item.groupName)
+                        .fontSize(14)
+                        .fontWeight(FontWeight.Medium)
+                        .fontColor($r('app.color.text_secondary'))
+                        .margin({ left: 8 })
+
+                      Text(` (${ri.item.groupCount})`)
+                        .fontSize(12)
+                        .fontColor($r('app.color.text_secondary'))
+                    }
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      this.toggleGroupExpansion(ri.item.groupIndex)
+                    })
+
+                    Button() {
+                      SymbolGlyph(this.isGroupAllEnabled(ri.item.groupIndex)
+                        ? $r('sys.symbol.xmark_circle')
+                        : $r('sys.symbol.checkmark_circle'))
+                        .fontSize(16)
+                        .fontColor([this.isGroupAllEnabled(ri.item.groupIndex)
+                          ? $r('app.color.text_tertiary')
+                          : this.themePrimary])
+                    }
+                    .type(ButtonType.Circle)
+                    .width(32)
+                    .height(32)
+                    .backgroundColor(Color.Transparent)
+                    .onClick(() => {
+                      if (this.isGroupAllEnabled(ri.item.groupIndex)) {
+                        this.disableGroupModels(ri.item.groupIndex)
+                      } else {
+                        this.enableGroupModels(ri.item.groupIndex)
+                      }
+                    })
+                  }
+                  .width('100%')
+                  .height(44)
+                  .padding({ left: 16, right: 8 })
+                }
+              } else if (ri.item.model !== null) {
+                ListItem() {
+                  ModelItemCard({
+                    model: ri.item.model,
+                    showDivider: ri.item.showDivider,
+                    providerId: this.provider?.id ?? '',
+                    onToggle: (modelId: string, isOn: boolean) => {
+                      this.updateModelEnabled(modelId, isOn)
+                    },
+                    onEdit: () => {
+                      this.openModelEditSheet(ri.item.model!)
+                    }
+                  })
+                }
+                .swipeAction({
+                  end: {
+                    builder: () => {
+                      this.DeleteButton(ri.item.model!)
+                    }
+                  }
+                })
+              }
+            })
+            .key((row: ProviderModelRenderRow) => row.key)
+            .virtualScroll({ totalCount: this.modelRenderRows.length })
+
+          ListItem() {
+            Column().height(this.getModelsListBottomSpacerHeight())
+          }
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .margin({ top: 8 })
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+        .cachedCount(this.getModelListCachedCount())
+      } else if (this.provider !== null && this.provider.models.length === 0) {
+        // 无模型提示
+        Column() {
+          SymbolGlyph($r('sys.symbol.square_stack_3d'))
+            .fontSize(40)
+            .fontColor([$r('app.color.text_tertiary')])
+
+          Text($r('app.string.provider_no_models'))
+            .fontSize(14)
+            .fontColor($r('app.color.text_secondary'))
+            .margin({ top: 12 })
+
+          Text($r('app.string.provider_no_models_hint'))
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+            .margin({ top: 4 })
+        }
+        .width('100%')
+        .padding({ top: 40, bottom: 40 })
+      } else {
+        // 搜索无结果
+        Column() {
+          Text($r('app.string.provider_models_not_found'))
+            .fontSize(14)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .width('100%')
+        .padding({ top: 40, bottom: 40 })
+      }
+
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(getAppUiState().themeSurface)
+    .borderRadius(16)
+    .margin({ left: 16, right: 16, top: 8 })
+  }
+
+
+  @Builder
+  UnifiedSheetBuilder() {
+    if (this.activeSheet === 'edit' && this.editingModel !== null) {
+      ModelEditSheet({
+        model: this.editingModel,
+        onSave: async (draft: ModelInfoExtendedJson): Promise<void> => {
+          await this.saveModelEdit(draft)
+        },
+        onCancel: () => {
+          this.cancelModelEdit()
+        }
+      })
+    } else if (this.activeSheet === 'picker' && this.provider !== null) {
+      ModelPickerSheetHost({
+        availableModels: this.fetchedModels,
+        existingModels: this.provider.models,
+        providerId: this.provider.id,
+        onConfirm: (selectedIds: string[]) => {
+          this.saveSelectedModels(selectedIds)
+        },
+        onCancel: () => {
+          this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
+            this.showSheet = false
+            this.activeSheet = 'none'
+          })
+        }
+      })
+    } else {
+      // 默认分支：提供背景色占位，避免关闭动画时黑屏
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(getAppUiState().themeBackground)
+    }
+  }
+
+  @Builder
+  DeleteButton(model: ModelInfo) {
+    Row() {
+      Button() {
+        SymbolGlyph($r('sys.symbol.trash'))
+          .fontSize(18)
+          .fontColor([Color.White])
+      }
+      .width(56)
+      .height(48)
+      .backgroundColor($r('app.color.status_error'))
+      .borderRadius(12)
+      .onClick(() => {
+        this.deleteModel(model)
+      })
+    }
+    .padding({ left: 8, right: 8 })
+    .height(56)
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  IconEditSheetBuilder() {
+    ProviderIconEditSheet({
+      provider: this.provider,
+      initialIconType: this.provider !== null ? this.provider.iconType : ProviderIconType.TEXT,
+      initialTextIcon: this.provider !== null ? this.provider.textIcon : '',
+      initialTextIconBgColor: this.provider !== null ? this.provider.textIconBgColor : '',
+      initialCustomImagePath: this.provider !== null ? this.provider.customImagePath : '',
+      onSave: (config: ProviderIconEditConfig) => {
+        this.applyIconConfig(config)
+      },
+      onResetToPreset: () => {
+        this.resetToPresetIcon()
+      },
+      onClose: () => {
+        this.showTextIconEditor = false
+      }
+    })
+  }
+
+  // ========== 图标编辑相关方法 ==========
+
+  // 打开图标编辑器
+  private openIconEditor(): void {
+    if (this.provider === null) {
+      return
+    }
+    this.showTextIconEditor = true
+  }
+
+  // 应用图标编辑器返回的配置
+  private async applyIconConfig(config: ProviderIconEditConfig): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+    this.provider.iconType = config.iconType as ProviderIconType
+    this.provider.textIcon = config.textIcon
+    this.provider.textIconBgColor = config.textIconBgColor
+    this.provider.customImagePath = config.customImagePath
+    // 切到自定义图标后清空预设 SVG 路径，避免回退渲染时仍然命中预设资源
+    if (config.iconType !== ProviderIconType.SVG) {
+      this.provider.iconPath = ''
+    }
+    await this.saveCurrentProvider()
+    this.showProviderToast($r('app.string.provider_icon_updated'))
+  }
+
+  // 重置为预设图标
+  private async resetToPresetIcon(): Promise<void> {
+    if (this.provider === null) {
+      return
+    }
+    if (!applyPresetIconDefaults(this.provider, this.provider.id)) {
+      // 非预设服务商：用名称生成默认文字图标
+      this.provider.iconType = ProviderIconType.TEXT
+      this.provider.iconPath = ''
+      this.provider.customImagePath = ''
+      const config = generateDefaultTextIcon(this.provider.name)
+      this.provider.textIcon = config.text
+      this.provider.textIconBgColor = config.bgColor
+    }
+    await this.saveCurrentProvider()
+    this.showProviderToast($r('app.string.provider_default_icon_reset'))
+    this.showTextIconEditor = false
+  }
+}
+
+@ComponentV2
+export struct ProviderDetailSheet {
+  @Param providerId: string = ''
+  @Param isCreateMode: boolean = false
+  @Param closeOnSave: boolean = true
+  @Param closeOnModelsSelected: boolean = false
+  @Event onClose: () => void = () => {}
+  @Event onProviderChanged: (providerId: string, isCreateMode: boolean) => void = (_providerId: string, _isCreateMode: boolean) => {}
+
+  build() {
+    Column() {
+      ProviderDetailPanel({
+        providerId: this.providerId,
+        isCreateMode: this.isCreateMode,
+        closeOnSave: this.closeOnSave,
+        closeOnModelsSelected: this.closeOnModelsSelected,
+        presentationMode: ProviderDetailPresentationMode.SHEET,
+        onClose: () => {
+          this.onClose()
+        },
+        onProviderChanged: (providerId: string, isCreateMode: boolean) => {
+          this.onProviderChanged(providerId, isCreateMode)
+        }
+      })
+    }
+    .width('100%')
+    .height('100%')
+  }
+}
+
+export function tryHandleProviderDetailInternalBack(): boolean {
+  if (providerDetailInternalBackHandler === null) {
+    return false
+  }
+  return providerDetailInternalBackHandler()
+}
+
+@ComponentV2
+export struct ModelItemCard {
+  @Param model: ModelInfo = new ModelInfo('', '')
+  @Param showDivider: boolean = false
+  @Param providerId: string = ''
+  private get themePrimary(): string {
+    return getAppUiState().themePrimary
+  }
+  @Event onToggle: (modelId: string, isEnabled: boolean) => void = (_modelId: string, _isEnabled: boolean): void => {}
+  @Event onEdit: () => void = () => {}
+
+  private getModelIconRenderData(): ModelIconRenderData {
+    return buildModelIconRenderData(this.model.id, this.providerId, this.model.name)
+  }
+
+  @Builder
+  CapabilityIcon(icon: string) {
+    SymbolGlyph($r(icon))
+      .fontSize(12)
+      .fontColor([$r('app.color.text_tertiary')])
+      .margin({ right: 6 })
+  }
+
+  private iconRenderData(): ModelIconRenderData {
+    return this.getModelIconRenderData()
+  }
+
+  build() {
+    Column() {
+      Row() {
+        // 模型图标
+        Column() {
+          if (this.iconRenderData().hasIcon()) {
+            if (this.iconRenderData().isRawfile()) {
+              Image($rawfile(this.iconRenderData().resourcePath))
+                .width(20)
+                .height(20)
+                .objectFit(ImageFit.Contain)
+            } else {
+              Image(this.iconRenderData().resourcePath)
+                .width(20)
+                .height(20)
+                .objectFit(ImageFit.Contain)
+            }
+          } else {
+            SymbolGlyph($r('sys.symbol.ai_edit'))
+              .fontSize(16)
+              .fontColor([$r('app.color.text_tertiary')])
+          }
+        }
+        .width(32)
+        .height(32)
+        .borderRadius(8)
+        .backgroundColor($r('app.color.model_icon_bg'))
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+
+        // 模型信息
+        Column() {
+          Text(this.model.name)
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.model.isEnabled ? $r('app.color.text_primary') : $r('app.color.text_tertiary'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+          // 模型能力图标
+          Row() {
+            if (getEffectiveCapabilities(this.model).supportsReasoning) {
+              this.CapabilityIcon('sys.symbol.AI_deep_thinking')
+            }
+            if (getEffectiveCapabilities(this.model).supportsVision) {
+              this.CapabilityIcon('sys.symbol.eye_viewfinder')
+            }
+            if (getEffectiveCapabilities(this.model).supportsTools) {
+              this.CapabilityIcon('sys.symbol.wrench_and_screwdriver')
+            }
+            if (getEffectiveCapabilities(this.model).supportsWebSearch) {
+              this.CapabilityIcon('sys.symbol.ohos_wifi')
+            }
+          }
+          .margin({ top: 4 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        .margin({ left: 10 })
+
+        // 启用开关
+        Toggle({ type: ToggleType.Switch, isOn: this.model.isEnabled })
+          .selectedColor(this.themePrimary)
+          .width(44)
+          .height(24)
+          .onChange((isOn: boolean) => {
+            this.onToggle(this.model.id, isOn)
+          })
+
+        // 设置按钮
+        Button() {
+          SymbolGlyph($r('sys.symbol.gearshape'))
+            .fontSize(16)
+            .fontColor([$r('app.color.text_tertiary')])
+        }
+        .type(ButtonType.Circle)
+        .width(32)
+        .height(32)
+        .backgroundColor(Color.Transparent)
+        .margin({ left: 8 })
+        .onClick(() => {
+          this.onEdit()
+        })
+      }
+      .width('100%')
+      .constraintSize({ minHeight: 56 })
+      .padding(14)
+      .borderRadius(12)
+
+      if (this.showDivider) {
+        Divider()
+          .color($r('app.color.divider'))
+          .margin({ left: 56, right: 16 })
+      }
+    }
+  }
+}

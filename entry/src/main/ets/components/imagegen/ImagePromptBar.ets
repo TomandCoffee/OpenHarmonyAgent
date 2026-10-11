@@ -1,0 +1,339 @@
+import { getAppUiState } from '../../state/AppUiState'
+import { ProviderIcon } from '../ProviderIcon'
+import { buildModelIconRenderData, ModelIconRenderData } from '../../utils/ModelIconRenderUtils'
+import { ImageAspectRatio } from '../../models/ImageGenerationModels'
+import { ReferenceImageStrip } from './ReferenceImageStrip'
+
+@ComponentV2
+export struct ImagePromptBar {
+  @Param prompt: string = ''
+  @Param isGenerating: boolean = false
+  @Param isEditing: boolean = false
+  @Param canGenerate: boolean = false
+  @Param selectedModelId: string = ''
+  @Param selectedModelName: string = ''
+  @Param selectedProviderId: string = ''
+  @Param selectedProviderIconType: string = 'svg'
+  @Param selectedProviderIconPath: string = ''
+  @Param selectedProviderTextIcon: string = ''
+  @Param selectedProviderTextIconBgColor: string = ''
+  @Param selectedProviderCustomImagePath: string = ''
+  @Param selectedProviderBrandColor: ResourceColor = ''
+  @Param referenceImages: string[] = []
+  @Param selectedAspectRatio: ImageAspectRatio = ImageAspectRatio.SQUARE
+  @Param canAddReferenceImages: boolean = true
+  @Param canOptimizePrompt: boolean = false
+  @Param isOptimizingPrompt: boolean = false
+  @Param bottomAvoidHeight: number = 0
+  @Event onPromptChange: (value: string) => void = (_value: string): void => {}
+  @Event onOpenModelSheet: () => void = (): void => {}
+  @Event onOpenSettings: () => void = (): void => {}
+  @Event onPickReferenceImages: () => void = (): void => {}
+  @Event onOptimizePrompt: () => void = (): void => {}
+  @Event onGenerate: () => void = (): void => {}
+  @Event onCancel: () => void = (): void => {}
+  @Event onRemoveReferenceImage: (path: string) => void = (_path: string): void => {}
+  @Event onPreviewReferenceImage: (index: number) => void = (_index: number): void => {}
+  @Event onAspectRatioChange: (value: ImageAspectRatio) => void = (_value: ImageAspectRatio): void => {}
+
+  private get themePrimary(): string {
+    return getAppUiState().themePrimary
+  }
+
+  private get themeSurface(): string {
+    return getAppUiState().themeSurface
+  }
+
+  private get chatInputEnterKeySend(): boolean {
+    return getAppUiState().chatInputEnterKeySend
+  }
+
+  private hasSelectedModel(): boolean {
+    return this.selectedModelName !== '' && this.selectedProviderId !== ''
+  }
+
+  private getSelectedModelIconRenderData(): ModelIconRenderData {
+    return buildModelIconRenderData(this.selectedModelId, this.selectedProviderId, this.selectedModelName)
+  }
+
+  // 主操作按钮状态: 生成中 → 取消(error 红);可发送 → 主题色;不可用 → 灰
+  private getPrimaryActionColor(): ResourceColor {
+    if (this.isGenerating) {
+      return $r('app.color.status_error')
+    }
+    if (this.canGenerate) {
+      return this.themePrimary
+    }
+    return $r('app.color.text_tertiary')
+  }
+
+  private getBottomPadding(): number {
+    return 12 + Math.max(this.bottomAvoidHeight, 0)
+  }
+
+  private getAspectRatioIcon(value: ImageAspectRatio): Resource {
+    if (value === ImageAspectRatio.LANDSCAPE) {
+      return $r('sys.symbol.rectangle_ratio_16_to_9')
+    }
+    if (value === ImageAspectRatio.PORTRAIT) {
+      return $r('sys.symbol.rectangle_ratio_9_to_16')
+    }
+    return $r('sys.symbol.rectangle_ratio_1_to_1')
+  }
+
+  build() {
+    Column() {
+      if (this.referenceImages.length > 0) {
+        ReferenceImageStrip({
+          imagePaths: this.referenceImages,
+          removable: !this.isGenerating,
+          onRemove: (path: string): void => {
+            this.onRemoveReferenceImage(path)
+          },
+          onPreview: (index: number): void => {
+            this.onPreviewReferenceImage(index)
+          }
+        })
+          .margin({ bottom: 8 })
+      }
+
+      Stack({ alignContent: Alignment.BottomEnd }) {
+        TextArea({ text: this.prompt, placeholder: $r('app.string.image_generation_prompt_placeholder') })
+          .width('100%')
+          .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_tertiary'))
+          .backgroundColor(this.themeSurface)
+          .borderRadius(12)
+          .constraintSize({ minHeight: 76, maxHeight: 190 })
+          .padding({ left: 12, right: 12, top: 10, bottom: 52 })
+          .enterKeyType(this.chatInputEnterKeySend ? EnterKeyType.Send : EnterKeyType.NEW_LINE)
+          .onChange((value: string): void => {
+            this.onPromptChange(value)
+          })
+          .onSubmit((): void => {
+            if (!this.chatInputEnterKeySend) {
+              return
+            }
+            if (!this.isGenerating && this.canGenerate) {
+              this.onGenerate()
+            }
+          })
+
+        Row({ space: 8 }) {
+          if (this.prompt.trim() !== '') {
+            this.OptimizePromptButton()
+          }
+          this.AddReferenceButton()
+        }
+        .margin({ right: 8, bottom: 8 })
+      }
+      .width('100%')
+
+      // 工具行: 左侧可横滑 (model + 3 比例 chip + 设置),右侧固定 send 圆按钮
+      // 横滑容器避免窄屏溢出, send 按钮始终在最右触手可及
+      Row({ space: 8 }) {
+        Scroll() {
+          Row({ space: 8 }) {
+            this.ModelCapsule()
+            this.AspectChip(ImageAspectRatio.SQUARE, $r('app.string.image_generation_aspect_square'))
+            this.AspectChip(ImageAspectRatio.LANDSCAPE, $r('app.string.image_generation_aspect_landscape'))
+            this.AspectChip(ImageAspectRatio.PORTRAIT, $r('app.string.image_generation_aspect_portrait'))
+            this.IconCircleButton($r('sys.symbol.gearshape'), true, (): void => {
+              this.onOpenSettings()
+            })
+          }
+        }
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        .layoutWeight(1)
+        .align(Alignment.Start)
+
+        this.SendButton()
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .margin({ top: 10 })
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 12, bottom: this.getBottomPadding() })
+    .backgroundColor(getAppUiState().themeBackground)
+  }
+
+  @Builder
+  private ModelCapsule() {
+    Button({ type: ButtonType.Capsule, stateEffect: false }) {
+      Row() {
+        this.SelectedModelIcon()
+        Text(this.selectedModelName !== '' ? this.selectedModelName : $r('app.string.image_generation_model'))
+          .fontSize(13)
+          .fontColor(this.selectedModelName !== '' ? this.themePrimary : $r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .constraintSize({ maxWidth: 120 })
+          .margin({ left: 4 })
+      }
+    }
+    .height(34)
+    .padding({ left: 10, right: 12 })
+    .backgroundColor(this.themeSurface)
+    .onClick(() => {
+      this.onOpenModelSheet()
+    })
+    .enabled(!this.isGenerating)
+  }
+
+  @Builder
+  private SelectedModelIcon() {
+    if (this.hasSelectedModel()) {
+      Column() {
+        if (this.getSelectedModelIconRenderData().hasIcon()) {
+          if (this.getSelectedModelIconRenderData().isRawfile()) {
+            Image($rawfile(this.getSelectedModelIconRenderData().resourcePath))
+              .width(18)
+              .height(18)
+              .objectFit(ImageFit.Contain)
+          } else {
+            Image(this.getSelectedModelIconRenderData().resourcePath)
+              .width(18)
+              .height(18)
+              .objectFit(ImageFit.Contain)
+          }
+        } else {
+          ProviderIcon({
+            iconType: this.selectedProviderIconType,
+            iconPath: this.selectedProviderIconPath,
+            textIcon: this.selectedProviderTextIcon,
+            textIconBgColor: this.selectedProviderTextIconBgColor,
+            customImagePath: this.selectedProviderCustomImagePath,
+            iconSize: 18,
+            radius: 4,
+            bgColor: this.selectedProviderBrandColor,
+            brandColor: this.selectedProviderBrandColor,
+            fallbackSymbol: $r('sys.symbol.ai_edit'),
+            fallbackColor: $r('app.color.text_tertiary')
+          })
+        }
+      }
+      .width(20)
+      .height(20)
+      .borderRadius(5)
+      .backgroundColor($r('app.color.model_icon_bg'))
+      .justifyContent(FlexAlign.Center)
+      .alignItems(HorizontalAlign.Center)
+    } else {
+      SymbolGlyph($r('sys.symbol.picture'))
+        .fontSize(15)
+        .fontColor([$r('app.color.text_secondary')])
+    }
+  }
+
+  @Builder
+  private AspectChip(value: ImageAspectRatio, label: Resource) {
+    Button({ type: ButtonType.Circle, stateEffect: false }) {
+      SymbolGlyph(this.getAspectRatioIcon(value))
+        .fontSize(22)
+        .fontColor([this.selectedAspectRatio === value ? this.themePrimary : $r('app.color.text_secondary')])
+    }
+    .height(38)
+    .width(38)
+    .borderRadius(19)
+    .accessibilityText(label)
+    .backgroundColor(this.selectedAspectRatio === value ? getAppUiState().themePrimaryLight : this.themeSurface)
+    .border({
+      width: this.selectedAspectRatio === value ? 1 : 0.5,
+      color: this.selectedAspectRatio === value ? this.themePrimary : $r('app.color.divider')
+    })
+    .enabled(!this.isGenerating)
+    .onClick(() => {
+      this.onAspectRatioChange(value)
+    })
+  }
+
+  @Builder
+  private AddReferenceButton() {
+    Button({ type: ButtonType.Capsule, stateEffect: false }) {
+      Row({ space: 4 }) {
+        SymbolGlyph($r('sys.symbol.plus'))
+          .fontSize(15)
+          .fontColor([this.canAddReferenceImages ? this.themePrimary : $r('app.color.text_tertiary')])
+        Text($r('app.string.image_generation_add_reference'))
+          .fontSize(13)
+          .fontColor(this.canAddReferenceImages ? this.themePrimary : $r('app.color.text_tertiary'))
+          .maxLines(1)
+      }
+      .alignItems(VerticalAlign.Center)
+    }
+    .height(34)
+    .padding({ left: 10, right: 12 })
+    .backgroundColor(Color.Transparent)
+    .accessibilityText($r('app.string.image_generation_add_reference'))
+    .enabled(this.canAddReferenceImages)
+    .onClick(() => {
+      this.onPickReferenceImages()
+    })
+  }
+
+  @Builder
+  private IconCircleButton(icon: Resource, enabled: boolean, action: () => void) {
+    Button() {
+      SymbolGlyph(icon)
+        .fontSize(17)
+        .fontColor([enabled ? $r('app.color.text_secondary') : $r('app.color.text_tertiary')])
+    }
+    .type(ButtonType.Circle)
+    .width(34)
+    .height(34)
+    .backgroundColor(this.themeSurface)
+    .enabled(enabled)
+    .onClick(() => {
+      action()
+    })
+  }
+
+  @Builder
+  private OptimizePromptButton() {
+    Button() {
+      if (this.isOptimizingPrompt) {
+        LoadingProgress()
+          .width(18)
+          .height(18)
+          .color(this.themePrimary)
+      } else {
+        SymbolGlyph($r('sys.symbol.AI_pencil'))
+          .fontSize(17)
+          .fontColor([this.canOptimizePrompt ? this.themePrimary : $r('app.color.text_tertiary')])
+      }
+    }
+    .type(ButtonType.Circle)
+    .width(34)
+    .height(34)
+    .backgroundColor(Color.Transparent)
+    .accessibilityText($r('app.string.image_generation_optimize_prompt'))
+    .enabled(this.canOptimizePrompt)
+    .onClick(() => {
+      this.onOptimizePrompt()
+    })
+  }
+
+  // 圆形主操作按钮: 生成中显示 stop, 否则显示发送箭头;颜色随状态切换
+  @Builder
+  private SendButton() {
+    Button({ type: ButtonType.Circle, stateEffect: false }) {
+      SymbolGlyph(this.isGenerating ? $r('sys.symbol.pause') : $r('sys.symbol.paperplane'))
+        .fontSize(17)
+        .fontColor([Color.White])
+    }
+    .width(40)
+    .height(40)
+    .backgroundColor(this.getPrimaryActionColor())
+    .enabled(this.isGenerating || this.canGenerate)
+    .onClick(() => {
+      if (this.isGenerating) {
+        this.onCancel()
+      } else {
+        this.onGenerate()
+      }
+    })
+  }
+}

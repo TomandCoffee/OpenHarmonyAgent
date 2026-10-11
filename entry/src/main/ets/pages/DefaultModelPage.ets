@@ -1,0 +1,852 @@
+// 默认模型配置页面
+import { DefaultModelService } from '../services/DefaultModelService'
+import { ProviderViewModel } from '../viewmodels/ProviderViewModel'
+import { DefaultModelConfig, ModelRole, ModelProvider, OutputMode } from '../models/ChatModels'
+import { DefaultPrompts } from '../config/DefaultPrompts'
+import { ServiceRegistry } from '../services/ServiceRegistry'
+import { DefaultModelSelectSheetContent } from '../components/defaultmodel/DefaultModelSelectSheetContent'
+import { appendPromptVariableText, PromptVariableItem, PromptVariablePanel } from '../components/PromptVariablePanel'
+import {
+  HdsNavigation,
+  HdsNavDestination,
+  HdsNavDestinationTitleMode,
+  HdsNavigationTitleBarOptions,
+  HdsNavigationTitleMode
+} from '@kit.UIDesignKit'
+import { SettingsPagePresentationMode } from '../config/SettingsDetailPresentation'
+import { getSettingsPageContentMaxWidth, isSettingsPageExpandedLayout } from '../utils/SettingsPageLayoutHelper'
+import { getAppUiState } from '../state/AppUiState'
+import {
+  buildHdsTopNavigationTitleBarOptionsForNativePage,
+  getHdsTopNavigationContentTopPadding,
+  getHdsStatusBarContentColor
+} from '../utils/HdsVisualEffectUtil'
+
+let defaultModelPagePathStack: NavPathStack | null = null
+
+@Entry
+@ComponentV2
+struct DefaultModelPage {
+  @Param hostedInNavDestination: boolean = false
+  // 主题颜色
+  private get topAvoidHeight(): number {
+    return getAppUiState().topAvoidHeight
+  }
+  private get themePrimary(): string {
+    return getAppUiState().themePrimary
+  }
+  private get layoutSizeClass(): string {
+    return getAppUiState().layoutSizeClass
+  }
+  private get windowWidthVp(): number {
+    return getAppUiState().windowWidthVp
+  }
+  private get windowHeightVp(): number {
+    return getAppUiState().windowHeightVp
+  }
+  private get settingsDetailPresentationMode(): string {
+    return getAppUiState().settingsDetailPresentationMode
+  }
+  private get materialType(): number {
+    return getAppUiState().materialType
+  }
+  private get materialLevel(): number {
+    return getAppUiState().materialLevel
+  }
+
+  @Local chatModel: DefaultModelConfig = new DefaultModelConfig()
+  @Local titleModel: DefaultModelConfig = new DefaultModelConfig()
+  @Local suggestionModel: DefaultModelConfig = new DefaultModelConfig()
+  @Local translateModel: DefaultModelConfig = new DefaultModelConfig()
+  @Local imageModel: DefaultModelConfig = new DefaultModelConfig()
+
+  @Local providers: ModelProvider[] = []
+  @Local isProvidersLoaded: boolean = false
+  @Local showModelSheet: boolean = false
+  @Local currentEditRole: ModelRole = ModelRole.CHAT
+  @Local showPromptSheet: boolean = false
+  @Local currentPromptRole: ModelRole = ModelRole.TITLE
+  @Local currentPrompt: string = ''
+  private defaultModelService: DefaultModelService = ServiceRegistry.defaultModel()
+  private providerViewModel: ProviderViewModel = ServiceRegistry.provider()
+  private compactScroller: Scroller = new Scroller()
+
+  private px2vp(px: number): number {
+    return px / (this.getUIContext().getHostContext()?.resourceManager.getDeviceCapabilitySync().screenDensity ?? 3) * 160
+  }
+
+  private isExpandedLayout(): boolean {
+    return isSettingsPageExpandedLayout(this.layoutSizeClass, this.settingsDetailPresentationMode, this.windowWidthVp,
+      this.windowHeightVp)
+  }
+
+  private getContentMaxWidth(): number {
+    return getSettingsPageContentMaxWidth(this.layoutSizeClass, this.windowWidthVp, this.settingsDetailPresentationMode,
+      this.windowHeightVp)
+  }
+
+  private isDetailPaneMode(): boolean {
+    return this.settingsDetailPresentationMode === SettingsPagePresentationMode.DETAIL_PANE
+  }
+
+  private handleBack(): void {
+    if (defaultModelPagePathStack !== null && defaultModelPagePathStack.size() > 0) {
+      defaultModelPagePathStack.pop()
+    }
+  }
+
+  private getCompactContentTopPadding(): number {
+    return getHdsTopNavigationContentTopPadding(this.px2vp(this.topAvoidHeight), this.windowWidthVp,
+      this.windowHeightVp)
+  }
+
+  private getCompactTitleBarOptions(): HdsNavigationTitleBarOptions {
+    return buildHdsTopNavigationTitleBarOptionsForNativePage(this.materialType, this.materialLevel, this.windowWidthVp,
+      this.windowHeightVp, $r('app.string.settings_default_model'), (): void => {
+        this.handleBack()
+      })
+  }
+
+  aboutToAppear(): void {
+    this.loadConfig()
+    this.loadProviders()
+  }
+
+  async loadConfig(): Promise<void> {
+    await this.defaultModelService.loadConfig()
+    this.chatModel = this.defaultModelService.getModel(ModelRole.CHAT)
+    this.titleModel = this.defaultModelService.getModel(ModelRole.TITLE)
+    this.suggestionModel = this.defaultModelService.getModel(ModelRole.SUGGESTION)
+    this.translateModel = this.defaultModelService.getModel(ModelRole.TRANSLATE)
+    this.imageModel = this.defaultModelService.getModel(ModelRole.IMAGE)
+  }
+
+  async loadProviders(): Promise<void> {
+    // 只加载启用的供应商（不包括禁用的）
+    this.providers = await this.providerViewModel.loadProviders()
+    this.isProvidersLoaded = true
+    console.info(`[DefaultModelPage] Loaded ${this.providers.length} enabled providers`)
+  }
+
+  @Builder
+  private PageContent() {
+    Scroll(this.compactScroller) {
+      Row() {
+        Column() {
+          if (!this.isDetailPaneMode()) {
+            Blank()
+              .width('100%')
+              .height(this.getCompactContentTopPadding())
+          }
+
+          if (this.isExpandedLayout()) {
+            this.ExpandedModelSections()
+          } else {
+            this.CompactModelSections()
+          }
+        }
+        .width('100%')
+        .constraintSize({ maxWidth: this.getContentMaxWidth() })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+      .padding({ left: 16, right: 16 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .align(Alignment.Top)
+    .edgeEffect(EdgeEffect.Spring)
+  }
+
+  @Builder
+  private DetailPaneHeader() {
+    Column() {
+      Row() {
+        Text($r('app.string.settings_default_model'))
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .height(64)
+      .padding({ left: 24, right: 24 })
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+    .border({ width: { bottom: 1 }, color: $r('app.color.divider') })
+  }
+
+  build() {
+    if (this.hostedInNavDestination) {
+      this.NavDestinationRoot()
+    } else {
+      this.StandaloneRoot()
+    }
+  }
+
+  @Builder
+  private PageRootContent() {
+    Column() {
+      if (this.isDetailPaneMode()) {
+        Column() {
+          this.DetailPaneHeader()
+          this.PageContent()
+        }
+        .width('100%')
+        .layoutWeight(1)
+      } else {
+        this.PageContent()
+      }
+
+      Column()
+        .width(0)
+        .height(0)
+        .bindSheet($$this.showModelSheet, this.ModelSelectSheet(), {
+          height: SheetSize.MEDIUM,
+          dragBar: true,
+          showClose: true,
+          title: { title: this.getSheetTitle() }
+        })
+
+      Column()
+        .width(0)
+        .height(0)
+        .bindSheet($$this.showPromptSheet, this.PromptEditSheet(), {
+          height: SheetSize.LARGE,
+          dragBar: true,
+          showClose: false
+        })
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(getAppUiState().themeBackground)
+  }
+
+  @Builder
+  private NavDestinationRoot() {
+    HdsNavDestination() {
+      this.PageRootContent()
+    }
+    .titleBar(this.getCompactTitleBarOptions())
+    .bindToScrollable([this.compactScroller])
+    .titleMode(HdsNavDestinationTitleMode.MINI)
+    .hideTitleBar(this.isDetailPaneMode(), false)
+    .systemBarStyle(
+      { statusBarContentColor: getHdsStatusBarContentColor() },
+      { statusBarContentColor: getHdsStatusBarContentColor() }
+    )
+    .hideBackButton(false)
+    .hideToolBar(true)
+    .backgroundColor(getAppUiState().themeBackground)
+    .onReady((context: NavDestinationContext) => {
+      defaultModelPagePathStack = context.pathStack
+    })
+    .onBackPressed((): boolean => {
+      this.handleBack()
+      return true
+    })
+  }
+
+  @Builder
+  private StandaloneRoot() {
+    if (this.isDetailPaneMode()) {
+      this.PageRootContent()
+    } else {
+      HdsNavigation() {
+        this.PageRootContent()
+      }
+      .width('100%')
+      .height('100%')
+      .backgroundColor(getAppUiState().themeBackground)
+      .titleBar(this.getCompactTitleBarOptions())
+      .bindToScrollable([this.compactScroller])
+      .titleMode(HdsNavigationTitleMode.MINI)
+      .systemBarStyle(
+        { statusBarContentColor: getHdsStatusBarContentColor() },
+        { statusBarContentColor: getHdsStatusBarContentColor() }
+      )
+      .hideBackButton(false)
+      .hideToolBar(true)
+      .mode(NavigationMode.Stack)
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP])
+    }
+  }
+
+  @Builder
+  CompactModelSections() {
+    Column() {
+      this.ChatModelSection()
+      this.TitleModelSection()
+      this.SuggestionModelSection()
+      this.TranslateModelSection()
+      this.ImageModelSection()
+      Column().height(40)
+    }
+    .width('100%')
+  }
+
+  @Builder
+  ExpandedModelSections() {
+    Column({ space: 20 }) {
+      Row({ space: 16 }) {
+        Column() {
+          this.ChatModelSection()
+        }
+        .layoutWeight(1)
+
+        Column() {
+          this.TitleModelSection()
+        }
+        .layoutWeight(1)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
+
+      Row({ space: 16 }) {
+        Column() {
+          this.SuggestionModelSection()
+        }
+        .layoutWeight(1)
+
+        Column() {
+          this.TranslateModelSection()
+        }
+        .layoutWeight(1)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
+
+      Row({ space: 16 }) {
+        Column() {
+          this.ImageModelSection()
+        }
+        .layoutWeight(1)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
+
+      Column().height(40)
+    }
+    .width('100%')
+  }
+
+  @Builder
+  ChatModelSection() {
+    Column() {
+      this.SectionTitle($r('app.string.default_model_section_chat'))
+      ModelConfigCard({
+        roleName: $r('app.string.default_model_role_chat'),
+        description: $r('app.string.default_model_desc_chat'),
+        showPromptEdit: false,
+        isConfigured: this.chatModel.isConfigured(),
+        displayName: this.chatModel.getDisplayName(),
+        isDefaultPrompt: true,
+        onCardClick: () => {
+          this.showPromptSheet = false
+          this.currentEditRole = ModelRole.CHAT
+          this.showModelSheet = true
+        },
+        onPromptClick: () => {}
+      })
+    }
+    .width('100%')
+  }
+
+  @Builder
+  TitleModelSection() {
+    Column() {
+      this.SectionTitle($r('app.string.default_model_section_title_generation'))
+      ModelConfigCard({
+        roleName: $r('app.string.default_model_role_title_generation'),
+        description: $r('app.string.default_model_desc_title_generation'),
+        showPromptEdit: true,
+        isConfigured: this.titleModel.isConfigured(),
+        displayName: this.titleModel.getDisplayName(),
+        isDefaultPrompt: this.defaultModelService.isDefaultTitlePrompt(),
+        onCardClick: () => {
+          this.showPromptSheet = false
+          this.currentEditRole = ModelRole.TITLE
+          this.showModelSheet = true
+        },
+        onPromptClick: () => {
+          this.showModelSheet = false
+          this.currentPromptRole = ModelRole.TITLE
+          this.currentPrompt = this.defaultModelService.getTitlePromptTemplate()
+          this.showPromptSheet = true
+        }
+      })
+    }
+    .width('100%')
+  }
+
+  @Builder
+  SuggestionModelSection() {
+    Column() {
+      this.SectionTitle($r('app.string.default_model_section_suggestion'))
+      ModelConfigCard({
+        roleName: $r('app.string.default_model_role_suggestion'),
+        description: $r('app.string.default_model_desc_suggestion'),
+        showPromptEdit: true,
+        isConfigured: this.suggestionModel.isConfigured(),
+        displayName: this.suggestionModel.getDisplayName(),
+        isDefaultPrompt: this.defaultModelService.isDefaultSuggestionPrompt(),
+        onCardClick: () => {
+          this.showPromptSheet = false
+          this.currentEditRole = ModelRole.SUGGESTION
+          this.showModelSheet = true
+        },
+        onPromptClick: () => {
+          this.showModelSheet = false
+          this.currentPromptRole = ModelRole.SUGGESTION
+          this.currentPrompt = this.defaultModelService.getSuggestionPromptTemplate()
+          this.showPromptSheet = true
+        }
+      })
+    }
+    .width('100%')
+  }
+
+  @Builder
+  ImageModelSection() {
+    Column() {
+      this.SectionTitle($r('app.string.default_model_role_image_generation'))
+      ModelConfigCard({
+        roleName: $r('app.string.default_model_role_image_generation'),
+        description: $r('app.string.default_model_desc_image_generation'),
+        showPromptEdit: false,
+        isConfigured: this.imageModel.isConfigured(),
+        displayName: this.imageModel.getDisplayName(),
+        isDefaultPrompt: true,
+        onCardClick: () => {
+          this.showPromptSheet = false
+          this.currentEditRole = ModelRole.IMAGE
+          this.showModelSheet = true
+        },
+        onPromptClick: () => {}
+      })
+    }
+    .width('100%')
+  }
+
+  @Builder
+  TranslateModelSection() {
+    Column() {
+      this.SectionTitle($r('app.string.default_model_section_translate'))
+      ModelConfigCard({
+        roleName: $r('app.string.default_model_role_translate'),
+        description: $r('app.string.default_model_desc_translate'),
+        showPromptEdit: true,
+        isConfigured: this.translateModel.isConfigured(),
+        displayName: this.translateModel.getDisplayName(),
+        isDefaultPrompt: this.defaultModelService.isDefaultTranslatePrompt(),
+        onCardClick: () => {
+          this.showPromptSheet = false
+          this.currentEditRole = ModelRole.TRANSLATE
+          this.showModelSheet = true
+        },
+        onPromptClick: () => {
+          this.showModelSheet = false
+          this.currentPromptRole = ModelRole.TRANSLATE
+          this.currentPrompt = this.defaultModelService.getTranslatePromptTemplate()
+          this.showPromptSheet = true
+        }
+      })
+    }
+    .width('100%')
+  }
+
+  @Builder
+  SectionTitle(title: string | Resource) {
+    Text(title)
+      .fontSize(14)
+      .fontWeight(FontWeight.Medium)
+      .fontColor($r('app.color.text_secondary'))
+      .padding({ top: 24, bottom: 8 })
+      .width('100%')
+  }
+
+  @Builder
+  ModelSelectSheet() {
+    DefaultModelSelectSheetContent({
+      currentSelectionText: this.getCurrentModelDisplayName(),
+      isProvidersLoaded: this.isProvidersLoaded,
+      providers: this.providers,
+      currentModelId: this.getCurrentModelId(),
+      currentProviderId: this.getCurrentProviderId(),
+      hasOutputModeFilter: this.currentEditRole === ModelRole.IMAGE,
+      outputModeFilter: OutputMode.IMAGE,
+      emptyTitle: this.currentEditRole === ModelRole.IMAGE ? $r('app.string.image_generation_no_available_model') : '',
+      emptyDescription: this.currentEditRole === ModelRole.IMAGE ? $r('app.string.image_generation_no_available_model_hint') : '',
+      onSelectModel: (providerId: string, modelId: string, modelName: string): void => {
+        this.selectModel(providerId, modelId, modelName)
+      },
+      onClearSelection: () => {
+        this.clearModelSelection()
+      }
+    })
+  }
+
+  @Builder
+  PromptEditSheet() {
+    Column() {
+      Row() {
+        Button() {
+          SymbolGlyph($r('sys.symbol.xmark'))
+            .fontSize(18)
+            .fontColor([$r('app.color.text_secondary')])
+        }
+        .type(ButtonType.Circle)
+        .width(36)
+        .height(36)
+        .backgroundColor($r('app.color.divider'))
+        .onClick(() => {
+          this.showPromptSheet = false
+        })
+
+        Text(this.getPromptEditTitle())
+          .fontSize(17)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+
+        Button() {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(18)
+            .fontColor([Color.White])
+        }
+        .type(ButtonType.Circle)
+        .width(36)
+        .height(36)
+        .backgroundColor(this.themePrimary)
+        .onClick(() => {
+          this.savePrompt()
+        })
+      }
+      .width('100%')
+      .height(56)
+      .padding({ left: 16, right: 16 })
+
+      PromptVariablePanel({
+        variables: this.getCurrentPromptVariables(),
+        onVariableClick: (token: string): void => {
+          this.appendPromptVariable(token)
+        }
+      })
+        .margin({ left: 16, right: 16, top: 16 })
+
+      // 编辑区域
+      TextArea({ text: this.currentPrompt })
+        .fontSize(14)
+        .fontColor($r('app.color.text_primary'))
+        .backgroundColor(getAppUiState().themeSurface)
+        .borderRadius(12)
+        .margin({ left: 16, right: 16, top: 16 })
+        .layoutWeight(1)
+        .onChange((value: string) => {
+          this.currentPrompt = value
+        })
+
+      // 按钮区域
+      Row() {
+        Button($r('app.string.default_model_reset_prompt'))
+          .fontSize(15)
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor(getAppUiState().themeSurface)
+          .borderRadius(24)
+          .height(44)
+          .width('100%')
+          .onClick(() => {
+            this.resetPrompt()
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 16, bottom: 32 })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  private getSheetTitle(): Resource {
+    if (this.currentEditRole === ModelRole.CHAT) {
+      return $r('app.string.default_model_select_chat_model')
+    } else if (this.currentEditRole === ModelRole.TITLE) {
+      return $r('app.string.default_model_select_title_model')
+    } else if (this.currentEditRole === ModelRole.SUGGESTION) {
+      return $r('app.string.default_model_select_suggestion_model')
+    } else if (this.currentEditRole === ModelRole.IMAGE) {
+      return $r('app.string.default_model_select_image_model')
+    }
+    return $r('app.string.default_model_select_translate_model')
+  }
+
+  private getPromptEditTitle(): Resource {
+    if (this.currentPromptRole === ModelRole.TITLE) {
+      return $r('app.string.default_model_prompt_edit_title_title')
+    } else if (this.currentPromptRole === ModelRole.SUGGESTION) {
+      return $r('app.string.default_model_prompt_edit_title_suggestion')
+    }
+    return $r('app.string.default_model_prompt_edit_title_translate')
+  }
+
+  // 获取当前选择的模型显示名称
+  private getCurrentModelDisplayName(): string | Resource {
+    let config: DefaultModelConfig
+    if (this.currentEditRole === ModelRole.CHAT) {
+      config = this.chatModel
+    } else if (this.currentEditRole === ModelRole.TITLE) {
+      config = this.titleModel
+    } else if (this.currentEditRole === ModelRole.SUGGESTION) {
+      config = this.suggestionModel
+    } else if (this.currentEditRole === ModelRole.IMAGE) {
+      config = this.imageModel
+    } else {
+      config = this.translateModel
+    }
+
+    if (config.isConfigured()) {
+      return config.getDisplayName()
+    }
+    return $r('app.string.default_model_unconfigured')
+  }
+
+  private getCurrentModelId(): string {
+    let config: DefaultModelConfig
+    if (this.currentEditRole === ModelRole.CHAT) {
+      config = this.chatModel
+    } else if (this.currentEditRole === ModelRole.TITLE) {
+      config = this.titleModel
+    } else if (this.currentEditRole === ModelRole.SUGGESTION) {
+      config = this.suggestionModel
+    } else if (this.currentEditRole === ModelRole.IMAGE) {
+      config = this.imageModel
+    } else {
+      config = this.translateModel
+    }
+    return config.modelId
+  }
+
+  private getCurrentProviderId(): string {
+    let config: DefaultModelConfig
+    if (this.currentEditRole === ModelRole.CHAT) {
+      config = this.chatModel
+    } else if (this.currentEditRole === ModelRole.TITLE) {
+      config = this.titleModel
+    } else if (this.currentEditRole === ModelRole.SUGGESTION) {
+      config = this.suggestionModel
+    } else if (this.currentEditRole === ModelRole.IMAGE) {
+      config = this.imageModel
+    } else {
+      config = this.translateModel
+    }
+    return config.providerId
+  }
+
+  private getProviderNameById(providerId: string): string {
+    for (let i = 0; i < this.providers.length; i++) {
+      if (this.providers[i].id === providerId) {
+        return this.providers[i].name
+      }
+    }
+    return ''
+  }
+
+  private async selectModel(providerId: string, modelId: string, modelName: string): Promise<void> {
+    console.info(`[DefaultModelPage] Selecting model: ${modelId} from provider: ${providerId} for role: ${this.currentEditRole}`)
+    const resolvedModelName = modelName !== '' ? modelName : modelId
+    const providerName = this.getProviderNameById(providerId)
+    const config = new DefaultModelConfig(modelId, providerId, resolvedModelName, providerName)
+    await this.defaultModelService.setModel(this.currentEditRole, config)
+    console.info(`[DefaultModelPage] Model saved, updating UI...`)
+
+    // 立即更新状态变量
+    if (this.currentEditRole === ModelRole.CHAT) {
+      this.chatModel = new DefaultModelConfig(config.modelId, config.providerId, config.modelName, config.providerName)
+    } else if (this.currentEditRole === ModelRole.TITLE) {
+      this.titleModel = new DefaultModelConfig(config.modelId, config.providerId, config.modelName, config.providerName)
+    } else if (this.currentEditRole === ModelRole.SUGGESTION) {
+      this.suggestionModel = new DefaultModelConfig(config.modelId, config.providerId, config.modelName,
+        config.providerName)
+    } else if (this.currentEditRole === ModelRole.IMAGE) {
+      this.imageModel = new DefaultModelConfig(config.modelId, config.providerId, config.modelName, config.providerName)
+    } else {
+      this.translateModel = new DefaultModelConfig(config.modelId, config.providerId, config.modelName, config.providerName)
+    }
+
+    // 关闭 sheet
+    this.showModelSheet = false
+    console.info(`[DefaultModelPage] Model selection complete`)
+  }
+
+  private async clearModelSelection(): Promise<void> {
+    console.info(`[DefaultModelPage] Clearing model selection for role: ${this.currentEditRole}`)
+    const config = new DefaultModelConfig()
+    await this.defaultModelService.setModel(this.currentEditRole, config)
+
+    // 立即更新状态变量
+    if (this.currentEditRole === ModelRole.CHAT) {
+      this.chatModel = new DefaultModelConfig()
+    } else if (this.currentEditRole === ModelRole.TITLE) {
+      this.titleModel = new DefaultModelConfig()
+    } else if (this.currentEditRole === ModelRole.SUGGESTION) {
+      this.suggestionModel = new DefaultModelConfig()
+    } else if (this.currentEditRole === ModelRole.IMAGE) {
+      this.imageModel = new DefaultModelConfig()
+    } else {
+      this.translateModel = new DefaultModelConfig()
+    }
+
+    // 关闭 sheet
+    this.showModelSheet = false
+  }
+
+  private async resetPrompt(): Promise<void> {
+    if (this.currentPromptRole === ModelRole.TITLE) {
+      await this.defaultModelService.resetTitlePrompt()
+      this.currentPrompt = DefaultPrompts.TITLE_PROMPT
+    } else if (this.currentPromptRole === ModelRole.SUGGESTION) {
+      await this.defaultModelService.resetSuggestionPrompt()
+      this.currentPrompt = DefaultPrompts.SUGGESTION_PROMPT
+    } else {
+      await this.defaultModelService.resetTranslatePrompt()
+      this.currentPrompt = DefaultPrompts.TRANSLATE_PROMPT
+    }
+  }
+
+  private getCurrentPromptVariables(): PromptVariableItem[] {
+    if (this.currentPromptRole === ModelRole.TRANSLATE) {
+      return [
+        new PromptVariableItem('{source_text}', $r('app.string.default_model_prompt_variable_source_text')),
+        new PromptVariableItem('{target_lang}', $r('app.string.default_model_prompt_variable_target_lang'))
+      ]
+    }
+    return [
+      new PromptVariableItem('{content}', $r('app.string.default_model_prompt_variable_content')),
+      new PromptVariableItem('{locale}', $r('app.string.default_model_prompt_variable_locale'))
+    ]
+  }
+
+  private appendPromptVariable(token: string): void {
+    this.currentPrompt = appendPromptVariableText(this.currentPrompt, token)
+  }
+
+  private async savePrompt(): Promise<void> {
+    if (this.currentPromptRole === ModelRole.TITLE) {
+      await this.defaultModelService.setTitlePromptTemplate(this.currentPrompt)
+    } else if (this.currentPromptRole === ModelRole.SUGGESTION) {
+      await this.defaultModelService.setSuggestionPromptTemplate(this.currentPrompt)
+    } else {
+      await this.defaultModelService.setTranslatePromptTemplate(this.currentPrompt)
+    }
+    this.showPromptSheet = false
+  }
+
+}
+
+// 独立的模型配置卡片组件，解决 @Builder 响应式问题
+@ComponentV2
+struct ModelConfigCard {
+  @Param roleName: string | Resource = ''
+  @Param description: string | Resource = ''
+  @Param showPromptEdit: boolean = false
+  @Param isDefaultPrompt: boolean = true
+
+  // 使用基本类型避免对象响应式问题
+  @Param isConfigured: boolean = false
+  @Param displayName: string = ''
+  // 主题颜色
+  private get themePrimary(): string {
+    return getAppUiState().themePrimary
+  }
+
+  @Event onCardClick: () => void = () => {}
+  @Event onPromptClick: () => void = () => {}
+
+  build() {
+    Column() {
+      Row() {
+        Column() {
+          Row() {
+            Text(this.roleName)
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_primary'))
+
+            if (this.isConfigured) {
+              Text(this.displayName)
+                .fontSize(13)
+                .fontColor(this.themePrimary)
+                .margin({ left: 8 })
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+            } else {
+              Text($r('app.string.default_model_unconfigured'))
+                .fontSize(13)
+                .fontColor($r('app.color.text_tertiary'))
+                .margin({ left: 8 })
+            }
+          }
+          .width('100%')
+
+          Text(this.description)
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+            .margin({ top: 4 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(18)
+          .fontColor([$r('app.color.text_tertiary')])
+      }
+      .width('100%')
+      .padding(16)
+      .onClick(() => {
+        this.onCardClick()
+      })
+
+      if (this.showPromptEdit) {
+        Divider().color($r('app.color.divider')).margin({ left: 16 })
+
+        Row() {
+          Text($r('app.string.default_model_prompt_template'))
+            .fontSize(14)
+            .fontColor($r('app.color.text_primary'))
+
+          Blank()
+
+          Text(this.isDefaultPrompt ?
+            $r('app.string.default_model_prompt_template_default') :
+            $r('app.string.default_model_prompt_template_custom'))
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+
+          SymbolGlyph($r('sys.symbol.gearshape'))
+            .fontSize(16)
+            .fontColor([$r('app.color.text_tertiary')])
+            .margin({ left: 8 })
+        }
+        .width('100%')
+        .padding(16)
+        .onClick(() => {
+          this.onPromptClick()
+        })
+      }
+    }
+    .width('100%')
+    .backgroundColor(getAppUiState().themeSurface)
+    .borderRadius(16)
+  }
+}
+
+@Builder
+export function DefaultModelPageBuilder(_name: string, _param: Object) {
+  DefaultModelPage({
+    hostedInNavDestination: true
+  })
+}

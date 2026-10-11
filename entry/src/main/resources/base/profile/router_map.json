@@ -1,0 +1,139 @@
+{
+  "routerMap": [
+    {
+      "name": "ChatPage",
+      "pageSourceFile": "src/main/ets/pages/ChatPage.ets",
+      "buildFunction": "ChatPageBuilder"
+    },
+    {
+      "name": "ChatDetailEmpty",
+      "pageSourceFile": "src/main/ets/pages/ChatDetailEmptyPage.ets",
+      "buildFunction": "ChatDetailEmptyPageBuilder"
+    },
+    {
+      "name": "ModelManagePage",
+      "pageSourceFile": "src/main/ets/pages/ModelManagePage.ets",
+      "buildFunction": "ModelManagePageBuilder"
+    },
+    {
+      "name": "DefaultModelPage",
+      "pageSourceFile": "src/main/ets/pages/DefaultModelPage.ets",
+      "buildFunction": "DefaultModelPageBuilder"
+    },
+    {
+      "name": "ThemeModeSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/ThemeModeSettingsPage.ets",
+      "buildFunction": "ThemeModeSettingsPageBuilder"
+    },
+    {
+      "name": "LanguageSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/LanguageSettingsPage.ets",
+      "buildFunction": "LanguageSettingsPageBuilder"
+    },
+    {
+      "name": "ColorThemeSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/ColorThemeSettingsPage.ets",
+      "buildFunction": "ColorThemeSettingsPageBuilder"
+    },
+    {
+      "name": "NotificationSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/NotificationSettingsPage.ets",
+      "buildFunction": "NotificationSettingsPageBuilder"
+    },
+    {
+      "name": "HandAdaptiveSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/HandAdaptiveSettingsPage.ets",
+      "buildFunction": "HandAdaptiveSettingsPageBuilder"
+    },
+    {
+      "name": "FontSizeSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/FontSizeSettingsPage.ets",
+      "buildFunction": "FontSizeSettingsPageBuilder"
+    },
+    {
+      "name": "SystemPromptSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/SystemPromptSettingsPage.ets",
+      "buildFunction": "SystemPromptSettingsPageBuilder"
+    },
+    {
+      "name": "ChatInputSettingsPage",
+      "pageSourceFile": "src/main/ets/pages/ChatInputSettingsPage.ets",
+      "buildFunction": "ChatInputSettingsPageBuilder"
+    },
+    {
+      "name": "ProviderDetailPage",
+      "pageSourceFile": "src/main/ets/pages/ProviderDetailPage.ets",
+      "buildFunction": "ProviderDetailPageBuilder"
+    },
+    {
+      "name": "ToolsCenterPage",
+      "pageSourceFile": "src/main/ets/pages/ToolsCenterPage.ets",
+      "buildFunction": "ToolsCenterPageBuilder"
+    },
+    {
+      "name": "ImageGenerationPage",
+      "pageSourceFile": "src/main/ets/pages/ImageGenerationPage.ets",
+      "buildFunction": "ImageGenerationPageBuilder"
+    },
+    {
+      "name": "ImagePromptTemplateManagerPage",
+      "pageSourceFile": "src/main/ets/pages/ImagePromptTemplateManagerPage.ets",
+      "buildFunction": "ImagePromptTemplateManagerPageBuilder"
+    },
+    {
+      "name": "ExportDataPage",
+      "pageSourceFile": "src/main/ets/pages/ExportDataPage.ets",
+      "buildFunction": "ExportDataPageBuilder"
+    },
+    {
+      "name": "ImportDataPage",
+      "pageSourceFile": "src/main/ets/pages/ImportDataPage.ets",
+      "buildFunction": "ImportDataPageBuilder"
+    },
+    {
+      "name": "WebDAVSyncPage",
+      "pageSourceFile": "src/main/ets/pages/WebDAVSyncPage.ets",
+      "buildFunction": "WebDAVSyncPageBuilder"
+    },
+    {
+      "name": "UsageStatsPage",
+      "pageSourceFile": "src/main/ets/pages/UsageStatsPage.ets",
+      "buildFunction": "UsageStatsPageBuilder"
+    },
+    {
+      "name": "PrivacyPolicyPage",
+      "pageSourceFile": "src/main/ets/pages/PrivacyPolicyPage.ets",
+      "buildFunction": "PrivacyPolicyPageBuilder"
+    },
+    {
+      "name": "AboutPage",
+      "pageSourceFile": "src/main/ets/pages/AboutPage.ets",
+      "buildFunction": "AboutPageBuilder"
+    },
+    {
+      "name": "HelpCenterPage",
+      "pageSourceFile": "src/main/ets/pages/HelpCenterPage.ets",
+      "buildFunction": "HelpCenterPageBuilder"
+    },
+    {
+      "name": "HelpTopicDetailPage",
+      "pageSourceFile": "src/main/ets/pages/HelpTopicDetailPage.ets",
+      "buildFunction": "HelpTopicDetailPageBuilder"
+    },
+    {
+      "name": "SupportDevelopmentPage",
+      "pageSourceFile": "src/main/ets/pages/SupportDevelopmentPage.ets",
+      "buildFunction": "SupportDevelopmentPageBuilder"
+    },
+    {
+      "name": "InvitationPage",
+      "pageSourceFile": "src/main/ets/pages/InvitationPage.ets",
+      "buildFunction": "InvitationPageBuilder"
+    },
+    {
+      "name": "CubeSpinnerPreview",
+      "pageSourceFile": "src/main/ets/pages/CubeSpinnerPreview.ets",
+      "buildFunction": "CubeSpinnerPreviewBuilder"
+    }
+  ]
+}

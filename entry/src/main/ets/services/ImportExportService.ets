@@ -1,0 +1,2155 @@
+/**
+ * 导入导出服务
+ * 支持将对话、附件、供应商配置等数据导出为 ZIP 文件
+ * 支持从 ZIP 文件导入数据
+ */
+
+import { zlib } from '@kit.BasicServicesKit'
+import { fileIo, fileUri } from '@kit.CoreFileKit'
+import { Context } from '@kit.AbilityKit'
+import { util } from '@kit.ArkTS'
+import {
+  ChatSession,
+  ChatMessage,
+  ModelProvider,
+  ModelInfo,
+  ModelInfoExtendedJson,
+  ProviderType,
+  ApiStyle,
+  OpenAITransport,
+  ProviderIconType,
+  MessageAttachment,
+  AttachmentType,
+  MessageRole,
+  SearchReference,
+  ToolCall,
+  ToolResult,
+  SessionTitleSource
+} from '../models/ChatModels'
+import { Assistant, DEFAULT_ASSISTANT_ID } from '../models/AssistantModels'
+import { deserializeMessageParts, MessagePartKind, serializeMessageParts } from '../models/MessageParts'
+import { DatabaseService } from './DatabaseService'
+import { AttachmentStorageService } from './AttachmentStorageService'
+import { getPreferencesService, PreferenceKeys } from './PreferencesService'
+import { getThemeService } from './ThemeService'
+import { getSettingsManager } from '../viewmodels/SettingsManager'
+import { DEFAULT_PRIMARY_COLOR } from '../config/ThemeDefaults'
+import { applyDerivedModelDefaults } from '../utils/ModelCapabilityDeriver'
+import { getAppStateManager } from '../viewmodels/AppStateManager'
+import { getProviderViewModel } from '../viewmodels/ProviderViewModel'
+import { ImageGenerationViewModel } from '../viewmodels/ImageGenerationViewModel'
+import { buildProviderImportOrder } from '../config/ProviderOrderUtils'
+import { AppStorageKeys } from '../config/AppStorageKeys'
+import { setAppUiStateValue } from '../state/AppUiState'
+import { getSearchEngineRegistry, registerAllSearchEngines } from './search/Index'
+import { GeneratedMedia } from '../models/ImageGenerationModels'
+
+const ASSISTANT_AVATAR_EXPORT_DIR: string = 'assistant_avatars'
+const PROVIDER_ICON_EXPORT_DIR: string = 'provider_icons'
+const GENERATED_MEDIA_EXPORT_DIR: string = 'generated_media'
+const GENERATED_MEDIA_IMAGES_EXPORT_DIR: string = 'images'
+const GENERATED_MEDIA_REFERENCES_EXPORT_DIR: string = 'references'
+
+// 导出选项
+export interface ExportOptions {
+  sessionIds?: string[]
+  includeAttachments: boolean
+  includeProviders: boolean
+  includeApiKeys?: boolean
+  includePreferences: boolean
+  includeGeneratedImages?: boolean
+}
+
+// 导入选项
+export interface ImportOptions {
+  conflictStrategy: 'skip' | 'rename' | 'overwrite' | 'ask'
+  importProviders: boolean
+  importPreferences: boolean
+}
+
+// 统计信息
+export interface StatisticsData {
+  sessionsCount: number
+  messagesCount: number
+  attachmentsCount: number
+  totalSize: number
+  preferencesCount?: number
+  generatedImagesCount?: number
+}
+
+// 同步元数据
+export interface SyncMetadata {
+  lastSyncTime: number
+  syncVersion: number
+  deviceId: string
+}
+
+// 清单数据
+export interface ManifestData {
+  version: string
+  exportTime: number
+  appVersion: string
+  exportType: string
+  options: ExportOptions
+  statistics: StatisticsData
+  sessions: SessionSummary[]
+  syncMetadata: SyncMetadata
+  providersCount?: number
+  assistantsCount?: number
+  preferencesCount?: number
+  generatedImagesCount?: number
+}
+
+// 供应商导出数据
+export interface ProviderExportData {
+  id: string
+  name: string
+  type: string
+  apiStyle: string
+  openaiTransport: string
+  apiKey: string
+  requiresApiKey: boolean
+  baseUrl: string
+  isEnabled: boolean
+  modelsJson: string
+  iconSymbol: string
+  sortOrder: number
+  isPreset: boolean
+  iconPath: string
+  apiPath: string
+  customHeadersJson: string
+  iconType: string
+  textIcon: string
+  textIconBgColor: string
+  customImagePath: string
+  providerIconFileName?: string
+}
+
+export interface AssistantExportData {
+  id: string
+  name: string
+  avatarSymbol: string
+  avatarFileName?: string
+  color: string
+  systemPrompt: string
+  defaultProviderId: string
+  defaultModelId: string
+  defaultModelName: string
+  temperatureEnabled: boolean
+  temperature: number
+  topPEnabled?: boolean
+  topP?: number
+  presencePenaltyEnabled?: boolean
+  presencePenalty?: number
+  frequencyPenaltyEnabled?: boolean
+  frequencyPenalty?: number
+  enabledToolIds?: string[]
+  isDefault: boolean
+  createdAt: number
+  updatedAt: number
+  sortOrder: number
+}
+
+export interface GeneratedMediaExportData {
+  id: string
+  type: string
+  prompt: string
+  providerId: string
+  providerName: string
+  modelId: string
+  modelName: string
+  fileName: string
+  mimeType: string
+  aspectRatio: string
+  sourcePathsJson: string
+  sourceFilesJson?: string
+  requestOptionsJson: string
+  actualOptionsJson: string
+  revisedPrompt: string
+  createdAt: number
+}
+
+// 会话摘要
+export interface SessionSummary {
+  id: string
+  title: string
+  messageCount: number
+  hasAttachments: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+// 冲突信息
+export interface ConflictInfo {
+  type: 'session' | 'provider'
+  id: string
+  title: string
+  localUpdatedAt: number
+  importUpdatedAt: number
+}
+
+// 导入预览信息
+export interface ImportPreview {
+  sessionsCount: number
+  messagesCount: number
+  attachmentsCount: number
+  providersCount: number
+  preferencesCount: number
+  generatedImagesCount: number
+  conflicts: ConflictInfo[]
+  manifest: ManifestData
+}
+
+// 导入结果
+export interface ImportResult {
+  imported: number
+  skipped: number
+  overwritten: number
+  preferencesRestored: number
+  generatedImagesImported: number
+}
+
+// 偏好设置条目
+export interface PreferenceEntry {
+  key: string
+  value: string | number | boolean
+  type: 'string' | 'number' | 'boolean'
+}
+
+// 敏感偏好键（不含 API 密钥时需跳过）
+function getSensitivePreferenceKeys(): string[] {
+  registerAllSearchEngines()
+  const keys = getSearchEngineRegistry().getSensitiveKeys()
+  keys.push(PreferenceKeys.MCP_SERVER_CONFIGS_JSON)
+  keys.push(PreferenceKeys.WEBDAV_SERVER_URL)
+  keys.push(PreferenceKeys.WEBDAV_USERNAME)
+  keys.push(PreferenceKeys.WEBDAV_PASSWORD)
+  return keys
+}
+
+// 会话数据
+interface SessionData {
+  id: string
+  title: string
+  modelId: string
+  providerId: string
+  assistantId?: string
+  titleSource?: string
+  suggestedQuestions?: string[]
+  createdAt: number
+  updatedAt: number
+  isFavorite: boolean
+  lastMessagePreview: string
+  messageCount: number
+  syncVersion: number
+  lastModified: number
+  syncStatus: string
+  deviceId: string
+}
+
+// 消息数据
+interface MessageData {
+  id: string
+  role: string
+  content: string
+  timestamp: number
+  modelName: string
+  reasoningContent: string
+  reasoningSignatureBlob?: string
+  partsJson?: string
+  searchQuery: string
+  searchEngine: string
+  searchSource?: string
+  searchReferences: SearchReferenceData[]
+  attachmentIds: string[]
+  toolCalls: ToolCallData[]
+  toolResults: ToolResultData[]
+}
+
+// 搜索引用数据
+interface SearchReferenceData {
+  id: string
+  title: string
+  url: string
+  snippet: string
+  timestamp: number
+}
+
+// 工具调用数据
+interface ToolCallData {
+  id: string
+  type: string
+  functionName: string
+  arguments: string
+  toolId?: string
+  displayName?: string
+  sourceType?: string
+  sourceLabel?: string
+  permissionLevel?: string
+}
+
+// 工具结果数据
+interface ToolResultData {
+  toolCallId: string
+  content: string
+  isError?: boolean
+  displayName?: string
+  sourceLabel?: string
+}
+
+// 附件元数据
+interface AttachmentMetadata {
+  id: string
+  type: string
+  name: string
+  mimeType: string
+  size: number
+  sourcePath?: string
+  processState?: string
+  parseEngine?: string
+  parsedText?: string
+  parseError?: string
+}
+
+interface ImportedAttachmentBinding {
+  metadata: AttachmentMetadata
+  filePath: string
+}
+
+interface GeneratedMediaSourceFileExportData {
+  index?: number
+  path?: string
+  fileName?: string
+  mimeType?: string
+}
+
+// 导入文件数据
+interface ImportFileData {
+  manifest: ManifestData
+  sessions: SessionData[]
+  messages: Map<string, MessageData[]>
+  attachmentsMetadata: Record<string, AttachmentMetadata[]>
+  providers: ProviderExportData[]
+  assistants: AssistantExportData[]
+  preferences: PreferenceEntry[]
+  generatedMedia: GeneratedMediaExportData[]
+  tempDir: string
+}
+
+export class ImportExportService {
+  private static instance: ImportExportService | null = null
+  private context: Context | null = null
+  private dbService: DatabaseService
+  private attachmentService: AttachmentStorageService
+
+  private constructor() {
+    this.dbService = DatabaseService.getInstance()
+    this.attachmentService = AttachmentStorageService.getInstance()
+  }
+
+  static getInstance(): ImportExportService {
+    if (ImportExportService.instance === null) {
+      ImportExportService.instance = new ImportExportService()
+    }
+    return ImportExportService.instance
+  }
+
+  async initialize(context: Context): Promise<void> {
+    this.context = context
+  }
+
+  // ============ 导出功能 ============
+
+  async exportData(options: ExportOptions, onProgress?: (progress: number) => void): Promise<string> {
+    if (this.context === null) {
+      throw new Error('Service not initialized')
+    }
+
+    try {
+      let lastProgress = -1
+      const emitProgress = (progress: number): void => {
+        if (onProgress && progress !== lastProgress) {
+          lastProgress = progress
+          onProgress(progress)
+        }
+      }
+
+      emitProgress(10)
+
+      const sessions = await this.collectSessions(options)
+      emitProgress(15)
+      const messages = await this.collectMessages(sessions, emitProgress)
+      const attachments = this.collectAttachments(messages, options)
+      const providers = options.includeProviders ? await this.collectProviders(options) : []
+      const assistants = await this.collectAssistants()
+      const preferences = options.includePreferences ? await this.collectPreferences(options) : []
+      const generatedMedia = await this.collectGeneratedMedia(options)
+
+      emitProgress(30)
+
+      const manifest =
+        this.generateManifest(sessions, messages, attachments, providers, assistants, preferences, generatedMedia, options)
+
+      const timestamp = Date.now()
+      const tempDir = `${this.context.cacheDir}/export_temp_${timestamp}`
+      fileIo.mkdirSync(tempDir)
+
+      await this.writeExportFiles(
+        tempDir,
+        manifest,
+        sessions,
+        messages,
+        attachments,
+        providers,
+        assistants,
+        preferences,
+        generatedMedia,
+        options
+      )
+
+      emitProgress(60)
+
+      const zipPath = `${this.context.cacheDir}/cubechat_export_${timestamp}.zip`
+      const zlibOptions: zlib.Options = {
+        level: zlib.CompressLevel.COMPRESS_LEVEL_DEFAULT_COMPRESSION,
+        memLevel: zlib.MemLevel.MEM_LEVEL_DEFAULT,
+        strategy: zlib.CompressStrategy.COMPRESS_STRATEGY_DEFAULT_STRATEGY
+      }
+      await zlib.compressFile(tempDir, zipPath, zlibOptions)
+
+      emitProgress(90)
+
+      this.deleteDirectory(tempDir)
+
+      emitProgress(100)
+
+      return zipPath
+    } catch (error) {
+      console.error('ImportExportService', `Export failed: ${JSON.stringify(error)}`)
+      throw new Error('Export failed')
+    }
+  }
+
+  private async collectSessions(options: ExportOptions): Promise<ChatSession[]> {
+    const allSessions = await this.dbService.getAllSessions(false)
+    if (options.sessionIds && options.sessionIds.length > 0) {
+      const result: ChatSession[] = []
+      for (const session of allSessions) {
+        if (options.sessionIds.includes(session.id)) {
+          result.push(session)
+        }
+      }
+      return result
+    }
+    return allSessions
+  }
+
+  private async collectMessages(
+    sessions: ChatSession[],
+    onProgress?: (progress: number) => void
+  ): Promise<Map<string, ChatMessage[]>> {
+    const messages = new Map<string, ChatMessage[]>()
+    if (sessions.length === 0) {
+      if (onProgress) {
+        onProgress(25)
+      }
+      return messages
+    }
+
+    for (let i = 0; i < sessions.length; i++) {
+      const session = sessions[i]
+      const sessionMessages = await this.dbService.getMessages(session.id)
+      messages.set(session.id, sessionMessages)
+      if (onProgress) {
+        const progress = 15 + Math.floor(((i + 1) / sessions.length) * 10)
+        onProgress(progress > 25 ? 25 : progress)
+      }
+    }
+    return messages
+  }
+
+  private collectAttachments(
+    messages: Map<string, ChatMessage[]>,
+    options: ExportOptions
+  ): Map<string, MessageAttachment[]> {
+    const attachments = new Map<string, MessageAttachment[]>()
+    if (!options.includeAttachments) {
+      return attachments
+    }
+
+    const keys = Array.from(messages.keys())
+    for (const key of keys) {
+      const msgs = messages.get(key)
+      if (msgs) {
+        for (const msg of msgs) {
+          if (msg.attachments.length > 0) {
+            attachments.set(msg.id, msg.attachments)
+          }
+        }
+      }
+    }
+    return attachments
+  }
+
+  private async collectProviders(options: ExportOptions): Promise<ProviderExportData[]> {
+    const allProviders = await this.dbService.getAllProviders()
+    const providers: ProviderExportData[] = []
+    const includeSecrets = this.shouldIncludeSecrets(options)
+    for (const p of allProviders) {
+      const providerData: ProviderExportData = {
+        id: p.id,
+        name: p.name,
+        type: p.type,
+        apiStyle: p.apiStyle,
+        openaiTransport: p.openaiTransport,
+        apiKey: includeSecrets ? p.apiKey : '',
+        requiresApiKey: p.requiresApiKey,
+        baseUrl: p.baseUrl,
+        isEnabled: p.isEnabled,
+        modelsJson: p.modelsJson,
+        iconSymbol: p.iconSymbol,
+        sortOrder: p.sortOrder,
+        isPreset: p.isPreset,
+        iconPath: p.iconPath,
+        apiPath: p.apiPath,
+        customHeadersJson: includeSecrets ? p.customHeadersJson : '',
+        iconType: p.iconType,
+        textIcon: p.textIcon,
+        textIconBgColor: p.textIconBgColor,
+        customImagePath: p.customImagePath
+      }
+      providers.push(providerData)
+    }
+    return providers
+  }
+
+  private async collectAssistants(): Promise<AssistantExportData[]> {
+    const allAssistants = await this.dbService.getAllAssistants()
+    const assistants: AssistantExportData[] = []
+    for (const assistant of allAssistants) {
+      assistants.push({
+        id: assistant.id,
+        name: assistant.name,
+        avatarSymbol: assistant.avatarSymbol,
+        color: assistant.color,
+        systemPrompt: assistant.systemPrompt,
+        defaultProviderId: assistant.defaultProviderId,
+        defaultModelId: assistant.defaultModelId,
+        defaultModelName: assistant.defaultModelName,
+        temperatureEnabled: assistant.temperatureEnabled,
+        temperature: assistant.temperature,
+        topPEnabled: assistant.topPEnabled,
+        topP: assistant.topP,
+        presencePenaltyEnabled: assistant.presencePenaltyEnabled,
+        presencePenalty: assistant.presencePenalty,
+        frequencyPenaltyEnabled: assistant.frequencyPenaltyEnabled,
+        frequencyPenalty: assistant.frequencyPenalty,
+        enabledToolIds: assistant.enabledToolIds.slice(),
+        isDefault: assistant.isDefault,
+        createdAt: assistant.createdAt,
+        updatedAt: assistant.updatedAt,
+        sortOrder: assistant.sortOrder
+      })
+    }
+    return assistants
+  }
+
+  private async collectGeneratedMedia(options: ExportOptions): Promise<GeneratedMedia[]> {
+    const result: GeneratedMedia[] = []
+    if (options.includeGeneratedImages !== true) {
+      return result
+    }
+    const allMedia = await this.dbService.getGeneratedMediaList(0)
+    for (const media of allMedia) {
+      if (media.filePath !== '' && this.attachmentService.fileExists(media.filePath)) {
+        result.push(media)
+      }
+    }
+    return result
+  }
+
+  private async collectPreferences(options: ExportOptions): Promise<PreferenceEntry[]> {
+    const entries: PreferenceEntry[] = []
+    try {
+      const allData = await getPreferencesService().getAll()
+      const keys = Array.from(allData.keys())
+      const includeSecrets = this.shouldIncludeSecrets(options)
+      for (const key of keys) {
+        // 若不含 API 密钥，跳过敏感键
+        if (!includeSecrets && getSensitivePreferenceKeys().includes(key)) {
+          continue
+        }
+        const value = allData.get(key)
+        if (value === undefined) {
+          continue
+        }
+        let entryType: 'string' | 'number' | 'boolean' = 'string'
+        if (typeof value === 'number') {
+          entryType = 'number'
+        } else if (typeof value === 'boolean') {
+          entryType = 'boolean'
+        }
+        const entry: PreferenceEntry = {
+          key: key,
+          value: value as string | number | boolean,
+          type: entryType
+        }
+        entries.push(entry)
+      }
+    } catch (error) {
+      console.error('ImportExportService', `Failed to collect preferences: ${JSON.stringify(error)}`)
+    }
+    return entries
+  }
+
+  private shouldIncludeSecrets(options: ExportOptions): boolean {
+    return options.includeApiKeys !== false
+  }
+
+  private generateManifest(
+    sessions: ChatSession[],
+    messages: Map<string, ChatMessage[]>,
+    attachments: Map<string, MessageAttachment[]>,
+    providers: ProviderExportData[],
+    assistants: AssistantExportData[],
+    preferences: PreferenceEntry[],
+    generatedMedia: GeneratedMedia[],
+    options: ExportOptions
+  ): ManifestData {
+    let totalMessages = 0
+    let totalAttachments = 0
+    const sessionSummaries: SessionSummary[] = []
+
+    for (const session of sessions) {
+      const sessionMessages = messages.get(session.id)
+      const messageCount = sessionMessages ? sessionMessages.length : 0
+      totalMessages += messageCount
+
+      let hasAttachments = false
+      if (sessionMessages) {
+        for (const msg of sessionMessages) {
+          if (attachments.has(msg.id)) {
+            hasAttachments = true
+            const atts = attachments.get(msg.id)
+            if (atts) {
+              totalAttachments += atts.length
+            }
+          }
+        }
+      }
+
+      const summary: SessionSummary = {
+        id: session.id,
+        title: session.title,
+        messageCount: messageCount,
+        hasAttachments: hasAttachments,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt
+      }
+      sessionSummaries.push(summary)
+    }
+
+    const statistics: StatisticsData = {
+      sessionsCount: sessions.length,
+      messagesCount: totalMessages,
+      attachmentsCount: totalAttachments,
+      totalSize: 0,
+      preferencesCount: preferences.length,
+      generatedImagesCount: generatedMedia.length
+    }
+
+    const syncMetadata: SyncMetadata = {
+      lastSyncTime: 0,
+      syncVersion: 1,
+      deviceId: ''
+    }
+
+    const manifest: ManifestData = {
+      version: '1.0',
+      exportTime: Date.now(),
+      appVersion: '1.1.3',
+      exportType: (options.sessionIds && options.sessionIds.length > 0) ? 'partial' : 'full',
+      options: options,
+      statistics: statistics,
+      sessions: sessionSummaries,
+      syncMetadata: syncMetadata,
+      providersCount: providers.length,
+      assistantsCount: assistants.length,
+      preferencesCount: preferences.length,
+      generatedImagesCount: generatedMedia.length
+    }
+
+    return manifest
+  }
+
+  private async writeExportFiles(
+    tempDir: string,
+    manifest: ManifestData,
+    sessions: ChatSession[],
+    messages: Map<string, ChatMessage[]>,
+    attachments: Map<string, MessageAttachment[]>,
+    providers: ProviderExportData[],
+    assistants: AssistantExportData[],
+    preferences: PreferenceEntry[],
+    generatedMedia: GeneratedMedia[],
+    options: ExportOptions
+  ): Promise<void> {
+    this.writeTextFile(`${tempDir}/manifest.json`, JSON.stringify(manifest, null, 2))
+
+    const sessionsData: SessionData[] = []
+    for (const s of sessions) {
+      const sessionData: SessionData = {
+        id: s.id,
+        title: s.title,
+        modelId: s.modelId,
+        providerId: s.providerId,
+        assistantId: s.assistantId !== '' ? s.assistantId : DEFAULT_ASSISTANT_ID,
+        titleSource: s.titleSource,
+        suggestedQuestions: [...s.suggestedQuestions],
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+        isFavorite: s.isFavorite,
+        lastMessagePreview: s.lastMessagePreview,
+        messageCount: s.messageCount,
+        syncVersion: s.syncVersion,
+        lastModified: s.lastModified,
+        syncStatus: s.syncStatus,
+        deviceId: s.deviceId
+      }
+      sessionsData.push(sessionData)
+    }
+    this.writeTextFile(`${tempDir}/sessions.json`, JSON.stringify(sessionsData, null, 2))
+
+    const messagesDir = `${tempDir}/messages`
+    try {
+      fileIo.mkdirSync(messagesDir)
+    } catch (error) {
+      throw new Error(`Failed to create messages directory: ${JSON.stringify(error)}`)
+    }
+
+    const messageKeys = Array.from(messages.keys())
+    for (const sessionId of messageKeys) {
+      const msgs = messages.get(sessionId)
+      if (msgs) {
+        const messagesData: MessageData[] = []
+        for (const m of msgs) {
+          const attachmentIds: string[] = []
+          for (const a of m.attachments) {
+            attachmentIds.push(a.id)
+          }
+
+          // 收集搜索引用数据
+          const searchReferencesData: SearchReferenceData[] = []
+          for (const ref of m.searchReferences) {
+            searchReferencesData.push({
+              id: ref.id,
+              title: ref.title,
+              url: ref.url,
+              snippet: ref.snippet,
+              timestamp: ref.timestamp
+            })
+          }
+
+          // 收集工具调用数据
+          const toolCallsData: ToolCallData[] = []
+          for (const tc of m.toolCalls) {
+            toolCallsData.push({
+              id: tc.id,
+              type: tc.type,
+              functionName: tc.functionName,
+              arguments: tc.arguments,
+              toolId: tc.toolId,
+              displayName: tc.displayName,
+              sourceType: tc.sourceType,
+              sourceLabel: tc.sourceLabel,
+              permissionLevel: tc.permissionLevel
+            })
+          }
+
+          // 收集工具结果数据
+          const toolResultsData: ToolResultData[] = []
+          for (const tr of m.toolResults) {
+            toolResultsData.push({
+              toolCallId: tr.toolCallId,
+              content: tr.content,
+              isError: tr.isError,
+              displayName: tr.displayName,
+              sourceLabel: tr.sourceLabel
+            })
+          }
+
+          const messageData: MessageData = {
+            id: m.id,
+            role: m.role,
+            content: m.content,
+            timestamp: m.timestamp,
+            modelName: m.modelName,
+            reasoningContent: m.reasoningContent,
+            reasoningSignatureBlob: m.reasoningSignatureBlob || '',
+            partsJson: serializeMessageParts(m.parts),
+            searchQuery: m.searchQuery,
+            searchEngine: m.searchEngine,
+            searchSource: m.searchSource,
+            searchReferences: searchReferencesData,
+            attachmentIds: attachmentIds,
+            toolCalls: toolCallsData,
+            toolResults: toolResultsData
+          }
+          messagesData.push(messageData)
+        }
+        this.writeTextFile(`${messagesDir}/${sessionId}.json`, JSON.stringify(messagesData, null, 2))
+      }
+    }
+
+    if (options.includeAttachments && attachments.size > 0) {
+      const attachmentsDir = `${tempDir}/attachments`
+      try {
+        fileIo.mkdirSync(attachmentsDir)
+        fileIo.mkdirSync(`${attachmentsDir}/images`)
+        fileIo.mkdirSync(`${attachmentsDir}/files`)
+      } catch (error) {
+        throw new Error(`Failed to create attachments directory: ${JSON.stringify(error)}`)
+      }
+
+      const attachmentsMetadata: Record<string, AttachmentMetadata[]> = {}
+      const attachmentKeys = Array.from(attachments.keys())
+      for (const messageId of attachmentKeys) {
+        const atts = attachments.get(messageId)
+        if (atts) {
+          const metadataList: AttachmentMetadata[] = []
+          for (const a of atts) {
+            const metadata: AttachmentMetadata = {
+              id: a.id,
+              type: a.type,
+              name: a.name,
+              mimeType: a.mimeType,
+              size: a.size,
+              sourcePath: a.filePath,
+              processState: a.processState,
+              parseEngine: a.parseEngine,
+              parsedText: a.parsedText,
+              parseError: a.parseError
+            }
+            metadataList.push(metadata)
+          }
+          attachmentsMetadata[messageId] = metadataList
+        }
+      }
+      this.writeTextFile(`${attachmentsDir}/metadata.json`, JSON.stringify(attachmentsMetadata, null, 2))
+
+      for (const messageId of attachmentKeys) {
+        const atts = attachments.get(messageId)
+        if (atts) {
+          for (const att of atts) {
+            if (this.attachmentService.fileExists(att.filePath)) {
+              const subDir = att.type === AttachmentType.IMAGE ? 'images' : 'files'
+              const ext = this.getExtension(att.name)
+              const destPath = `${attachmentsDir}/${subDir}/${att.id}${ext}`
+              await this.copyFile(att.filePath, destPath)
+            }
+          }
+        }
+      }
+    }
+
+    if (options.includeProviders && providers.length > 0) {
+      await this.writeProviderIconFiles(tempDir, providers)
+      this.writeTextFile(`${tempDir}/providers.json`, JSON.stringify(providers, null, 2))
+    }
+
+    if (assistants.length > 0) {
+      await this.writeAssistantAvatarFiles(tempDir, assistants)
+      this.writeTextFile(`${tempDir}/assistants.json`, JSON.stringify(assistants, null, 2))
+    }
+
+    if (options.includeGeneratedImages === true && generatedMedia.length > 0) {
+      await this.writeGeneratedMediaFiles(tempDir, generatedMedia)
+    }
+
+    // 写入偏好设置数据
+    if (options.includePreferences && preferences.length > 0) {
+      this.writeTextFile(`${tempDir}/preferences.json`, JSON.stringify(preferences, null, 2))
+    }
+  }
+
+  // ============ 导入功能 ============
+
+  async previewImport(zipPath: string): Promise<ImportPreview> {
+    if (this.context === null) {
+      throw new Error('Service not initialized')
+    }
+
+    try {
+      console.info('ImportExportService', `Starting preview import from: ${zipPath}`)
+
+      const tempDir = `${this.context.cacheDir}/import_preview_${Date.now()}`
+      console.info('ImportExportService', `Temp dir: ${tempDir}`)
+
+      // 确保目标目录存在
+      try {
+        fileIo.mkdirSync(tempDir)
+        console.info('ImportExportService', 'Temp directory created')
+      } catch (mkdirError) {
+        console.error('ImportExportService', `Failed to create temp dir: ${JSON.stringify(mkdirError)}`)
+        throw new Error(`Failed to create temp directory: ${mkdirError}`)
+      }
+
+      const zlibOptions: zlib.Options = {
+        level: zlib.CompressLevel.COMPRESS_LEVEL_DEFAULT_COMPRESSION
+      }
+
+      console.info('ImportExportService', 'Starting decompression...')
+      await zlib.decompressFile(zipPath, tempDir, zlibOptions)
+      console.info('ImportExportService', 'Decompression completed')
+
+      console.info('ImportExportService', 'Reading manifest...')
+      const manifestText = this.readTextFile(`${tempDir}/manifest.json`)
+      console.info('ImportExportService', `Manifest text length: ${manifestText.length}`)
+
+      const manifest = JSON.parse(manifestText) as ManifestData
+      console.info('ImportExportService', `Manifest parsed, sessions: ${manifest.sessions.length}`)
+
+      const conflicts = await this.detectConflicts(manifest)
+      console.info('ImportExportService', `Conflicts detected: ${conflicts.length}`)
+
+      this.deleteDirectory(tempDir)
+
+      const preview: ImportPreview = {
+        sessionsCount: manifest.statistics.sessionsCount,
+        messagesCount: manifest.statistics.messagesCount,
+        attachmentsCount: manifest.statistics.attachmentsCount,
+        providersCount: manifest.providersCount || 0,
+        preferencesCount: manifest.preferencesCount || 0,
+        generatedImagesCount: manifest.generatedImagesCount || manifest.statistics.generatedImagesCount || 0,
+        conflicts: conflicts,
+        manifest: manifest
+      }
+
+      return preview
+    } catch (error) {
+      console.error('ImportExportService', `Preview failed: ${JSON.stringify(error)}`)
+      console.error('ImportExportService', `Error details: ${error}`)
+      throw new Error(`Preview failed: ${error}`)
+    }
+  }
+
+  async importData(
+    zipPath: string,
+    options: ImportOptions,
+    onProgress?: (progress: number) => void
+  ): Promise<ImportResult> {
+    if (this.context === null) {
+      throw new Error('Service not initialized')
+    }
+
+    try {
+      if (onProgress) {
+        onProgress(10)
+      }
+
+      const tempDir = `${this.context.cacheDir}/import_temp_${Date.now()}`
+
+      // 确保目标目录存在
+      fileIo.mkdirSync(tempDir)
+
+      const zlibOptions: zlib.Options = {
+        level: zlib.CompressLevel.COMPRESS_LEVEL_DEFAULT_COMPRESSION
+      }
+      await zlib.decompressFile(zipPath, tempDir, zlibOptions)
+
+      if (onProgress) {
+        onProgress(30)
+      }
+
+      const importData = this.readImportFiles(tempDir)
+
+      if (onProgress) {
+        onProgress(50)
+      }
+
+      const result = await this.performImport(importData, options)
+
+      if (onProgress) {
+        onProgress(90)
+      }
+
+      this.deleteDirectory(tempDir)
+
+      if (onProgress) {
+        onProgress(100)
+      }
+
+      return result
+    } catch (error) {
+      console.error('ImportExportService', `Import failed: ${JSON.stringify(error)}`)
+      throw new Error('Import failed')
+    }
+  }
+
+  private readImportFiles(tempDir: string): ImportFileData {
+    const manifestText = this.readTextFile(`${tempDir}/manifest.json`)
+    const manifest = JSON.parse(manifestText) as ManifestData
+
+    const sessionsText = this.readTextFile(`${tempDir}/sessions.json`)
+    const sessions = JSON.parse(sessionsText) as SessionData[]
+
+    const messages = new Map<string, MessageData[]>()
+    const messagesDir = `${tempDir}/messages`
+    for (const session of sessions) {
+      try {
+        const messageText = this.readTextFile(`${messagesDir}/${session.id}.json`)
+        const sessionMessages = JSON.parse(messageText) as MessageData[]
+        messages.set(session.id, sessionMessages)
+      } catch (e) {
+        console.warn('ImportExportService', `Failed to read messages for session ${session.id}`)
+      }
+    }
+
+    let attachmentsMetadata: Record<string, AttachmentMetadata[]> = {}
+    try {
+      const metadataText = this.readTextFile(`${tempDir}/attachments/metadata.json`)
+      attachmentsMetadata = JSON.parse(metadataText) as Record<string, AttachmentMetadata[]>
+    } catch (e) {
+      console.info('ImportExportService', 'No attachments metadata found')
+    }
+
+    // 读取供应商数据
+    let providers: ProviderExportData[] = []
+    try {
+      const providersText = this.readTextFile(`${tempDir}/providers.json`)
+      providers = JSON.parse(providersText) as ProviderExportData[]
+    } catch (e) {
+      console.info('ImportExportService', 'No providers data found')
+    }
+
+    let assistants: AssistantExportData[] = []
+    try {
+      const assistantsText = this.readTextFile(`${tempDir}/assistants.json`)
+      assistants = JSON.parse(assistantsText) as AssistantExportData[]
+    } catch (e) {
+      console.info('ImportExportService', 'No assistants data found')
+    }
+
+    // 读取偏好设置数据
+    let preferences: PreferenceEntry[] = []
+    try {
+      const preferencesText = this.readTextFile(`${tempDir}/preferences.json`)
+      preferences = JSON.parse(preferencesText) as PreferenceEntry[]
+    } catch (e) {
+      console.info('ImportExportService', 'No preferences data found')
+    }
+
+    let generatedMedia: GeneratedMediaExportData[] = []
+    try {
+      const generatedMediaText = this.readTextFile(`${tempDir}/${GENERATED_MEDIA_EXPORT_DIR}/metadata.json`)
+      generatedMedia = JSON.parse(generatedMediaText) as GeneratedMediaExportData[]
+    } catch (e) {
+      console.info('ImportExportService', 'No generated media data found')
+    }
+
+    const importData: ImportFileData = {
+      manifest: manifest,
+      sessions: sessions,
+      messages: messages,
+      attachmentsMetadata: attachmentsMetadata,
+      providers: providers,
+      assistants: assistants,
+      preferences: preferences,
+      generatedMedia: generatedMedia,
+      tempDir: tempDir
+    }
+
+    return importData
+  }
+
+  private async performImport(
+    importData: ImportFileData,
+    options: ImportOptions
+  ): Promise<ImportResult> {
+    let imported = 0
+    let skipped = 0
+    let overwritten = 0
+    let generatedImagesImported = 0
+
+    const sessions = importData.sessions
+    const messages = importData.messages
+    const attachmentsMetadata = importData.attachmentsMetadata
+    const tempDir = importData.tempDir
+
+    if (importData.assistants.length > 0) {
+      await this.importAssistants(importData.assistants, tempDir)
+    }
+
+    for (const sessionData of sessions) {
+      const existingSession = await this.dbService.getSession(sessionData.id)
+
+      let finalSessionId = sessionData.id
+      let finalTitle = sessionData.title
+
+      if (existingSession !== null) {
+        if (options.conflictStrategy === 'skip') {
+          skipped++
+          continue
+        } else if (options.conflictStrategy === 'rename') {
+          finalSessionId = `${sessionData.id}_imported_${Date.now()}`
+          finalTitle = `${sessionData.title} (导入)`
+        } else if (options.conflictStrategy === 'overwrite') {
+          await this.dbService.deleteSession(existingSession.id)
+          overwritten++
+        }
+      }
+
+      const assistantId = sessionData.assistantId !== undefined && sessionData.assistantId !== '' ?
+        sessionData.assistantId : DEFAULT_ASSISTANT_ID
+      const existingAssistant = await this.dbService.getAssistant(assistantId)
+      const effectiveAssistantId = existingAssistant !== null ? assistantId : DEFAULT_ASSISTANT_ID
+      const session = new ChatSession(
+        finalSessionId,
+        finalTitle,
+        sessionData.modelId,
+        sessionData.providerId,
+        effectiveAssistantId
+      )
+      session.createdAt = sessionData.createdAt
+      session.updatedAt = sessionData.updatedAt
+      session.isFavorite = sessionData.isFavorite || false
+      session.lastMessagePreview = sessionData.lastMessagePreview || ''
+      session.messageCount = sessionData.messageCount || 0
+      session.suggestedQuestions = this.normalizeSuggestedQuestions(sessionData.suggestedQuestions)
+      session.titleSource =
+        sessionData.titleSource === SessionTitleSource.PLACEHOLDER ||
+        sessionData.titleSource === SessionTitleSource.AI ?
+          sessionData.titleSource as SessionTitleSource : SessionTitleSource.MANUAL
+      session.syncVersion = sessionData.syncVersion
+      session.lastModified = sessionData.lastModified
+      session.syncStatus = sessionData.syncStatus as 'synced' | 'pending' | 'conflict'
+      session.deviceId = sessionData.deviceId
+      await this.dbService.createSession(session)
+
+      const sessionMessages = messages.get(sessionData.id)
+      if (sessionMessages) {
+        for (const msgData of sessionMessages) {
+          const message = new ChatMessage(msgData.id, msgData.role as MessageRole, msgData.content, msgData.modelName)
+          message.timestamp = msgData.timestamp
+          message.reasoningContent = msgData.reasoningContent || ''
+          message.reasoningSignatureBlob = msgData.reasoningSignatureBlob || ''
+          message.parts = deserializeMessageParts(msgData.partsJson || '')
+          message.searchQuery = msgData.searchQuery || ''
+          message.searchEngine = msgData.searchEngine || ''
+          message.searchSource = msgData.searchSource || ''
+
+          // 恢复搜索引用
+          if (msgData.searchReferences && msgData.searchReferences.length > 0) {
+            for (const refData of msgData.searchReferences) {
+              const ref = new SearchReference(
+                refData.id,
+                refData.title,
+                refData.url,
+                refData.snippet
+              )
+              ref.timestamp = refData.timestamp
+              message.searchReferences.push(ref)
+            }
+          }
+
+          // 恢复工具调用
+          if (msgData.toolCalls && msgData.toolCalls.length > 0) {
+            for (const tcData of msgData.toolCalls) {
+              const toolCall = new ToolCall(
+                tcData.id,
+                tcData.functionName,
+                tcData.arguments,
+                tcData.toolId || tcData.functionName,
+                tcData.displayName || tcData.functionName,
+                tcData.sourceType || '',
+                tcData.sourceLabel || '',
+                tcData.permissionLevel || ''
+              )
+              toolCall.type = tcData.type
+              message.toolCalls.push(toolCall)
+            }
+          }
+
+          // 恢复工具结果
+          if (msgData.toolResults && msgData.toolResults.length > 0) {
+            for (const trData of msgData.toolResults) {
+              const toolResult = new ToolResult(
+                trData.toolCallId,
+                trData.content,
+                trData.isError === true,
+                trData.displayName || '',
+                trData.sourceLabel || ''
+              )
+              message.toolResults.push(toolResult)
+            }
+          }
+
+          if (msgData.attachmentIds && msgData.attachmentIds.length > 0) {
+            const attachments = attachmentsMetadata[msgData.id]
+            if (attachments) {
+              const importedAttachmentBindings: ImportedAttachmentBinding[] = []
+              for (const attData of attachments) {
+                const subDir = attData.type === 'image' ? 'images' : 'files'
+                const ext = this.getExtension(attData.name)
+                const srcPath = `${tempDir}/attachments/${subDir}/${attData.id}${ext}`
+
+                let sourceExists = false
+                try {
+                  sourceExists = fileIo.accessSync(srcPath)
+                } catch (error) {
+                  console.warn('ImportExportService', `Attachment file access failed: ${JSON.stringify(error)}`)
+                  sourceExists = false
+                }
+
+                if (sourceExists) {
+                  const attachment = new MessageAttachment(
+                    attData.id,
+                    attData.type === 'image' ? AttachmentType.IMAGE : AttachmentType.FILE,
+                    attData.name,
+                    '',
+                    attData.mimeType,
+                    attData.size
+                  )
+                  attachment.processState = attData.processState ?? attachment.processState
+                  attachment.parseEngine = attData.parseEngine ?? ''
+                  attachment.parsedText = attData.parsedText ?? ''
+                  attachment.parseError = attData.parseError ?? ''
+
+                  const savedPath = await this.attachmentService.importExistingAttachment(srcPath, attachment)
+                  attachment.filePath = savedPath
+
+                  if (savedPath !== '') {
+                    message.attachments.push(attachment)
+                    importedAttachmentBindings.push({
+                      metadata: attData,
+                      filePath: savedPath
+                    })
+                  }
+                }
+              }
+              this.rewriteImportedMessageImageParts(message, importedAttachmentBindings)
+            }
+          }
+
+          await this.dbService.addMessage(finalSessionId, message, false)
+        }
+      }
+
+      await this.dbService.refreshSessionSummaryForSession(finalSessionId)
+
+      // 恢复会话的原始时间戳（addMessage 会将 updated_at 覆盖为 Date.now()）
+      await this.dbService.updateSessionTimestamps(finalSessionId, sessionData.createdAt, sessionData.updatedAt)
+
+      if (existingSession === null) {
+        imported++
+      }
+    }
+
+    // 导入供应商数据
+    if (options.importProviders && importData.providers.length > 0) {
+      const sortedProviders = this.sortImportedProviders(importData.providers)
+      for (const providerData of sortedProviders) {
+        await this.importProvider(providerData, tempDir)
+      }
+      await this.restoreProviderOrder(sortedProviders)
+    }
+
+    if (importData.generatedMedia.length > 0) {
+      generatedImagesImported = await this.importGeneratedMedia(importData.generatedMedia, tempDir)
+    }
+
+    // 导入偏好设置
+    let preferencesRestored = 0
+    let shouldRefreshAfterImport = generatedImagesImported > 0
+    if (options.importPreferences && importData.preferences.length > 0) {
+      preferencesRestored = await this.importPreferences(importData.preferences)
+      shouldRefreshAfterImport = true
+    }
+    if (shouldRefreshAfterImport) {
+      await this.refreshAfterImport()
+    }
+
+    setAppUiStateValue(AppStorageKeys.SESSION_LIST_REFRESH_AT, Date.now())
+
+    const result: ImportResult = {
+      imported: imported,
+      skipped: skipped,
+      overwritten: overwritten,
+      preferencesRestored: preferencesRestored,
+      generatedImagesImported: generatedImagesImported
+    }
+
+    return result
+  }
+
+  private rewriteImportedMessageImageParts(message: ChatMessage, bindings: ImportedAttachmentBinding[]): void {
+    if (message.parts.length === 0 || bindings.length === 0) {
+      return
+    }
+    for (let i = 0; i < message.parts.length; i++) {
+      const part = message.parts[i]
+      if (part.kind !== MessagePartKind.IMAGE) {
+        continue
+      }
+      for (let j = 0; j < bindings.length; j++) {
+        const binding = bindings[j]
+        if (this.doesImagePartBelongToAttachment(part.mediaUrl, part.mediaName, part.mediaMime, binding.metadata)) {
+          part.mediaUrl = binding.filePath
+          part.mediaName = binding.metadata.name
+          part.mediaMime = binding.metadata.mimeType
+          break
+        }
+      }
+    }
+  }
+
+  private doesImagePartBelongToAttachment(
+    mediaUrl: string,
+    mediaName: string,
+    mediaMime: string,
+    attachment: AttachmentMetadata
+  ): boolean {
+    if (attachment.type !== 'image') {
+      return false
+    }
+    const oldPath = attachment.sourcePath !== undefined ? attachment.sourcePath : ''
+    if (oldPath !== '' && this.isSameLocalMediaSource(mediaUrl, oldPath)) {
+      return true
+    }
+
+    const normalized = this.normalizeLocalMediaSource(mediaUrl)
+    const ext = this.getExtension(attachment.name)
+    if (normalized !== '' && ext !== '' && normalized.endsWith(`/${attachment.id}${ext}`)) {
+      return true
+    }
+
+    return mediaName !== '' && mediaName === attachment.name &&
+      (mediaMime === '' || mediaMime === attachment.mimeType)
+  }
+
+  private isSameLocalMediaSource(left: string, right: string): boolean {
+    const normalizedLeft = this.normalizeLocalMediaSource(left)
+    const normalizedRight = this.normalizeLocalMediaSource(right)
+    return normalizedLeft !== '' && normalizedRight !== '' && normalizedLeft === normalizedRight
+  }
+
+  private normalizeLocalMediaSource(value: string): string {
+    const trimmed = value.trim()
+    if (trimmed === '') {
+      return ''
+    }
+    const lower = trimmed.toLowerCase()
+    if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:')) {
+      return trimmed
+    }
+    if (lower.startsWith('file://')) {
+      return this.getPathFromFileUri(trimmed)
+    }
+    return trimmed
+  }
+
+  private normalizeSuggestedQuestions(rawQuestions: string[] | undefined): string[] {
+    const normalized: string[] = []
+    if (rawQuestions === undefined || !Array.isArray(rawQuestions)) {
+      return normalized
+    }
+    for (let i = 0; i < rawQuestions.length && normalized.length < 3; i++) {
+      const question = rawQuestions[i].trim()
+      if (question === '' || normalized.indexOf(question) >= 0) {
+        continue
+      }
+      normalized.push(question)
+    }
+    return normalized
+  }
+
+  private async importAssistants(assistants: AssistantExportData[], tempDir: string): Promise<void> {
+    for (const assistantData of assistants) {
+      const assistant = new Assistant(
+        assistantData.id !== '' ? assistantData.id : DEFAULT_ASSISTANT_ID,
+        assistantData.name
+      )
+      assistant.avatarSymbol = await this.resolveImportedAssistantAvatarSymbol(assistantData, tempDir)
+      assistant.color = assistantData.color !== '' ? assistantData.color : DEFAULT_PRIMARY_COLOR
+      assistant.systemPrompt = assistantData.systemPrompt || ''
+      assistant.defaultProviderId = assistantData.defaultProviderId || ''
+      assistant.defaultModelId = assistantData.defaultModelId || ''
+      assistant.defaultModelName = assistantData.defaultModelName || ''
+      assistant.temperatureEnabled = assistantData.temperatureEnabled === true
+      assistant.temperature = assistantData.temperature !== undefined ? assistantData.temperature : 0.7
+      assistant.topPEnabled = assistantData.topPEnabled === true
+      assistant.topP = assistantData.topP !== undefined ? assistantData.topP : 1.0
+      assistant.presencePenaltyEnabled = assistantData.presencePenaltyEnabled === true
+      assistant.presencePenalty = assistantData.presencePenalty !== undefined ? assistantData.presencePenalty : 0
+      assistant.frequencyPenaltyEnabled = assistantData.frequencyPenaltyEnabled === true
+      assistant.frequencyPenalty = assistantData.frequencyPenalty !== undefined ? assistantData.frequencyPenalty : 0
+      assistant.enabledToolIds = Array.isArray(assistantData.enabledToolIds) ? assistantData.enabledToolIds.slice() : []
+      assistant.isDefault = assistant.id === DEFAULT_ASSISTANT_ID || assistantData.isDefault === true
+      assistant.createdAt = assistantData.createdAt
+      assistant.updatedAt = assistantData.updatedAt
+      assistant.sortOrder = assistant.isDefault ? 0 : assistantData.sortOrder
+      await this.dbService.saveAssistant(assistant)
+    }
+  }
+
+  private async importProvider(providerData: ProviderExportData, tempDir: string): Promise<void> {
+    // 解析 modelsJson 为 ModelInfo 数组
+    let models: ModelInfo[] = []
+    try {
+      const modelsArray = JSON.parse(providerData.modelsJson) as ModelInfoExtendedJson[]
+      for (const m of modelsArray) {
+        const model = ModelInfo.fromExtendedJson(m)
+        applyDerivedModelDefaults(model)
+        models.push(model)
+      }
+    } catch (e) {
+      console.warn('ImportExportService', `Failed to parse models for provider ${providerData.id}`)
+    }
+
+    // 解析 apiStyle 枚举
+    let apiStyle = ApiStyle.OPENAI
+    if (providerData.apiStyle === 'anthropic') {
+      apiStyle = ApiStyle.ANTHROPIC
+    } else if (providerData.apiStyle === 'google') {
+      apiStyle = ApiStyle.GOOGLE
+    }
+
+    // 解析 iconType 枚举
+    let iconType = ProviderIconType.SVG
+    if (providerData.iconType === 'text') {
+      iconType = ProviderIconType.TEXT
+    } else if (providerData.iconType === 'image') {
+      iconType = ProviderIconType.IMAGE
+    }
+
+    // 创建 ModelProvider 对象
+    const provider = new ModelProvider(
+      providerData.id,
+      providerData.name,
+      providerData.type as ProviderType,
+      providerData.iconSymbol,
+      $r('app.color.primary'),
+      providerData.baseUrl,
+      apiStyle
+    )
+    provider.apiKey = providerData.apiKey
+    provider.requiresApiKey = providerData.requiresApiKey !== undefined ? providerData.requiresApiKey :
+      (provider.type !== ProviderType.OLLAMA && provider.type !== ProviderType.LMSTUDIO)
+    provider.isConnected = providerData.isEnabled
+    provider.isPreset = providerData.isPreset
+    provider.iconPath = providerData.iconPath
+    provider.apiPath = providerData.apiPath
+    provider.openaiTransport = providerData.openaiTransport === OpenAITransport.RESPONSES
+      ? OpenAITransport.RESPONSES
+      : OpenAITransport.CHAT_COMPLETIONS
+    provider.customHeadersJson = providerData.customHeadersJson !== undefined ? providerData.customHeadersJson : ''
+    provider.iconType = iconType
+    provider.textIcon = providerData.textIcon
+    provider.textIconBgColor = providerData.textIconBgColor
+    provider.customImagePath = await this.resolveImportedProviderIconPath(providerData, tempDir)
+    provider.models = models
+
+    // 保存到数据库
+    await this.dbService.saveProvider(provider)
+  }
+
+  private sortImportedProviders(providers: ProviderExportData[]): ProviderExportData[] {
+    const sortedProviders = [...providers]
+    sortedProviders.sort((a: ProviderExportData, b: ProviderExportData) => {
+      const leftOrder = a.sortOrder !== undefined ? a.sortOrder : Number.MAX_SAFE_INTEGER
+      const rightOrder = b.sortOrder !== undefined ? b.sortOrder : Number.MAX_SAFE_INTEGER
+      if (leftOrder !== rightOrder) {
+        return leftOrder - rightOrder
+      }
+      return a.name.localeCompare(b.name)
+    })
+    return sortedProviders
+  }
+
+  private async restoreProviderOrder(importedProviders: ProviderExportData[]): Promise<void> {
+    const localProviders = await this.dbService.getAllProviders()
+    const importedProviderIds: string[] = []
+    const localProviderIds: string[] = []
+
+    for (let i = 0; i < importedProviders.length; i++) {
+      importedProviderIds.push(importedProviders[i].id)
+    }
+    for (let i = 0; i < localProviders.length; i++) {
+      localProviderIds.push(localProviders[i].id)
+    }
+
+    const orderedProviderIds = buildProviderImportOrder(importedProviderIds, localProviderIds)
+    if (orderedProviderIds.length <= 0) {
+      return
+    }
+    await this.dbService.updateProvidersOrder(orderedProviderIds)
+    await getProviderViewModel().loadAllProviders()
+  }
+
+  private async importPreferences(preferences: PreferenceEntry[]): Promise<number> {
+    let restored = 0
+    const preferencesService = getPreferencesService()
+    for (const entry of preferences) {
+      try {
+        if (entry.type === 'string') {
+          await preferencesService.setString(entry.key, entry.value as string)
+        } else if (entry.type === 'number') {
+          await preferencesService.setNumber(entry.key, entry.value as number)
+        } else if (entry.type === 'boolean') {
+          await preferencesService.setBoolean(entry.key, entry.value as boolean)
+        }
+        restored++
+      } catch (error) {
+        console.warn('ImportExportService', `Failed to restore preference ${entry.key}: ${JSON.stringify(error)}`)
+      }
+    }
+    console.info('ImportExportService', `Preferences restored: ${restored}/${preferences.length}`)
+    return restored
+  }
+
+  private async refreshAfterImport(): Promise<void> {
+    try {
+      // 刷新主题服务缓存
+      await getThemeService().reloadTheme()
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to reload theme: ${JSON.stringify(error)}`)
+    }
+    try {
+      // 刷新设置管理器缓存
+      await getSettingsManager().reload()
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to reload settings: ${JSON.stringify(error)}`)
+    }
+    try {
+      // 刷新应用状态管理器缓存
+      await getAppStateManager().loadState()
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to reload app state: ${JSON.stringify(error)}`)
+    }
+    try {
+      // 刷新图像生成提示词库缓存, 覆盖普通导入与 WebDAV 恢复后的内存状态
+      const imageGenerationViewModel = ImageGenerationViewModel.getInstance()
+      imageGenerationViewModel.promptTemplateRecommendationsVisible = await getPreferencesService().getBoolean(
+        PreferenceKeys.IMAGE_PROMPT_TEMPLATE_RECOMMENDATIONS_VISIBLE,
+        true
+      )
+      await imageGenerationViewModel.refreshPromptTemplates()
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to reload image prompt templates: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private isLocalFileAvatar(value: string): boolean {
+    return value.trim().toLowerCase().startsWith('file://')
+  }
+
+  private getPathFromFileUri(value: string): string {
+    let trimmed = value.trim()
+    const fragmentIndex = trimmed.indexOf('#')
+    if (fragmentIndex >= 0) {
+      trimmed = trimmed.substring(0, fragmentIndex)
+    }
+    const queryIndex = trimmed.indexOf('?')
+    if (queryIndex >= 0) {
+      trimmed = trimmed.substring(0, queryIndex)
+    }
+    if (!trimmed.toLowerCase().startsWith('file://')) {
+      return trimmed
+    }
+    try {
+      return new fileUri.FileUri(trimmed).path
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to resolve file uri path: ${JSON.stringify(error)}`)
+      return trimmed.substring(7)
+    }
+  }
+
+  private isLocalProviderIconPath(value: string): boolean {
+    const trimmed = value.trim()
+    if (trimmed === '') {
+      return false
+    }
+    const lower = trimmed.toLowerCase()
+    return lower.startsWith('file://') || (!lower.startsWith('http://') && !lower.startsWith('https://') &&
+      !lower.startsWith('data:'))
+  }
+
+  private sanitizeFileName(value: string): string {
+    const safeName = value.trim().replace(/[^0-9A-Za-z._-]/g, '_').replace(/\.\./g, '_')
+    if (safeName === '' || safeName === '.' || safeName === '..') {
+      return 'avatar'
+    }
+    return safeName
+  }
+
+  private buildExportedAssistantAvatarFileName(assistant: AssistantExportData): string {
+    const sourcePath = this.getPathFromFileUri(assistant.avatarSymbol)
+    const ext = this.getExtension(sourcePath.split('?')[0])
+    const baseName = this.sanitizeFileName(assistant.id !== '' ? assistant.id : DEFAULT_ASSISTANT_ID)
+    return `${baseName}${ext !== '' ? ext : '.jpg'}`
+  }
+
+  private ensureDirectory(dirPath: string): void {
+    try {
+      fileIo.mkdirSync(dirPath, true)
+    } catch (error) {
+      console.warn('ImportExportService', `Directory may already exist: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private isLocalProviderIcon(provider: ProviderExportData): boolean {
+    return provider.iconType === ProviderIconType.IMAGE && provider.customImagePath !== '' &&
+      this.isLocalProviderIconPath(provider.customImagePath)
+  }
+
+  private buildExportedProviderIconFileName(provider: ProviderExportData): string {
+    const sourcePath = this.getPathFromFileUri(provider.customImagePath)
+    const ext = this.getExtension(sourcePath.split('?')[0])
+    const baseName = this.sanitizeFileName(provider.id !== '' ? provider.id : provider.name)
+    return `${baseName}${ext !== '' ? ext : '.jpg'}`
+  }
+
+  private async writeProviderIconFiles(tempDir: string, providers: ProviderExportData[]): Promise<void> {
+    let iconDirReady = false
+    const iconDir = `${tempDir}/${PROVIDER_ICON_EXPORT_DIR}`
+    for (const provider of providers) {
+      if (!this.isLocalProviderIcon(provider)) {
+        continue
+      }
+      const sourcePath = this.getPathFromFileUri(provider.customImagePath)
+      let sourceExists = false
+      try {
+        sourceExists = fileIo.accessSync(sourcePath)
+      } catch (error) {
+        console.warn('ImportExportService', `Provider icon access failed: ${JSON.stringify(error)}`)
+        sourceExists = false
+      }
+      if (!sourceExists) {
+        continue
+      }
+      if (!iconDirReady) {
+        this.ensureDirectory(iconDir)
+        iconDirReady = true
+      }
+      const fileName = this.buildExportedProviderIconFileName(provider)
+      try {
+        await fileIo.copyFile(sourcePath, `${iconDir}/${fileName}`)
+        provider.providerIconFileName = fileName
+      } catch (error) {
+        console.warn('ImportExportService', `Failed to export provider icon: ${JSON.stringify(error)}`)
+      }
+    }
+  }
+
+  private async resolveImportedProviderIconPath(providerData: ProviderExportData, tempDir: string): Promise<string> {
+    const fallbackIcon = providerData.customImagePath !== undefined ? providerData.customImagePath : ''
+    if (providerData.iconType !== ProviderIconType.IMAGE) {
+      return fallbackIcon
+    }
+    const iconFileName = providerData.providerIconFileName !== undefined ?
+      this.sanitizeFileName(providerData.providerIconFileName) : ''
+    if (iconFileName === '' || this.context === null) {
+      return fallbackIcon
+    }
+
+    const sourcePath = `${tempDir}/${PROVIDER_ICON_EXPORT_DIR}/${iconFileName}`
+    let sourceExists = false
+    try {
+      sourceExists = fileIo.accessSync(sourcePath)
+    } catch (error) {
+      console.warn('ImportExportService', `Imported provider icon access failed: ${JSON.stringify(error)}`)
+      sourceExists = false
+    }
+    if (!sourceExists) {
+      return fallbackIcon
+    }
+
+    const iconDir = `${this.context.filesDir}/${PROVIDER_ICON_EXPORT_DIR}`
+    this.ensureDirectory(iconDir)
+    const ext = this.getExtension(iconFileName)
+    const providerId = this.sanitizeFileName(providerData.id !== '' ? providerData.id : providerData.name)
+    const targetPath =
+      `${iconDir}/icon_${providerId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}${ext !== '' ? ext : '.jpg'}`
+    try {
+      await fileIo.copyFile(sourcePath, targetPath)
+      return fileUri.getUriFromPath(targetPath)
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to import provider icon: ${JSON.stringify(error)}`)
+      return fallbackIcon
+    }
+  }
+
+  private async writeAssistantAvatarFiles(tempDir: string, assistants: AssistantExportData[]): Promise<void> {
+    let avatarDirReady = false
+    const avatarDir = `${tempDir}/${ASSISTANT_AVATAR_EXPORT_DIR}`
+    for (const assistant of assistants) {
+      if (!this.isLocalFileAvatar(assistant.avatarSymbol)) {
+        continue
+      }
+      const sourcePath = this.getPathFromFileUri(assistant.avatarSymbol)
+      let sourceExists = false
+      try {
+        sourceExists = fileIo.accessSync(sourcePath)
+      } catch (error) {
+        console.warn('ImportExportService', `Assistant avatar access failed: ${JSON.stringify(error)}`)
+        sourceExists = false
+      }
+      if (!sourceExists) {
+        continue
+      }
+      if (!avatarDirReady) {
+        this.ensureDirectory(avatarDir)
+        avatarDirReady = true
+      }
+      const fileName = this.buildExportedAssistantAvatarFileName(assistant)
+      try {
+        await fileIo.copyFile(sourcePath, `${avatarDir}/${fileName}`)
+        assistant.avatarFileName = fileName
+      } catch (error) {
+        console.warn('ImportExportService', `Failed to export assistant avatar: ${JSON.stringify(error)}`)
+      }
+    }
+  }
+
+  private async resolveImportedAssistantAvatarSymbol(assistantData: AssistantExportData, tempDir: string): Promise<string> {
+    const fallbackAvatar = assistantData.avatarSymbol !== undefined && assistantData.avatarSymbol !== '' ?
+      assistantData.avatarSymbol : 'AI'
+    const avatarFileName = assistantData.avatarFileName !== undefined ? this.sanitizeFileName(assistantData.avatarFileName) : ''
+    if (avatarFileName === '' || this.context === null) {
+      return fallbackAvatar
+    }
+
+    const sourcePath = `${tempDir}/${ASSISTANT_AVATAR_EXPORT_DIR}/${avatarFileName}`
+    let sourceExists = false
+    try {
+      sourceExists = fileIo.accessSync(sourcePath)
+    } catch (error) {
+      console.warn('ImportExportService', `Imported assistant avatar access failed: ${JSON.stringify(error)}`)
+      sourceExists = false
+    }
+    if (!sourceExists) {
+      return fallbackAvatar
+    }
+
+    const avatarDir = `${this.context.filesDir}/${ASSISTANT_AVATAR_EXPORT_DIR}`
+    this.ensureDirectory(avatarDir)
+    const ext = this.getExtension(avatarFileName)
+    const assistantId = this.sanitizeFileName(assistantData.id !== '' ? assistantData.id : DEFAULT_ASSISTANT_ID)
+    const targetPath =
+      `${avatarDir}/avatar_${assistantId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}${ext !== '' ? ext : '.jpg'}`
+    try {
+      await fileIo.copyFile(sourcePath, targetPath)
+      return fileUri.getUriFromPath(targetPath)
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to import assistant avatar: ${JSON.stringify(error)}`)
+      return fallbackAvatar
+    }
+  }
+
+  private async writeGeneratedMediaFiles(tempDir: string, generatedMedia: GeneratedMedia[]): Promise<void> {
+    const mediaDir = `${tempDir}/${GENERATED_MEDIA_EXPORT_DIR}`
+    const imagesDir = `${mediaDir}/${GENERATED_MEDIA_IMAGES_EXPORT_DIR}`
+    const referencesDir = `${mediaDir}/${GENERATED_MEDIA_REFERENCES_EXPORT_DIR}`
+    this.ensureDirectory(mediaDir)
+    this.ensureDirectory(imagesDir)
+
+    const metadata: GeneratedMediaExportData[] = []
+    for (const media of generatedMedia) {
+      if (media.filePath === '' || !this.attachmentService.fileExists(media.filePath)) {
+        continue
+      }
+      const fileName = this.buildExportedGeneratedMediaFileName(media)
+      try {
+        await fileIo.copyFile(media.filePath, `${imagesDir}/${fileName}`)
+        const sourceFiles = await this.writeGeneratedMediaSourceFiles(media, referencesDir)
+        metadata.push({
+          id: media.id,
+          type: media.type,
+          prompt: media.prompt,
+          providerId: media.providerId,
+          providerName: media.providerName,
+          modelId: media.modelId,
+          modelName: media.modelName,
+          fileName: fileName,
+          mimeType: media.mimeType,
+          aspectRatio: media.aspectRatio,
+          sourcePathsJson: media.sourcePathsJson,
+          sourceFilesJson: sourceFiles.length > 0 ? JSON.stringify(sourceFiles) : '',
+          requestOptionsJson: media.requestOptionsJson,
+          actualOptionsJson: media.actualOptionsJson,
+          revisedPrompt: media.revisedPrompt,
+          createdAt: media.createdAt
+        })
+      } catch (error) {
+        console.warn('ImportExportService', `Failed to export generated media: ${JSON.stringify(error)}`)
+      }
+    }
+
+    if (metadata.length > 0) {
+      this.writeTextFile(`${mediaDir}/metadata.json`, JSON.stringify(metadata, null, 2))
+    }
+  }
+
+  private async writeGeneratedMediaSourceFiles(
+    media: GeneratedMedia,
+    referencesDir: string
+  ): Promise<GeneratedMediaSourceFileExportData[]> {
+    const sourcePaths = this.parseStringArrayJson(media.sourcePathsJson)
+    const sourceFiles: GeneratedMediaSourceFileExportData[] = []
+    let referencesDirReady = false
+    for (let i = 0; i < sourcePaths.length; i++) {
+      const sourcePath = this.resolveLocalExportFilePath(sourcePaths[i])
+      if (sourcePath === '') {
+        continue
+      }
+      let sourceExists = false
+      try {
+        sourceExists = fileIo.accessSync(sourcePath)
+      } catch (error) {
+        console.warn('ImportExportService', `Generated media reference access failed: ${JSON.stringify(error)}`)
+        sourceExists = false
+      }
+      if (!sourceExists) {
+        continue
+      }
+      if (!referencesDirReady) {
+        this.ensureDirectory(referencesDir)
+        referencesDirReady = true
+      }
+
+      const fileName = this.buildExportedGeneratedMediaReferenceFileName(media, i, sourcePath)
+      try {
+        await fileIo.copyFile(sourcePath, `${referencesDir}/${fileName}`)
+        sourceFiles.push({
+          index: i,
+          path: sourcePaths[i],
+          fileName: fileName,
+          mimeType: this.resolveMimeTypeFromExtension(fileName)
+        })
+      } catch (error) {
+        console.warn('ImportExportService', `Failed to export generated media reference: ${JSON.stringify(error)}`)
+      }
+    }
+    return sourceFiles
+  }
+
+  private async importGeneratedMedia(generatedMedia: GeneratedMediaExportData[], tempDir: string): Promise<number> {
+    let imported = 0
+    for (const mediaData of generatedMedia) {
+      const fileName = mediaData.fileName !== undefined ? this.sanitizeFileName(mediaData.fileName) : ''
+      if (fileName === '') {
+        continue
+      }
+      const sourcePath = `${tempDir}/${GENERATED_MEDIA_EXPORT_DIR}/${GENERATED_MEDIA_IMAGES_EXPORT_DIR}/${fileName}`
+      let sourceExists = false
+      try {
+        sourceExists = fileIo.accessSync(sourcePath)
+      } catch (error) {
+        console.warn('ImportExportService', `Generated media file access failed: ${JSON.stringify(error)}`)
+        sourceExists = false
+      }
+      if (!sourceExists) {
+        continue
+      }
+
+      const id = mediaData.id !== '' ? mediaData.id : `gen_imported_${Date.now()}_${imported}`
+      const mimeType = mediaData.mimeType !== '' ? mediaData.mimeType : this.resolveMimeTypeFromExtension(fileName)
+      const attachment = new MessageAttachment(
+        id,
+        AttachmentType.IMAGE,
+        `${id}${this.getExtensionForMimeTypeOrFileName(fileName, mimeType)}`,
+        '',
+        mimeType,
+        0
+      )
+      const savedPath = await this.attachmentService.importExistingAttachment(sourcePath, attachment)
+      if (savedPath === '') {
+        continue
+      }
+      const importedSourcePathsJson = await this.importGeneratedMediaSourcePaths(mediaData, tempDir, id)
+
+      const media = new GeneratedMedia()
+      media.id = id
+      media.type = mediaData.type
+      media.prompt = mediaData.prompt
+      media.providerId = mediaData.providerId
+      media.providerName = mediaData.providerName
+      media.modelId = mediaData.modelId
+      media.modelName = mediaData.modelName
+      media.filePath = savedPath
+      media.mimeType = mimeType
+      media.aspectRatio = mediaData.aspectRatio
+      media.sourcePathsJson = importedSourcePathsJson
+      media.requestOptionsJson = mediaData.requestOptionsJson
+      media.actualOptionsJson = mediaData.actualOptionsJson
+      media.revisedPrompt = mediaData.revisedPrompt
+      media.createdAt = mediaData.createdAt > 0 ? mediaData.createdAt : Date.now()
+      await this.dbService.insertGeneratedMedia(media)
+      imported++
+    }
+    return imported
+  }
+
+  private async importGeneratedMediaSourcePaths(
+    mediaData: GeneratedMediaExportData,
+    tempDir: string,
+    mediaId: string
+  ): Promise<string> {
+    const sourcePaths = this.parseStringArrayJson(mediaData.sourcePathsJson)
+    const sourceFiles = this.parseGeneratedMediaSourceFiles(mediaData.sourceFilesJson || '')
+    if (sourceFiles.length === 0) {
+      return mediaData.sourcePathsJson
+    }
+
+    let importedCount = 0
+    for (let i = 0; i < sourceFiles.length; i++) {
+      const sourceFile = sourceFiles[i]
+      const fileName = sourceFile.fileName !== undefined ? this.sanitizeFileName(sourceFile.fileName) : ''
+      if (fileName === '') {
+        continue
+      }
+      const sourcePath = `${tempDir}/${GENERATED_MEDIA_EXPORT_DIR}/${GENERATED_MEDIA_REFERENCES_EXPORT_DIR}/${fileName}`
+      let sourceExists = false
+      try {
+        sourceExists = fileIo.accessSync(sourcePath)
+      } catch (error) {
+        console.warn('ImportExportService', `Generated media reference access failed: ${JSON.stringify(error)}`)
+        sourceExists = false
+      }
+      if (!sourceExists) {
+        continue
+      }
+
+      const sourceMimeType = sourceFile.mimeType !== undefined ? sourceFile.mimeType : ''
+      const mimeType = sourceMimeType !== '' ? sourceMimeType : this.resolveMimeTypeFromExtension(fileName)
+      const sourceIndex = sourceFile.index !== undefined ? sourceFile.index : -1
+      const referenceId =
+        this.sanitizeFileName(`${mediaId}_ref_${sourceIndex}_${Date.now()}_${importedCount}`)
+      const attachment = new MessageAttachment(
+        referenceId,
+        AttachmentType.IMAGE,
+        `${referenceId}${this.getExtensionForMimeTypeOrFileName(fileName, mimeType)}`,
+        '',
+        mimeType,
+        0
+      )
+      const savedPath = await this.attachmentService.importExistingAttachment(sourcePath, attachment)
+      if (savedPath === '') {
+        continue
+      }
+      if (sourceIndex >= 0 && sourceIndex < sourcePaths.length) {
+        sourcePaths[sourceIndex] = savedPath
+      } else {
+        sourcePaths.push(savedPath)
+      }
+      importedCount++
+    }
+
+    return importedCount > 0 ? JSON.stringify(sourcePaths) : mediaData.sourcePathsJson
+  }
+
+  private buildExportedGeneratedMediaFileName(media: GeneratedMedia): string {
+    const ext = this.getExtensionForMimeTypeOrFileName(media.filePath, media.mimeType)
+    const baseName = this.sanitizeFileName(media.id !== '' ? media.id : `generated_${media.createdAt}`)
+    return `${baseName}${ext}`
+  }
+
+  private buildExportedGeneratedMediaReferenceFileName(media: GeneratedMedia, index: number, sourcePath: string): string {
+    const ext = this.getExtensionForMimeTypeOrFileName(sourcePath, '')
+    const mediaName = media.id !== '' ? media.id : `generated_${media.createdAt}`
+    const baseName = this.sanitizeFileName(`${mediaName}_ref_${index}`)
+    return `${baseName}${ext}`
+  }
+
+  private resolveLocalExportFilePath(value: string): string {
+    const trimmed = value.trim()
+    if (trimmed === '') {
+      return ''
+    }
+    const lower = trimmed.toLowerCase()
+    if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:')) {
+      return ''
+    }
+    if (lower.startsWith('file://')) {
+      return this.getPathFromFileUri(trimmed)
+    }
+    return trimmed
+  }
+
+  private parseStringArrayJson(value: string): string[] {
+    if (value.trim() === '') {
+      return []
+    }
+    try {
+      const raw = JSON.parse(value) as Object
+      if (!Array.isArray(raw)) {
+        return []
+      }
+      const items = raw as string[]
+      const result: string[] = []
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]
+        if (typeof item === 'string' && item.trim() !== '') {
+          result.push(item)
+        }
+      }
+      return result
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to parse string array json: ${JSON.stringify(error)}`)
+      return []
+    }
+  }
+
+  private parseGeneratedMediaSourceFiles(value: string): GeneratedMediaSourceFileExportData[] {
+    if (value.trim() === '') {
+      return []
+    }
+    try {
+      const raw = JSON.parse(value) as Object
+      if (!Array.isArray(raw)) {
+        return []
+      }
+      const items = raw as GeneratedMediaSourceFileExportData[]
+      const result: GeneratedMediaSourceFileExportData[] = []
+      for (let i = 0; i < items.length; i++) {
+        const fileName = items[i].fileName !== undefined ? items[i].fileName : ''
+        if (fileName !== '') {
+          result.push({
+            index: items[i].index !== undefined ? items[i].index : -1,
+            path: items[i].path !== undefined ? items[i].path : '',
+            fileName: fileName,
+            mimeType: items[i].mimeType !== undefined ? items[i].mimeType : ''
+          })
+        }
+      }
+      return result
+    } catch (error) {
+      console.warn('ImportExportService', `Failed to parse generated media source files: ${JSON.stringify(error)}`)
+      return []
+    }
+  }
+
+  private getExtensionForMimeTypeOrFileName(fileName: string, mimeType: string): string {
+    const ext = this.getExtension(fileName)
+    if (ext !== '') {
+      return ext
+    }
+    if (mimeType === 'image/jpeg') {
+      return '.jpg'
+    }
+    if (mimeType === 'image/webp') {
+      return '.webp'
+    }
+    return '.png'
+  }
+
+  private resolveMimeTypeFromExtension(fileName: string): string {
+    const lower = fileName.toLowerCase()
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+      return 'image/jpeg'
+    }
+    if (lower.endsWith('.webp')) {
+      return 'image/webp'
+    }
+    return 'image/png'
+  }
+
+  private async detectConflicts(manifest: ManifestData): Promise<ConflictInfo[]> {
+    const conflicts: ConflictInfo[] = []
+
+    for (const sessionSummary of manifest.sessions) {
+      const existingSession = await this.dbService.getSession(sessionSummary.id)
+      if (existingSession !== null) {
+        const conflict: ConflictInfo = {
+          type: 'session',
+          id: sessionSummary.id,
+          title: sessionSummary.title,
+          localUpdatedAt: existingSession.updatedAt,
+          importUpdatedAt: sessionSummary.updatedAt
+        }
+        conflicts.push(conflict)
+      }
+    }
+
+    return conflicts
+  }
+
+  // ============ 工具方法 ============
+
+  private writeTextFile(filePath: string, content: string): void {
+    try {
+      const file = fileIo.openSync(filePath, fileIo.OpenMode.CREATE | fileIo.OpenMode.READ_WRITE)
+      fileIo.writeSync(file.fd, content)
+      fileIo.closeSync(file)
+    } catch (error) {
+      throw new Error(`Write text file failed: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private readTextFile(filePath: string): string {
+    try {
+      const file = fileIo.openSync(filePath, fileIo.OpenMode.READ_ONLY)
+      const stat = fileIo.statSync(file.fd)
+      const buffer = new ArrayBuffer(stat.size)
+      fileIo.readSync(file.fd, buffer)
+      fileIo.closeSync(file)
+
+      const uint8Array = new Uint8Array(buffer)
+      const decoder = util.TextDecoder.create('utf-8')
+      return decoder.decodeToString(uint8Array, { stream: false })
+    } catch (error) {
+      throw new Error(`Read text file failed: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private async copyFile(srcPath: string, destPath: string): Promise<void> {
+    try {
+      await fileIo.copyFile(srcPath, destPath)
+    } catch (error) {
+      console.error('ImportExportService', `Failed to copy file: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private deleteDirectory(dirPath: string): void {
+    try {
+      if (fileIo.accessSync(dirPath)) {
+        this.deleteRecursively(dirPath)
+      }
+    } catch (error) {
+      console.error('ImportExportService', `Failed to delete directory: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private deleteRecursively(path: string): void {
+    try {
+      const files = fileIo.listFileSync(path)
+
+      for (const file of files) {
+        const fullPath = `${path}/${file}`
+        const stats = fileIo.statSync(fullPath)
+
+        if (stats.isDirectory()) {
+          this.deleteRecursively(fullPath)
+        } else {
+          fileIo.unlinkSync(fullPath)
+        }
+      }
+
+      fileIo.rmdirSync(path)
+    } catch (error) {
+      console.error('ImportExportService', `Failed to delete recursively: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private getExtension(fileName: string): string {
+    const dotIndex = fileName.lastIndexOf('.')
+    if (dotIndex > 0) {
+      return fileName.substring(dotIndex)
+    }
+    return ''
+  }
+}
+
+export function getImportExportService(): ImportExportService {
+  return ImportExportService.getInstance()
+}

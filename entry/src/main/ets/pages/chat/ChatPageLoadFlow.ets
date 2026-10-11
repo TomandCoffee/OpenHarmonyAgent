@@ -1,0 +1,166 @@
+import { ChatMessage, ChatSearchMode, MessageAttachment, ModelProvider, ReasoningLevel } from '../../models/ChatModels'
+import { AppStateManager } from '../../viewmodels/AppStateManager'
+import { ProviderViewModel } from '../../viewmodels/ProviderViewModel'
+import { ChatViewModel } from '../../viewmodels/ChatViewModel'
+import { PreferenceKeys, PreferencesService } from '../../services/PreferencesService'
+import { AssistantService } from '../../services/AssistantService'
+import { ChatPageRouteParams } from './ChatPageRouteTypes'
+import { Assistant, DEFAULT_ASSISTANT_ID } from '../../models/AssistantModels'
+import { normalizeStoredChatReasoningLevel } from './ChatReasoningStateHelper'
+import { DEFAULT_PRIMARY_COLOR } from '../../config/ThemeDefaults'
+
+export class ChatPageLoadResult {
+  webSearchEnabled: boolean = false
+  webSearchConversationEnabled: boolean = false
+  // 联网模式: external_engine (默认) | openai_builtin
+  searchMode: ChatSearchMode = ChatSearchMode.EXTERNAL_ENGINE
+  builtinImageGenEnabled: boolean = false
+  reasoningLevel: ReasoningLevel = ReasoningLevel.OFF
+  providers: ModelProvider[] = []
+  pendingInitialPrompt: string = ''
+  pendingInitialDraft: string = ''
+  pendingInitialToolIds: string[] = []
+  initialPromptAutoSent: boolean = false
+  sessionId: string = ''
+  sessionTitle: string = '新对话'
+  messages: ChatMessage[] = []
+  draftText: string = ''
+  draftAttachments: MessageAttachment[] = []
+  suggestedQuestions: string[] = []
+  isNewChatTransition: boolean = true
+  isNewEmptySession: boolean = false
+  assistantId: string = DEFAULT_ASSISTANT_ID
+  assistantAvatarSymbol: string = 'AI'
+  assistantColor: string = DEFAULT_PRIMARY_COLOR
+}
+
+export interface ChatPageLoadFlowDependencies {
+  appStateManager: AppStateManager
+  preferencesService: PreferencesService
+  assistantService: AssistantService
+  providerViewModel: ProviderViewModel
+  chatViewModel: ChatViewModel
+  parseToolIdsFromRoute: (raw: string) => string[]
+}
+
+export class ChatPageLoadFlow {
+  private deps: ChatPageLoadFlowDependencies
+
+  constructor(deps: ChatPageLoadFlowDependencies) {
+    this.deps = deps
+  }
+
+  async loadPageData(
+    routeParams: ChatPageRouteParams | null,
+    fallbackTitle: string
+  ): Promise<ChatPageLoadResult> {
+    const result = new ChatPageLoadResult()
+    result.sessionTitle = fallbackTitle
+
+    await this.deps.appStateManager.loadState()
+    result.webSearchEnabled = await this.deps.preferencesService.getBoolean(PreferenceKeys.SEARCH_SERVICE_ENABLED, false)
+    result.webSearchConversationEnabled = await this.deps.preferencesService.getBoolean(
+      PreferenceKeys.SEARCH_CONVERSATION_ENABLED,
+      result.webSearchEnabled
+    )
+    const rawSearchMode = await this.deps.preferencesService.getString(
+      PreferenceKeys.SEARCH_MODE,
+      ChatSearchMode.EXTERNAL_ENGINE
+    )
+    result.searchMode = rawSearchMode === ChatSearchMode.OPENAI_BUILTIN ?
+      ChatSearchMode.OPENAI_BUILTIN : ChatSearchMode.EXTERNAL_ENGINE
+    result.builtinImageGenEnabled = await this.deps.preferencesService.getBoolean(
+      PreferenceKeys.CHAT_BUILTIN_IMAGE_GEN_ENABLED,
+      false
+    )
+    result.reasoningLevel = normalizeStoredChatReasoningLevel(await this.deps.preferencesService.getString(
+      PreferenceKeys.CHAT_REASONING_LEVEL,
+      ReasoningLevel.OFF
+    ))
+    result.providers = await this.deps.providerViewModel.loadProviders()
+
+    result.pendingInitialPrompt =
+      routeParams !== null && routeParams !== undefined && routeParams.initialPrompt !== undefined ?
+        routeParams.initialPrompt.trim() : ''
+    result.pendingInitialDraft =
+      routeParams !== null && routeParams !== undefined && routeParams.initialDraft !== undefined ?
+        routeParams.initialDraft : ''
+    result.pendingInitialToolIds =
+      this.deps.parseToolIdsFromRoute(routeParams !== null && routeParams !== undefined &&
+        routeParams.initialToolIds !== undefined ? routeParams.initialToolIds : '')
+    result.initialPromptAutoSent = false
+
+    if (routeParams !== null && routeParams !== undefined &&
+      routeParams.sessionId !== undefined && routeParams.sessionId !== '') {
+      result.sessionId = routeParams.sessionId
+      result.isNewChatTransition = false
+      const session = await this.deps.chatViewModel.loadSession(routeParams.sessionId)
+      if (session !== null) {
+        result.sessionTitle = session.title
+        result.messages = [...session.messages]
+        result.draftText = session.draftText
+        result.draftAttachments = this.cloneDraftAttachments(session.draftAttachments)
+        result.suggestedQuestions = [...session.suggestedQuestions]
+        const assistant = await this.loadAssistantSnapshot(session.assistantId)
+        this.applyAssistantSnapshot(result, assistant)
+      }
+      result.isNewEmptySession = false
+      return result
+    }
+
+    const assistant = await this.deps.assistantService.getCurrentAssistantForNewChat()
+    this.applyAssistantSnapshot(result, assistant)
+    const pendingSession = this.deps.chatViewModel.createPendingSession(
+      '',
+      assistant.id,
+      assistant.defaultModelId,
+      assistant.defaultProviderId
+    )
+    result.sessionId = pendingSession.id
+    result.sessionTitle = pendingSession.title
+    result.messages = []
+    result.isNewChatTransition = true
+    result.isNewEmptySession = true
+    return result
+  }
+
+  private async loadAssistantSnapshot(assistantId: string): Promise<Assistant> {
+    const id = assistantId.trim() !== '' ? assistantId.trim() : DEFAULT_ASSISTANT_ID
+    const assistant = await this.deps.assistantService.getAssistant(id)
+    if (assistant !== null) {
+      return assistant
+    }
+    const fallback = await this.deps.assistantService.getAssistant(DEFAULT_ASSISTANT_ID)
+    if (fallback !== null) {
+      return fallback
+    }
+    return new Assistant(DEFAULT_ASSISTANT_ID, '默认助手')
+  }
+
+  private applyAssistantSnapshot(result: ChatPageLoadResult, assistant: Assistant): void {
+    result.assistantId = assistant.id !== '' ? assistant.id : DEFAULT_ASSISTANT_ID
+    result.assistantAvatarSymbol = assistant.avatarSymbol !== '' ? assistant.avatarSymbol : 'AI'
+    result.assistantColor = assistant.color !== '' ? assistant.color : DEFAULT_PRIMARY_COLOR
+  }
+
+  private cloneDraftAttachments(attachments: MessageAttachment[]): MessageAttachment[] {
+    const cloned: MessageAttachment[] = []
+    for (let i = 0; i < attachments.length; i++) {
+      const attachment = new MessageAttachment(
+        attachments[i].id,
+        attachments[i].type,
+        attachments[i].name,
+        attachments[i].filePath,
+        attachments[i].mimeType,
+        attachments[i].size
+      )
+      attachment.base64Data = attachments[i].base64Data
+      attachment.processState = attachments[i].processState
+      attachment.parseEngine = attachments[i].parseEngine
+      attachment.parsedText = attachments[i].parsedText
+      attachment.parseError = attachments[i].parseError
+      cloned.push(attachment)
+    }
+    return cloned
+  }
+}

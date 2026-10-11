@@ -1,0 +1,14 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "@cangjie-tpc/markdown_hybrid": "^1.3.6",
+    "@lyb/media-preview": "^1.3.5"
+  },
+  "devDependencies": {},
+  "dynamicDependencies": {}
+}

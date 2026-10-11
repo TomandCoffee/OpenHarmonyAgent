@@ -1,0 +1,2266 @@
+import {
+  getHttpService,
+  HttpService,
+  HttpRequestController,
+  HttpRequestRuntimeOptions
+} from './HttpService'
+import { SearchReference, SearchServiceConfig, SearchEngine } from '../models/ChatModels'
+import { getPreferencesService, PreferenceKeys } from './PreferencesService'
+import { cleanSearchQuery as cleanSearchQueryShared } from '../utils/SearchQueryUtils'
+import { getSearchEngineRegistry, registerAllSearchEngines } from './search/Index'
+
+// 搜索结果类（用于返回给业务层）
+export class SearchResult {
+  success: boolean
+  query: string
+  searchEngine: string
+  references: SearchReference[]
+  contentForAI: string
+  errorMessage: string
+
+  constructor(
+    success: boolean,
+    query: string,
+    searchEngine: string,
+    references: SearchReference[],
+    contentForAI: string,
+    errorMessage: string
+  ) {
+    this.success = success
+    this.query = query
+    this.searchEngine = searchEngine
+    this.references = references
+    this.contentForAI = contentForAI
+    this.errorMessage = errorMessage
+  }
+}
+
+// 单个搜索结果项
+export class SearchResultItem {
+  title: string = ''
+  url: string = ''
+  snippet: string = ''
+
+  constructor(title: string, url: string, snippet: string) {
+    this.title = title
+    this.url = url
+    this.snippet = snippet
+  }
+}
+
+// 网页搜索结果类
+export class WebSearchResult {
+  success: boolean = false
+  url: string = ''
+  title: string = ''
+  content: string = ''
+  errorMessage: string = ''
+  searchResults: SearchResultItem[] = []
+  sourceName: string = ''
+
+  constructor(success: boolean, url: string, title: string, content: string, errorMessage: string,
+    searchResults?: SearchResultItem[], sourceName: string = '') {
+    this.success = success
+    this.url = url
+    this.title = title
+    this.content = content
+    this.errorMessage = errorMessage
+    this.sourceName = sourceName
+    if (searchResults !== undefined) {
+      this.searchResults = searchResults
+    }
+  }
+}
+
+// 运行时配置快照：单次搜索链路内复用，避免重复读取偏好设置
+export class SearchRuntimeConfigSnapshot {
+  enabled: boolean = true
+  searchEngine: SearchEngine = SearchEngine.BING
+  maxResults: number = 10
+  timeout: number = 5000
+  autoTestConnection: boolean = true
+  // 各引擎配置统一存储：key 为 PreferenceKeys 中的 key，value 为用户填写的值
+  engineConfigs: Map<string, string> = new Map()
+
+  // 兼容旧字段（逐步迁移后可移除）
+  braveApiKey: string = ''
+  tavilyApiKey: string = ''
+  tavilyBaseUrl: string = 'https://api.tavily.com'
+  exaApiKey: string = ''
+  exaBaseUrl: string = 'https://api.exa.ai'
+  metasoApiKey: string = ''
+  firecrawlApiKey: string = ''
+  firecrawlBaseUrl: string = 'https://api.firecrawl.dev'
+
+  // 通过 preference key 获取引擎配置值
+  getConfig(prefKey: string, defaultValue: string = ''): string {
+    return this.engineConfigs.get(prefKey) ?? defaultValue
+  }
+}
+
+// 搜索执行选项（可选）
+export interface WebSearchExecutionOptions {
+  requestId?: string
+  runtimeConfig?: SearchRuntimeConfigSnapshot
+  cancelCheck?: () => boolean
+}
+
+// HTML 解析结果类
+class HtmlParseResult {
+  title: string = ''
+  content: string = ''
+
+  constructor(title: string, content: string) {
+    this.title = title
+    this.content = content
+  }
+}
+
+// Bing 搜索结果类（内部使用）
+class BingSearchResponse {
+  success: boolean = false
+  query: string = ''
+  results: SearchResultItem[] = []
+  errorMessage: string = ''
+
+  constructor(success: boolean, query: string, results: SearchResultItem[], errorMessage: string) {
+    this.success = success
+    this.query = query
+    this.results = results
+    this.errorMessage = errorMessage
+  }
+}
+
+class ExaSearchTextConfig {
+  maxCharacters: number = 2500
+}
+
+class ExaSearchContentsConfig {
+  text: ExaSearchTextConfig = new ExaSearchTextConfig()
+}
+
+class ExaSearchRequest {
+  query: string = ''
+  type: string = 'auto'
+  numResults: number = 10
+  contents: ExaSearchContentsConfig = new ExaSearchContentsConfig()
+
+  constructor(query: string, numResults: number) {
+    this.query = query
+    this.numResults = numResults
+  }
+}
+
+class ExaContentsRequest {
+  ids: string[] = []
+  text: ExaSearchTextConfig = new ExaSearchTextConfig()
+
+  constructor(url: string) {
+    this.ids = [url]
+    this.text.maxCharacters = 8000
+  }
+}
+
+class TavilyExtractRequest {
+  urls: string[] = []
+  extract_depth: string = 'basic'
+  format: string = 'markdown'
+  include_images: boolean = false
+  timeout: number = 10
+
+  constructor(url: string, extractDepth: string, timeoutSeconds: number) {
+    this.urls = [url]
+    this.extract_depth = extractDepth
+    this.timeout = timeoutSeconds
+  }
+}
+
+class RequestControllerEntry {
+  controller: HttpRequestController
+  refCount: number = 1
+
+  constructor(controller: HttpRequestController) {
+    this.controller = controller
+  }
+}
+
+export class WebSearchService {
+  private static instance: WebSearchService | null = null
+  private httpService: HttpService
+
+  // 保留旧字段，兼容现有调用方
+  private config: SearchServiceConfig = new SearchServiceConfig()
+  private braveApiKey: string = ''
+  private tavilyApiKey: string = ''
+  private exaApiKey: string = ''
+  private exaBaseUrl: string = 'https://api.exa.ai'
+
+  private requestControllerMap: Map<string, RequestControllerEntry> = new Map()
+
+  // 搜索引擎分发表：新增引擎只需在此注册处理函数
+  private searchHandlers: Map<string, (
+    query: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ) => Promise<SearchResult>> = new Map()
+
+  // 网页抓取分发表：仅支持 scrape 的引擎需要注册
+  private scrapeHandlers: Map<string, (
+    url: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ) => Promise<WebSearchResult>> = new Map()
+
+  private constructor() {
+    this.httpService = getHttpService()
+    this.initSearchHandlers()
+  }
+
+  private initSearchHandlers(): void {
+    this.searchHandlers.set(SearchEngine.BING,
+      (q, r, c, cc) => this.bingSearchEnhanced(q, r, c, cc))
+    this.searchHandlers.set(SearchEngine.BRAVE,
+      (q, r, c, cc) => this.braveSearchEnhanced(q, r, c, cc))
+    this.searchHandlers.set(SearchEngine.TAVILY,
+      (q, r, c, cc) => this.tavilySearchEnhanced(q, r, c, cc))
+    this.searchHandlers.set(SearchEngine.EXA,
+      (q, r, c, cc) => this.exaSearchEnhanced(q, r, c, cc))
+    this.searchHandlers.set(SearchEngine.METASO,
+      (q, r, c, cc) => this.metasoSearchEnhanced(q, r, c, cc))
+    this.searchHandlers.set(SearchEngine.FIRECRAWL,
+      (q, r, c, cc) => this.firecrawlSearchEnhanced(q, r, c, cc))
+
+    // 抓取处理器
+    this.scrapeHandlers.set(SearchEngine.TAVILY,
+      (u, r, c, cc) => this.tavilyExtractUrlContent(u, r, c, cc))
+    this.scrapeHandlers.set(SearchEngine.EXA,
+      (u, r, c, cc) => this.exaFetchUrlContent(u, r, c, cc))
+    this.scrapeHandlers.set(SearchEngine.FIRECRAWL,
+      (u, r, c, cc) => this.firecrawlScrapeUrlContent(u, r, c, cc))
+    this.scrapeHandlers.set(SearchEngine.METASO,
+      (u, r, c, cc) => this.metasoScrapeUrlContent(u, r, c, cc))
+  }
+
+  static getInstance(): WebSearchService {
+    if (WebSearchService.instance === null) {
+      WebSearchService.instance = new WebSearchService()
+    }
+    return WebSearchService.instance
+  }
+
+  private normalizeBaseUrl(raw: string, fallback: string): string {
+    const trimmed = raw.trim()
+    if (trimmed === '') {
+      return fallback
+    }
+    if (trimmed.endsWith('/')) {
+      return trimmed.substring(0, trimmed.length - 1)
+    }
+    return trimmed
+  }
+
+  private parseSearchEngine(raw: string): SearchEngine {
+    return getSearchEngineRegistry().parseEngine(raw)
+  }
+
+  private normalizeTimeout(raw: number): number {
+    if (raw <= 0) {
+      return 5000
+    }
+    if (raw > 60000) {
+      return 60000
+    }
+    return raw
+  }
+
+  private normalizeResultCount(raw: number): number {
+    if (raw <= 0) {
+      return 10
+    }
+    if (raw > 20) {
+      return 20
+    }
+    return raw
+  }
+
+  private applyRuntimeConfig(snapshot: SearchRuntimeConfigSnapshot): void {
+    this.config.enabled = snapshot.enabled
+    this.config.searchEngine = snapshot.searchEngine
+    this.config.maxResults = snapshot.maxResults
+    this.config.timeout = snapshot.timeout
+    this.config.autoTestConnection = snapshot.autoTestConnection
+    this.braveApiKey = snapshot.braveApiKey
+    this.tavilyApiKey = snapshot.tavilyApiKey
+    this.exaApiKey = snapshot.exaApiKey
+    this.exaBaseUrl = snapshot.exaBaseUrl
+  }
+
+  // 加载搜索服务配置（旧接口，保留）
+  async loadConfig(): Promise<void> {
+    const runtime = await this.getRuntimeConfigSnapshot()
+    this.applyRuntimeConfig(runtime)
+  }
+
+  // 获取单次搜索链路可复用的配置快照
+  async getRuntimeConfigSnapshot(): Promise<SearchRuntimeConfigSnapshot> {
+    registerAllSearchEngines()
+    const prefsService = getPreferencesService()
+    const snapshot = new SearchRuntimeConfigSnapshot()
+
+    const enabled = await prefsService.getBoolean(PreferenceKeys.SEARCH_SERVICE_ENABLED, false)
+    const engine = await prefsService.getString(PreferenceKeys.SEARCH_ENGINE, 'bing')
+    const maxResults = await prefsService.getNumber(PreferenceKeys.SEARCH_MAX_RESULTS, 10)
+
+    snapshot.enabled = enabled
+    snapshot.searchEngine = this.parseSearchEngine(engine)
+    snapshot.maxResults = this.normalizeResultCount(maxResults)
+    // 境外搜索 API (api.tavily.com / api.exa.ai / api.firecrawl.dev 等) 在国内连通性偏差,
+    // 5s 经常握手都没完成; 上调到 20s, 配合 HttpService 的 idempotent 重试覆盖瞬时抖动。
+    snapshot.timeout = this.normalizeTimeout(20000)
+    snapshot.autoTestConnection = true
+
+    // 动态加载所有引擎的配置字段
+    const registry = getSearchEngineRegistry()
+    const allEngines = registry.getAll()
+    for (let i = 0; i < allEngines.length; i++) {
+      const desc = allEngines[i]
+      for (let j = 0; j < desc.configFields.length; j++) {
+        const field = desc.configFields[j]
+        const value = await prefsService.getString(field.key, field.defaultValue)
+        const normalized = field.isPassword ? value.trim() :
+          this.normalizeBaseUrl(value, field.defaultValue)
+        snapshot.engineConfigs.set(field.key, normalized)
+      }
+    }
+
+    // 同步到兼容旧字段
+    snapshot.braveApiKey = snapshot.getConfig(PreferenceKeys.SEARCH_BRAVE_API_KEY)
+    snapshot.tavilyApiKey = snapshot.getConfig(PreferenceKeys.SEARCH_TAVILY_API_KEY)
+    snapshot.tavilyBaseUrl = snapshot.getConfig(PreferenceKeys.SEARCH_TAVILY_BASE_URL, 'https://api.tavily.com')
+    snapshot.exaApiKey = snapshot.getConfig(PreferenceKeys.SEARCH_EXA_API_KEY)
+    snapshot.exaBaseUrl = snapshot.getConfig(PreferenceKeys.SEARCH_EXA_BASE_URL, 'https://api.exa.ai')
+    snapshot.metasoApiKey = snapshot.getConfig(PreferenceKeys.SEARCH_METASO_API_KEY)
+    snapshot.firecrawlApiKey = snapshot.getConfig(PreferenceKeys.SEARCH_FIRECRAWL_API_KEY)
+    snapshot.firecrawlBaseUrl = snapshot.getConfig(PreferenceKeys.SEARCH_FIRECRAWL_BASE_URL, 'https://api.firecrawl.dev')
+
+    // 同步到旧字段，兼容依赖 this.config 的现有逻辑
+    this.applyRuntimeConfig(snapshot)
+    return snapshot
+  }
+
+  private resolvePreferredEngineName(runtime: SearchRuntimeConfigSnapshot): string {
+    return getSearchEngineRegistry().getLabel(runtime.searchEngine)
+  }
+
+  async getPreferredEngineName(runtimeConfig?: SearchRuntimeConfigSnapshot): Promise<string> {
+    const runtime = runtimeConfig !== undefined ? runtimeConfig : await this.getRuntimeConfigSnapshot()
+    return this.resolvePreferredEngineName(runtime)
+  }
+
+  async canExposeScrapeWebToModel(runtimeConfig?: SearchRuntimeConfigSnapshot): Promise<boolean> {
+    const runtime = runtimeConfig !== undefined ? runtimeConfig : await this.getRuntimeConfigSnapshot()
+    if (!runtime.enabled) {
+      return false
+    }
+    const descriptor = getSearchEngineRegistry().getById(runtime.searchEngine)
+    if (descriptor === undefined || !descriptor.supportsScrape) {
+      return false
+    }
+    // 支持抓取的引擎都需要 API Key
+    const apiKeyPrefKey = getSearchEngineRegistry().getApiKeyPrefKey(runtime.searchEngine)
+    if (apiKeyPrefKey !== '') {
+      return runtime.getConfig(apiKeyPrefKey) !== ''
+    }
+    return false
+  }
+
+  private acquireRequestController(requestId: string): HttpRequestController | null {
+    if (requestId === '') {
+      return null
+    }
+
+    const existing = this.requestControllerMap.get(requestId)
+    if (existing !== undefined) {
+      existing.refCount += 1
+      return existing.controller
+    }
+
+    const controller = new HttpRequestController()
+    this.requestControllerMap.set(requestId, new RequestControllerEntry(controller))
+    return controller
+  }
+
+  private releaseRequestController(requestId: string): void {
+    if (requestId === '') {
+      return
+    }
+
+    const existing = this.requestControllerMap.get(requestId)
+    if (existing === undefined) {
+      return
+    }
+
+    existing.refCount -= 1
+    if (existing.refCount <= 0) {
+      this.requestControllerMap.delete(requestId)
+    }
+  }
+
+  cancelRequest(requestId: string): void {
+    if (requestId === '') {
+      return
+    }
+    const existing = this.requestControllerMap.get(requestId)
+    if (existing === undefined) {
+      return
+    }
+    existing.controller.cancelAll()
+    this.requestControllerMap.delete(requestId)
+  }
+
+  cancelAllRequests(): void {
+    this.requestControllerMap.forEach((entry: RequestControllerEntry) => {
+      entry.controller.cancelAll()
+    })
+    this.requestControllerMap.clear()
+  }
+
+  private isCancelled(controller: HttpRequestController | null, cancelCheck?: () => boolean): boolean {
+    if (controller !== null && controller.isCancelled()) {
+      return true
+    }
+    if (cancelCheck !== undefined && cancelCheck()) {
+      if (controller !== null) {
+        controller.cancelAll()
+      }
+      return true
+    }
+    return false
+  }
+
+  private buildHttpOptions(timeout: number, controller: HttpRequestController | null): HttpRequestRuntimeOptions {
+    // idempotent: true —— 搜索引擎 / 网页抓取 API (Tavily/Brave/Exa/Metaso/Firecrawl 及 Bing 本地)
+    // 全部幂等, 显式声明允许 HttpService 在国内瞬时网络抖动 / 5xx 时自动重试一次。
+    // WebDAV PUT/DELETE 等有副作用的方法走自己的路径, 不复用这个 helper。
+    const options: HttpRequestRuntimeOptions = {
+      timeout: this.normalizeTimeout(timeout),
+      idempotent: true
+    }
+    if (controller !== null) {
+      options.controller = controller
+    }
+    return options
+  }
+
+  private buildCancelledSearchResult(query: string, engineName: string): SearchResult {
+    return new SearchResult(
+      false,
+      query,
+      engineName,
+      [],
+      '',
+      '请求已取消'
+    )
+  }
+
+  private buildCancelledWebResult(url: string): WebSearchResult {
+    return new WebSearchResult(false, url, '', '', '请求已取消')
+  }
+
+  // 统一搜索接口
+  async search(query: string, options?: WebSearchExecutionOptions): Promise<SearchResult> {
+    const runtime = options?.runtimeConfig !== undefined ? options.runtimeConfig : await this.getRuntimeConfigSnapshot()
+    const requestId = options?.requestId !== undefined ? options.requestId : ''
+    const cancelCheck = options?.cancelCheck
+    const controller = this.acquireRequestController(requestId)
+
+    try {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledSearchResult(query, this.resolvePreferredEngineName(runtime))
+      }
+
+      if (!runtime.enabled) {
+        return new SearchResult(false, query, this.resolvePreferredEngineName(runtime), [], '', '搜索服务未启用')
+      }
+
+      const cleanedQuery = cleanSearchQueryShared(query)
+      if (cleanedQuery !== query) {
+        console.info('WebSearchService', `Search query cleaned: "${query}" -> "${cleanedQuery}"`)
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledSearchResult(cleanedQuery, this.resolvePreferredEngineName(runtime))
+      }
+
+      // 引擎分发（Map 替代 if-else 链）
+      const engineHandler = this.searchHandlers.get(runtime.searchEngine)
+      if (engineHandler !== undefined) {
+        return await engineHandler(cleanedQuery, runtime, controller, cancelCheck)
+      }
+      return await this.bingSearchEnhanced(cleanedQuery, runtime, controller, cancelCheck)
+    } finally {
+      this.releaseRequestController(requestId)
+    }
+  }
+
+  private async bingSearchEnhanced(
+    query: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<SearchResult> {
+    const response = await this.bingSearchInternal(query, runtime.maxResults, runtime, controller, cancelCheck)
+
+    if (!response.success) {
+      return new SearchResult(
+        false,
+        query,
+        'Bing(local)',
+        [],
+        '',
+        response.errorMessage
+      )
+    }
+
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledSearchResult(query, 'Bing(local)')
+    }
+
+    const references: SearchReference[] = []
+    for (let i = 0; i < response.results.length; i++) {
+      const item = response.results[i]
+      references.push(new SearchReference(
+        `ref_${Date.now()}_${i}`,
+        item.title,
+        item.url,
+        item.snippet
+      ))
+    }
+
+    const contentForAI = this.limitPromptContent(this.buildContentForAI(response.results), 6000)
+
+    return new SearchResult(
+      true,
+      response.query,
+      'Bing(local)',
+      references,
+      contentForAI,
+      ''
+    )
+  }
+
+  private async exaSearchEnhanced(
+    query: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<SearchResult> {
+    if (runtime.exaApiKey === '') {
+      return new SearchResult(
+        false,
+        query,
+        'Exa',
+        [],
+        '',
+        'Exa API Key 未配置'
+      )
+    }
+
+    const response = await this.exaSearch(query, runtime.maxResults, runtime, controller, cancelCheck)
+    if (!response.success) {
+      return new SearchResult(
+        false,
+        query,
+        'Exa',
+        [],
+        '',
+        response.errorMessage
+      )
+    }
+
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledSearchResult(query, 'Exa')
+    }
+
+    const references: SearchReference[] = []
+    for (let i = 0; i < response.results.length; i++) {
+      const item = response.results[i]
+      references.push(new SearchReference(
+        `ref_${Date.now()}_${i}`,
+        item.title,
+        item.url,
+        item.snippet
+      ))
+    }
+
+    const contentForAI = this.limitPromptContent(this.buildContentForAI(response.results), 6000)
+    return new SearchResult(
+      true,
+      query,
+      'Exa',
+      references,
+      contentForAI,
+      ''
+    )
+  }
+
+  private async braveSearchEnhanced(
+    query: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<SearchResult> {
+    if (runtime.braveApiKey === '') {
+      return new SearchResult(
+        false,
+        query,
+        'Brave Search',
+        [],
+        '',
+        'Brave API Key 未配置'
+      )
+    }
+
+    const response = await this.braveSearch(query, runtime.maxResults, runtime, controller, cancelCheck)
+    if (!response.success) {
+      return new SearchResult(
+        false,
+        query,
+        'Brave Search',
+        [],
+        '',
+        response.errorMessage
+      )
+    }
+
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledSearchResult(query, 'Brave Search')
+    }
+
+    const references: SearchReference[] = []
+    for (let i = 0; i < response.results.length; i++) {
+      const item = response.results[i]
+      references.push(new SearchReference(
+        `ref_${Date.now()}_${i}`,
+        item.title,
+        item.url,
+        item.snippet
+      ))
+    }
+
+    return new SearchResult(
+      true,
+      query,
+      'Brave Search',
+      references,
+      this.limitPromptContent(this.buildContentForAI(response.results), 6000),
+      ''
+    )
+  }
+
+  private async tavilySearchEnhanced(
+    query: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<SearchResult> {
+    if (runtime.tavilyApiKey === '') {
+      return new SearchResult(
+        false,
+        query,
+        'Tavily',
+        [],
+        '',
+        'Tavily API Key 未配置'
+      )
+    }
+
+    const response = await this.tavilySearch(query, runtime.maxResults, runtime, controller, cancelCheck)
+    if (!response.success) {
+      return new SearchResult(
+        false,
+        query,
+        'Tavily',
+        [],
+        '',
+        response.errorMessage
+      )
+    }
+
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledSearchResult(query, 'Tavily')
+    }
+
+    const references: SearchReference[] = []
+    for (let i = 0; i < response.results.length; i++) {
+      const item = response.results[i]
+      references.push(new SearchReference(
+        `ref_${Date.now()}_${i}`,
+        item.title,
+        item.url,
+        item.snippet
+      ))
+    }
+
+    return new SearchResult(
+      true,
+      query,
+      'Tavily',
+      references,
+      this.limitPromptContent(this.buildContentForAI(response.results), 6000),
+      ''
+    )
+  }
+
+  private async metasoSearchEnhanced(
+    query: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<SearchResult> {
+    if (runtime.metasoApiKey === '') {
+      return new SearchResult(false, query, 'Metaso', [], '', 'Metaso API Key 未配置')
+    }
+
+    try {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledSearchResult(query, 'Metaso')
+      }
+
+      const response = await this.httpService.postWithTimeout(
+        'https://metaso.cn/api/v1/search',
+        JSON.stringify({
+          q: query,
+          scope: 'webpage',
+          size: this.normalizeResultCount(runtime.maxResults),
+          includeSummary: false
+        }),
+        {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${runtime.metasoApiKey}`
+        },
+        runtime.timeout,
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new SearchResult(false, query, 'Metaso', [], '', response.errorMessage)
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledSearchResult(query, 'Metaso')
+      }
+
+      const results = this.parseMetasoSearchResults(response.data, this.normalizeResultCount(runtime.maxResults))
+      const references: SearchReference[] = []
+      for (let i = 0; i < results.length; i++) {
+        const item = results[i]
+        references.push(new SearchReference(`ref_${Date.now()}_${i}`, item.title, item.url, item.snippet))
+      }
+
+      return new SearchResult(
+        true,
+        query,
+        'Metaso',
+        references,
+        this.limitPromptContent(this.buildContentForAI(results), 6000),
+        ''
+      )
+    } catch (error) {
+      return new SearchResult(false, query, 'Metaso', [], '', `Metaso 搜索失败: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private parseMetasoSearchResults(json: string, maxCount: number): SearchResultItem[] {
+    const results: SearchResultItem[] = []
+    if (json === '') {
+      return results
+    }
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const webpages = parsed['webpages']
+      if (webpages === undefined || webpages === null || !Array.isArray(webpages)) {
+        return results
+      }
+      const list = webpages as Object[]
+      for (let i = 0; i < list.length && results.length < maxCount; i++) {
+        const item = list[i]
+        if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+          continue
+        }
+        const itemObj = item as Record<string, Object>
+        const title = this.readStringFromObject(itemObj, 'title').trim()
+        const url = this.readStringFromObject(itemObj, 'link').trim()
+        const snippet = this.normalizeSnippet(this.readStringFromObject(itemObj, 'snippet'))
+        if (title === '' || url === '') {
+          continue
+        }
+        results.push(new SearchResultItem(title, url, snippet))
+      }
+    } catch (error) {
+      console.error('WebSearchService', `Parse Metaso results failed: ${JSON.stringify(error)}`)
+    }
+    return results
+  }
+
+  private async metasoScrapeUrlContent(
+    url: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<WebSearchResult> {
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledWebResult(url)
+    }
+    if (!this.isValidUrl(url)) {
+      return new WebSearchResult(false, url, '', '', 'URL 格式无效', undefined, 'Metaso Reader')
+    }
+
+    const fullUrl = this.normalizeContentUrl(url)
+    try {
+      const response = await this.httpService.postWithTimeout(
+        'https://metaso.cn/api/v1/crawl',
+        JSON.stringify({ url: fullUrl, format: 'markdown' }),
+        {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${runtime.metasoApiKey}`
+        },
+        this.normalizeTimeout(runtime.timeout),
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new WebSearchResult(false, fullUrl, '', '', response.errorMessage, undefined, 'Metaso Reader')
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledWebResult(fullUrl)
+      }
+
+      const parsed = JSON.parse(response.data) as Record<string, Object>
+      const content = this.readStringFromObject(parsed, 'content').trim()
+      if (content === '') {
+        const markdown = this.readStringFromObject(parsed, 'markdown').trim()
+        if (markdown === '') {
+          return new WebSearchResult(false, fullUrl, '', '', 'Metaso Reader 未返回正文', undefined, 'Metaso Reader')
+        }
+        const title = this.readStringFromObject(parsed, 'title').trim() ||
+          this.extractTitleFromTextContent(markdown, fullUrl)
+        return new WebSearchResult(true, fullUrl, title, this.limitExtractedContent(markdown), '', undefined,
+          'Metaso Reader')
+      }
+
+      const title = this.readStringFromObject(parsed, 'title').trim() ||
+        this.extractTitleFromTextContent(content, fullUrl)
+      return new WebSearchResult(true, fullUrl, title, this.limitExtractedContent(content), '', undefined,
+        'Metaso Reader')
+    } catch (error) {
+      return new WebSearchResult(
+        false, fullUrl, '', '',
+        `Metaso Reader 失败: ${JSON.stringify(error)}`, undefined, 'Metaso Reader'
+      )
+    }
+  }
+
+  private async firecrawlSearchEnhanced(
+    query: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<SearchResult> {
+    if (runtime.firecrawlApiKey === '') {
+      return new SearchResult(false, query, 'Firecrawl', [], '', 'Firecrawl API Key 未配置')
+    }
+
+    try {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledSearchResult(query, 'Firecrawl')
+      }
+
+      const baseUrl = this.normalizeBaseUrl(runtime.firecrawlBaseUrl, 'https://api.firecrawl.dev')
+      const response = await this.httpService.postWithTimeout(
+        `${baseUrl}/v2/search`,
+        JSON.stringify({
+          query: query,
+          limit: this.normalizeResultCount(runtime.maxResults)
+        }),
+        {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${runtime.firecrawlApiKey}`
+        },
+        runtime.timeout,
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new SearchResult(false, query, 'Firecrawl', [], '', response.errorMessage)
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledSearchResult(query, 'Firecrawl')
+      }
+
+      const results = this.parseFirecrawlSearchResults(response.data, this.normalizeResultCount(runtime.maxResults))
+      const references: SearchReference[] = []
+      for (let i = 0; i < results.length; i++) {
+        const item = results[i]
+        references.push(new SearchReference(`ref_${Date.now()}_${i}`, item.title, item.url, item.snippet))
+      }
+
+      return new SearchResult(
+        true,
+        query,
+        'Firecrawl',
+        references,
+        this.limitPromptContent(this.buildContentForAI(results), 6000),
+        ''
+      )
+    } catch (error) {
+      return new SearchResult(false, query, 'Firecrawl', [], '', `Firecrawl 搜索失败: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private parseFirecrawlSearchResults(json: string, maxCount: number): SearchResultItem[] {
+    const results: SearchResultItem[] = []
+    if (json === '') {
+      return results
+    }
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const data = parsed['data']
+      if (data === undefined || data === null || typeof data !== 'object' || Array.isArray(data)) {
+        return results
+      }
+      const dataObj = data as Record<string, Object>
+
+      // 解析 web 结果
+      const web = dataObj['web']
+      if (web !== undefined && web !== null && Array.isArray(web)) {
+        const list = web as Object[]
+        for (let i = 0; i < list.length && results.length < maxCount; i++) {
+          const item = list[i]
+          if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+            continue
+          }
+          const itemObj = item as Record<string, Object>
+          const title = this.readStringFromObject(itemObj, 'title').trim()
+          const url = this.readStringFromObject(itemObj, 'url').trim()
+          const snippet = this.normalizeSnippet(this.readStringFromObject(itemObj, 'description'))
+          if (title === '' || url === '') {
+            continue
+          }
+          results.push(new SearchResultItem(title, url, snippet))
+        }
+      }
+
+      // 解析 news 结果
+      const news = dataObj['news']
+      if (news !== undefined && news !== null && Array.isArray(news)) {
+        const list = news as Object[]
+        for (let i = 0; i < list.length && results.length < maxCount; i++) {
+          const item = list[i]
+          if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+            continue
+          }
+          const itemObj = item as Record<string, Object>
+          const title = this.readStringFromObject(itemObj, 'title').trim()
+          const url = this.readStringFromObject(itemObj, 'url').trim()
+          const snippet = this.normalizeSnippet(this.readStringFromObject(itemObj, 'snippet'))
+          if (title === '' || url === '') {
+            continue
+          }
+          results.push(new SearchResultItem(title, url, snippet))
+        }
+      }
+    } catch (error) {
+      console.error('WebSearchService', `Parse Firecrawl results failed: ${JSON.stringify(error)}`)
+    }
+    return results
+  }
+
+  private async firecrawlScrapeUrlContent(
+    url: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<WebSearchResult> {
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledWebResult(url)
+    }
+
+    if (!this.isValidUrl(url)) {
+      return new WebSearchResult(false, url, '', '', 'URL 格式无效', undefined, 'Firecrawl Scrape')
+    }
+
+    const fullUrl = this.normalizeContentUrl(url)
+    try {
+      const baseUrl = this.normalizeBaseUrl(runtime.firecrawlBaseUrl, 'https://api.firecrawl.dev')
+      const response = await this.httpService.postWithTimeout(
+        `${baseUrl}/v2/scrape`,
+        JSON.stringify({
+          url: fullUrl,
+          onlyMainContent: true,
+          formats: ['markdown']
+        }),
+        {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${runtime.firecrawlApiKey}`
+        },
+        this.normalizeTimeout(runtime.timeout),
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new WebSearchResult(false, fullUrl, '', '', response.errorMessage, undefined, 'Firecrawl Scrape')
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledWebResult(fullUrl)
+      }
+
+      const parsed = JSON.parse(response.data) as Record<string, Object>
+      const success = parsed['success']
+      if (success !== true) {
+        return new WebSearchResult(false, fullUrl, '', '', 'Firecrawl Scrape 请求失败', undefined, 'Firecrawl Scrape')
+      }
+
+      const data = parsed['data']
+      if (data === undefined || data === null || typeof data !== 'object' || Array.isArray(data)) {
+        return new WebSearchResult(false, fullUrl, '', '', 'Firecrawl Scrape 未返回数据', undefined, 'Firecrawl Scrape')
+      }
+
+      const dataObj = data as Record<string, Object>
+      const markdown = this.readStringFromObject(dataObj, 'markdown').trim()
+      if (markdown === '') {
+        return new WebSearchResult(false, fullUrl, '', '', 'Firecrawl Scrape 未返回正文', undefined, 'Firecrawl Scrape')
+      }
+
+      const title = this.readStringFromObject(dataObj, 'title').trim() ||
+        this.extractTitleFromTextContent(markdown, fullUrl)
+      return new WebSearchResult(
+        true,
+        fullUrl,
+        title,
+        this.limitExtractedContent(markdown),
+        '',
+        undefined,
+        'Firecrawl Scrape'
+      )
+    } catch (error) {
+      return new WebSearchResult(
+        false, fullUrl, '', '',
+        `Firecrawl Scrape 失败: ${JSON.stringify(error)}`, undefined, 'Firecrawl Scrape'
+      )
+    }
+  }
+
+  private async braveSearch(
+    query: string,
+    resultCount: number,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<BingSearchResponse> {
+    try {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      const searchUrl =
+        `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${this.normalizeResultCount(resultCount)}`
+      const response = await this.httpService.get(
+        searchUrl,
+        {
+          'Accept': 'application/json',
+          'X-Subscription-Token': runtime.braveApiKey
+        },
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new BingSearchResponse(false, query, [], response.errorMessage)
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      const errorMessage = this.extractBraveErrorMessage(response.data)
+      if (errorMessage !== '') {
+        return new BingSearchResponse(false, query, [], errorMessage)
+      }
+
+      return new BingSearchResponse(
+        true,
+        query,
+        this.parseBraveSearchResults(response.data, this.normalizeResultCount(resultCount)),
+        ''
+      )
+    } catch (error) {
+      return new BingSearchResponse(false, query, [], `Brave 搜索失败: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private async tavilySearch(
+    query: string,
+    resultCount: number,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<BingSearchResponse> {
+    try {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      const response = await this.httpService.postWithTimeout(
+        this.buildTavilyEndpointUrl(runtime.tavilyBaseUrl, 'search'),
+        JSON.stringify({
+          query: query,
+          topic: 'general',
+          search_depth: 'basic',
+          max_results: this.normalizeResultCount(resultCount),
+          include_answer: false,
+          include_images: false,
+          include_raw_content: false
+        }),
+        this.buildTavilyHeaders(runtime),
+        runtime.timeout,
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new BingSearchResponse(false, query, [], response.errorMessage)
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      const errorMessage = this.extractTavilyErrorMessage(response.data)
+      if (errorMessage !== '') {
+        return new BingSearchResponse(false, query, [], errorMessage)
+      }
+
+      return new BingSearchResponse(
+        true,
+        query,
+        this.parseTavilySearchResults(response.data, this.normalizeResultCount(resultCount)),
+        ''
+      )
+    } catch (error) {
+      return new BingSearchResponse(false, query, [], `Tavily 搜索失败: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private buildTavilyHeaders(runtime: SearchRuntimeConfigSnapshot): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${runtime.tavilyApiKey}`
+    }
+  }
+
+  private buildExaHeaders(runtime: SearchRuntimeConfigSnapshot): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'x-api-key': runtime.exaApiKey
+    }
+  }
+
+  private stripKnownTavilyEndpoint(url: string): string {
+    const endpoints: string[] = ['/search', '/extract', '/map', '/crawl', '/research', '/usage']
+    for (let i = 0; i < endpoints.length; i++) {
+      if (url.endsWith(endpoints[i])) {
+        return url.substring(0, url.length - endpoints[i].length)
+      }
+    }
+    return url
+  }
+
+  private stripKnownExaEndpoint(url: string): string {
+    const endpoints: string[] = ['/search', '/contents']
+    for (let i = 0; i < endpoints.length; i++) {
+      if (url.endsWith(endpoints[i])) {
+        return url.substring(0, url.length - endpoints[i].length)
+      }
+    }
+    return url
+  }
+
+  private buildTavilyEndpointUrl(baseUrl: string, endpoint: string): string {
+    const normalized = this.normalizeBaseUrl(baseUrl, 'https://api.tavily.com')
+    const base = this.stripKnownTavilyEndpoint(normalized)
+    return `${base}/${endpoint}`
+  }
+
+  private buildExaEndpointUrl(baseUrl: string, endpoint: string): string {
+    const normalized = this.normalizeBaseUrl(baseUrl, 'https://api.exa.ai')
+    const base = this.stripKnownExaEndpoint(normalized)
+    return `${base}/${endpoint}`
+  }
+
+  private getTavilyExtractApiTimeoutSeconds(depth: string): number {
+    return depth === 'advanced' ? 30 : 10
+  }
+
+  private getTavilyExtractHttpTimeoutMs(runtimeTimeout: number, depth: string): number {
+    const apiTimeoutMs = this.getTavilyExtractApiTimeoutSeconds(depth) * 1000
+    return Math.max(this.normalizeTimeout(runtimeTimeout), apiTimeoutMs + 5000)
+  }
+
+  private async tavilyExtractUrlContent(
+    url: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<WebSearchResult> {
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledWebResult(url)
+    }
+
+    if (!this.isValidUrl(url)) {
+      return new WebSearchResult(false, url, '', '', 'URL 格式无效')
+    }
+
+    const fullUrl = this.normalizeContentUrl(url)
+    const basicResult = await this.tavilyExtractUrlContentByDepth(fullUrl, runtime, controller, cancelCheck, 'basic')
+    if (basicResult.success || this.isCancelled(controller, cancelCheck) ||
+      !this.shouldRetryTavilyExtractWithAdvanced(basicResult.errorMessage)) {
+      return basicResult
+    }
+
+    console.warn('WebSearchService', `[Tavily Extract] Basic failed, retry advanced: ${basicResult.errorMessage}`)
+    const advancedResult = await this.tavilyExtractUrlContentByDepth(
+      fullUrl,
+      runtime,
+      controller,
+      cancelCheck,
+      'advanced'
+    )
+    if (advancedResult.success || this.isCancelled(controller, cancelCheck)) {
+      return advancedResult
+    }
+
+    return new WebSearchResult(
+      false,
+      fullUrl,
+      '',
+      '',
+      `Tavily Extract basic 失败: ${basicResult.errorMessage}; advanced 失败: ${advancedResult.errorMessage}`,
+      undefined,
+      'Tavily Extract'
+    )
+  }
+
+  private async tavilyExtractUrlContentByDepth(
+    fullUrl: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck: (() => boolean) | undefined,
+    depth: string
+  ): Promise<WebSearchResult> {
+    try {
+      const timeout = this.getTavilyExtractHttpTimeoutMs(runtime.timeout, depth)
+      const request = new TavilyExtractRequest(
+        fullUrl,
+        depth,
+        this.getTavilyExtractApiTimeoutSeconds(depth)
+      )
+      console.info(
+        'WebSearchService',
+        `[Tavily Extract] POST ${this.buildTavilyEndpointUrl(runtime.tavilyBaseUrl, 'extract')} depth=${depth}`
+      )
+      const response = await this.httpService.postWithTimeout(
+        this.buildTavilyEndpointUrl(runtime.tavilyBaseUrl, 'extract'),
+        JSON.stringify(request),
+        this.buildTavilyHeaders(runtime),
+        timeout,
+        this.buildHttpOptions(timeout, controller)
+      )
+
+      if (!response.success) {
+        return new WebSearchResult(false, fullUrl, '', '', response.errorMessage, undefined, 'Tavily Extract')
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledWebResult(fullUrl)
+      }
+
+      const errorMessage = this.extractTavilyErrorMessage(response.data)
+      if (errorMessage !== '') {
+        return new WebSearchResult(false, fullUrl, '', '', errorMessage, undefined, 'Tavily Extract')
+      }
+
+      return this.parseTavilyExtractResult(response.data, fullUrl)
+    } catch (error) {
+      return new WebSearchResult(
+        false,
+        fullUrl,
+        '',
+        '',
+        `Tavily Extract 失败: ${JSON.stringify(error)}`,
+        undefined,
+        'Tavily Extract'
+      )
+    }
+  }
+
+  private shouldRetryTavilyExtractWithAdvanced(errorMessage: string): boolean {
+    if (errorMessage === '') {
+      return true
+    }
+    const lower = errorMessage.toLowerCase()
+    if (lower.includes('401') || lower.includes('403') || lower.includes('api key') ||
+      lower.includes('unauthorized') || lower.includes('forbidden') || lower.includes('quota') ||
+      lower.includes('credit') || lower.includes('rate limit') || lower.includes('请求已取消')) {
+      return false
+    }
+    return true
+  }
+
+  private async exaSearch(
+    query: string,
+    resultCount: number,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<BingSearchResponse> {
+    try {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      const request = new ExaSearchRequest(query, this.normalizeResultCount(resultCount))
+      const body = JSON.stringify(request)
+      const response = await this.httpService.postWithTimeout(
+        this.buildExaEndpointUrl(runtime.exaBaseUrl, 'search'),
+        body,
+        this.buildExaHeaders(runtime),
+        runtime.timeout,
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new BingSearchResponse(false, query, [], response.errorMessage)
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      const errorMessage = this.extractExaErrorMessage(response.data)
+      if (errorMessage !== '') {
+        return new BingSearchResponse(false, query, [], errorMessage)
+      }
+
+      const results = this.parseExaSearchResults(response.data, this.normalizeResultCount(resultCount))
+      return new BingSearchResponse(true, query, results, '')
+    } catch (error) {
+      return new BingSearchResponse(false, query, [], `Exa 搜索失败: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private async exaFetchUrlContent(
+    url: string,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<WebSearchResult> {
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledWebResult(url)
+    }
+
+    if (!this.isValidUrl(url)) {
+      return new WebSearchResult(false, url, '', '', 'URL 格式无效', undefined, 'Exa Contents')
+    }
+
+    if (runtime.exaApiKey === '') {
+      return new WebSearchResult(false, url, '', '', 'Exa API Key 未配置，无法调用 Contents', undefined, 'Exa Contents')
+    }
+
+    const fullUrl = this.normalizeContentUrl(url)
+    try {
+      const request = new ExaContentsRequest(fullUrl)
+      console.info('WebSearchService', `[Exa Contents] POST ${this.buildExaEndpointUrl(runtime.exaBaseUrl, 'contents')}`)
+      const response = await this.httpService.postWithTimeout(
+        this.buildExaEndpointUrl(runtime.exaBaseUrl, 'contents'),
+        JSON.stringify(request),
+        this.buildExaHeaders(runtime),
+        this.normalizeTimeout(runtime.timeout),
+        this.buildHttpOptions(runtime.timeout, controller)
+      )
+
+      if (!response.success) {
+        return new WebSearchResult(false, fullUrl, '', '', response.errorMessage, undefined, 'Exa Contents')
+      }
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledWebResult(fullUrl)
+      }
+
+      const errorMessage = this.extractExaErrorMessage(response.data)
+      if (errorMessage !== '') {
+        return new WebSearchResult(false, fullUrl, '', '', errorMessage, undefined, 'Exa Contents')
+      }
+
+      return this.parseExaContentsResult(response.data, fullUrl)
+    } catch (error) {
+      return new WebSearchResult(
+        false,
+        fullUrl,
+        '',
+        '',
+        `Exa Contents 失败: ${JSON.stringify(error)}`,
+        undefined,
+        'Exa Contents'
+      )
+    }
+  }
+
+  private extractBraveErrorMessage(json: string): string {
+    if (json === '') {
+      return ''
+    }
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const error = parsed['error']
+      if (error === undefined || error === null) {
+        return ''
+      }
+      if (typeof error === 'string') {
+        return error
+      }
+      if (typeof error === 'object') {
+        const errorObj = error as Record<string, Object>
+        const message = this.readStringFromObject(errorObj, 'message')
+        if (message !== '') {
+          return message
+        }
+        return JSON.stringify(errorObj)
+      }
+      return JSON.stringify(error)
+    } catch (_error) {
+      return ''
+    }
+  }
+
+  private extractTavilyErrorMessage(json: string): string {
+    if (json === '') {
+      return ''
+    }
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const detail = parsed['detail']
+      if (detail !== undefined && detail !== null) {
+        if (typeof detail === 'string') {
+          return detail
+        }
+        return JSON.stringify(detail)
+      }
+      const message = this.readStringFromObject(parsed, 'message')
+      if (message !== '') {
+        return message
+      }
+      const error = parsed['error']
+      if (error === undefined || error === null) {
+        return ''
+      }
+      if (typeof error === 'string') {
+        return error
+      }
+      if (typeof error === 'object') {
+        const errorObj = error as Record<string, Object>
+        const message = this.readStringFromObject(errorObj, 'message')
+        if (message !== '') {
+          return message
+        }
+        return JSON.stringify(errorObj)
+      }
+      return JSON.stringify(error)
+    } catch (_error) {
+      return ''
+    }
+  }
+
+  private parseBraveSearchResults(json: string, maxCount: number): SearchResultItem[] {
+    const results: SearchResultItem[] = []
+    if (json === '') {
+      return results
+    }
+
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const web = parsed['web']
+      if (web === undefined || web === null || typeof web !== 'object' || Array.isArray(web)) {
+        return results
+      }
+      const webObj = web as Record<string, Object>
+      const resultsValue = webObj['results']
+      if (resultsValue === undefined || resultsValue === null || !Array.isArray(resultsValue)) {
+        return results
+      }
+
+      const list = resultsValue as Object[]
+      for (let i = 0; i < list.length && results.length < maxCount; i++) {
+        const item = list[i]
+        if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+          continue
+        }
+        const itemObj = item as Record<string, Object>
+        const title = this.readStringFromObject(itemObj, 'title').trim()
+        const url = this.readStringFromObject(itemObj, 'url').trim()
+        const snippet = this.normalizeSnippet(this.readStringFromObject(itemObj, 'description'))
+        if (title === '' || url === '') {
+          continue
+        }
+        results.push(new SearchResultItem(title, url, snippet))
+      }
+    } catch (error) {
+      console.error('WebSearchService', `Parse Brave results failed: ${JSON.stringify(error)}`)
+    }
+
+    return results
+  }
+
+  private parseTavilySearchResults(json: string, maxCount: number): SearchResultItem[] {
+    const results: SearchResultItem[] = []
+    if (json === '') {
+      return results
+    }
+
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const resultsValue = parsed['results']
+      if (resultsValue === undefined || resultsValue === null || !Array.isArray(resultsValue)) {
+        return results
+      }
+
+      const list = resultsValue as Object[]
+      for (let i = 0; i < list.length && results.length < maxCount; i++) {
+        const item = list[i]
+        if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+          continue
+        }
+        const itemObj = item as Record<string, Object>
+        const title = this.readStringFromObject(itemObj, 'title').trim()
+        const url = this.readStringFromObject(itemObj, 'url').trim()
+        const snippet = this.normalizeSnippet(this.readStringFromObject(itemObj, 'content'))
+        if (title === '' || url === '') {
+          continue
+        }
+        results.push(new SearchResultItem(title, url, snippet))
+      }
+    } catch (error) {
+      console.error('WebSearchService', `Parse Tavily results failed: ${JSON.stringify(error)}`)
+    }
+
+    return results
+  }
+
+  private parseTavilyExtractResult(json: string, fallbackUrl: string): WebSearchResult {
+    if (json === '') {
+      return new WebSearchResult(false, fallbackUrl, '', '', 'Tavily Extract 未返回内容')
+    }
+
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const resultsValue = parsed['results']
+      if (resultsValue !== undefined && resultsValue !== null && Array.isArray(resultsValue)) {
+        const list = resultsValue as Object[]
+        for (let i = 0; i < list.length; i++) {
+          const item = list[i]
+          if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+            continue
+          }
+          const itemObj = item as Record<string, Object>
+          const content = this.extractTavilyExtractContent(itemObj)
+          if (content === '') {
+            continue
+          }
+          const resultUrl = this.readStringFromObject(itemObj, 'url')
+          const resolvedUrl = resultUrl !== '' ? resultUrl : fallbackUrl
+          let title = this.readStringFromObject(itemObj, 'title').trim()
+          if (title === '') {
+            title = this.extractTitleFromTextContent(content, resolvedUrl)
+          }
+          return new WebSearchResult(
+            true,
+            resolvedUrl,
+            title,
+            this.limitExtractedContent(content),
+            '',
+            undefined,
+            'Tavily Extract'
+          )
+        }
+      }
+
+      const failedMessage = this.extractTavilyFailedResultMessage(parsed)
+      if (failedMessage !== '') {
+        return new WebSearchResult(false, fallbackUrl, '', '', failedMessage)
+      }
+    } catch (error) {
+      console.error('WebSearchService', `Parse Tavily extract failed: ${JSON.stringify(error)}`)
+      return new WebSearchResult(false, fallbackUrl, '', '', `Tavily Extract 解析失败: ${JSON.stringify(error)}`)
+    }
+
+    return new WebSearchResult(false, fallbackUrl, '', '', 'Tavily Extract 未返回正文')
+  }
+
+  private extractTavilyExtractContent(itemObj: Record<string, Object>): string {
+    const rawContent = this.readStringFromObject(itemObj, 'raw_content').trim()
+    if (rawContent !== '') {
+      return rawContent
+    }
+
+    const content = this.readStringFromObject(itemObj, 'content').trim()
+    if (content !== '') {
+      return content
+    }
+
+    return this.readStringFromObject(itemObj, 'text').trim()
+  }
+
+  private extractTavilyFailedResultMessage(parsed: Record<string, Object>): string {
+    const failedResults = parsed['failed_results']
+    if (failedResults === undefined || failedResults === null || !Array.isArray(failedResults)) {
+      return ''
+    }
+
+    const list = failedResults as Object[]
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i]
+      if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+        continue
+      }
+      const itemObj = item as Record<string, Object>
+      const error = this.readStringFromObject(itemObj, 'error')
+      if (error !== '') {
+        return error
+      }
+    }
+    return ''
+  }
+
+  private extractTitleFromTextContent(content: string, fallbackUrl: string): string {
+    const headingMatch = /^#{1,6}\s+(.+)$/m.exec(content)
+    if (headingMatch !== null && headingMatch[1] !== undefined) {
+      const title = headingMatch[1].trim()
+      if (title !== '') {
+        return title
+      }
+    }
+    return fallbackUrl
+  }
+
+  private limitExtractedContent(content: string): string {
+    const maxContentLength = 8000
+    if (content.length <= maxContentLength) {
+      return content
+    }
+    return content.substring(0, maxContentLength) + '...'
+  }
+
+  private extractExaErrorMessage(json: string): string {
+    if (json === '') {
+      return ''
+    }
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const error = parsed['error']
+      if (error === undefined || error === null) {
+        return ''
+      }
+      if (typeof error === 'string') {
+        return error
+      }
+      if (typeof error === 'object') {
+        const errorObj = error as Record<string, Object>
+        const message = this.readStringFromObject(errorObj, 'message')
+        if (message !== '') {
+          return message
+        }
+        return JSON.stringify(errorObj)
+      }
+      return JSON.stringify(error)
+    } catch (_error) {
+      return ''
+    }
+  }
+
+  private parseExaSearchResults(json: string, maxCount: number): SearchResultItem[] {
+    const results: SearchResultItem[] = []
+    if (json === '') {
+      return results
+    }
+
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const resultsValue = parsed['results']
+      if (resultsValue === undefined || resultsValue === null || !Array.isArray(resultsValue)) {
+        return results
+      }
+
+      const list = resultsValue as Object[]
+      for (let i = 0; i < list.length && results.length < maxCount; i++) {
+        const item = list[i]
+        if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+          continue
+        }
+        const itemObj = item as Record<string, Object>
+        const title = this.readStringFromObject(itemObj, 'title')
+        const url = this.readStringFromObject(itemObj, 'url')
+        const snippet = this.extractExaSnippet(itemObj)
+
+        if (title === '' || url === '') {
+          continue
+        }
+        results.push(new SearchResultItem(title, url, snippet))
+      }
+    } catch (error) {
+      console.error('WebSearchService', `Parse Exa results failed: ${JSON.stringify(error)}`)
+    }
+
+    return results
+  }
+
+  private parseExaContentsResult(json: string, fallbackUrl: string): WebSearchResult {
+    if (json === '') {
+      return new WebSearchResult(false, fallbackUrl, '', '', 'Exa Contents 未返回内容', undefined, 'Exa Contents')
+    }
+
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>
+      const resultsValue = parsed['results']
+      if (resultsValue !== undefined && resultsValue !== null && Array.isArray(resultsValue)) {
+        const list = resultsValue as Object[]
+        for (let i = 0; i < list.length; i++) {
+          const item = list[i]
+          if (item === null || item === undefined || typeof item !== 'object' || Array.isArray(item)) {
+            continue
+          }
+          const itemObj = item as Record<string, Object>
+          const content = this.extractExaContentsContent(itemObj)
+          if (content === '') {
+            continue
+          }
+          const resultUrl = this.readStringFromObject(itemObj, 'url')
+          const resolvedUrl = resultUrl !== '' ? resultUrl : fallbackUrl
+          let title = this.readStringFromObject(itemObj, 'title').trim()
+          if (title === '') {
+            title = this.extractTitleFromTextContent(content, resolvedUrl)
+          }
+          return new WebSearchResult(
+            true,
+            resolvedUrl,
+            title,
+            this.limitExtractedContent(content),
+            '',
+            undefined,
+            'Exa Contents'
+          )
+        }
+      }
+    } catch (error) {
+      console.error('WebSearchService', `Parse Exa contents failed: ${JSON.stringify(error)}`)
+      return new WebSearchResult(false, fallbackUrl, '', '', `Exa Contents 解析失败: ${JSON.stringify(error)}`,
+        undefined, 'Exa Contents')
+    }
+
+    return new WebSearchResult(false, fallbackUrl, '', '', 'Exa Contents 未返回正文', undefined, 'Exa Contents')
+  }
+
+  private extractExaContentsContent(itemObj: Record<string, Object>): string {
+    const text = this.readStringFromObject(itemObj, 'text').trim()
+    if (text !== '') {
+      return text
+    }
+
+    const summary = this.readStringFromObject(itemObj, 'summary').trim()
+    if (summary !== '') {
+      return summary
+    }
+
+    const highlights = itemObj['highlights']
+    if (highlights !== undefined && highlights !== null && Array.isArray(highlights)) {
+      const parts: string[] = []
+      const list = highlights as Object[]
+      for (let i = 0; i < list.length; i++) {
+        if (typeof list[i] === 'string') {
+          const value = (list[i] as string).trim()
+          if (value !== '') {
+            parts.push(value)
+          }
+        }
+      }
+      if (parts.length > 0) {
+        return parts.join('\n\n')
+      }
+    }
+
+    return ''
+  }
+
+  private extractExaSnippet(itemObj: Record<string, Object>): string {
+    const summary = this.readStringFromObject(itemObj, 'summary')
+    if (summary !== '') {
+      return this.normalizeSnippet(summary)
+    }
+
+    const text = this.readStringFromObject(itemObj, 'text')
+    if (text !== '') {
+      return this.normalizeSnippet(text)
+    }
+
+    const highlights = itemObj['highlights']
+    if (highlights !== undefined && highlights !== null && Array.isArray(highlights)) {
+      const list = highlights as Object[]
+      for (let i = 0; i < list.length; i++) {
+        if (typeof list[i] === 'string') {
+          return this.normalizeSnippet(list[i] as string)
+        }
+      }
+    }
+
+    return ''
+  }
+
+  private normalizeSnippet(raw: string): string {
+    const trimmed = raw.replace(/\s+/g, ' ').trim()
+    if (trimmed.length <= 220) {
+      return trimmed
+    }
+    return trimmed.substring(0, 220) + '...'
+  }
+
+  private readStringFromObject(obj: Record<string, Object>, key: string): string {
+    const value = obj[key]
+    if (value === undefined || value === null) {
+      return ''
+    }
+    if (typeof value === 'string') {
+      return value
+    }
+    return ''
+  }
+
+  private limitPromptContent(content: string, maxChars: number): string {
+    if (content.length <= maxChars) {
+      return content
+    }
+    return content.substring(0, maxChars) + '\n\n[搜索上下文已截断]'
+  }
+
+  // 构建给 AI 的内容（限制总长度，避免上下文过大）
+  private buildContentForAI(results: SearchResultItem[]): string {
+    // 引用格式指引贴在搜索结果旁边，比塞进 system 更精准、不调用搜索时 0 token 占用。
+    // 与 BuiltinTools.ets 的工具 description 一致，避免两边出现冲突的指令。
+    let content = '以下是搜索结果。引用搜索结果时请使用标准 Markdown 链接格式 [title](url)，不要写成 [1]、[2] 这类编号。\n\n'
+    const maxChars = 3800
+
+    for (let i = 0; i < results.length; i++) {
+      const item = results[i]
+      const block = `${i + 1}. ${item.title}\n   ${item.snippet}\n   来源: ${item.url}\n\n`
+      if ((content + block).length > maxChars) {
+        content += '[更多结果已省略]\n'
+        break
+      }
+      content += block
+    }
+    return content
+  }
+
+  // ========== Bing 搜索功能 ==========
+  // 执行 Bing 搜索（公开接口，兼容旧调用）
+  async bingSearch(
+    query: string,
+    resultCount: number = 5,
+    runtimeConfig?: SearchRuntimeConfigSnapshot,
+    options?: WebSearchExecutionOptions
+  ): Promise<BingSearchResponse> {
+    const runtime = runtimeConfig !== undefined ? runtimeConfig : await this.getRuntimeConfigSnapshot()
+    const requestId = options?.requestId !== undefined ? options.requestId : ''
+    const controller = this.acquireRequestController(requestId)
+
+    try {
+      return await this.bingSearchInternal(query, resultCount, runtime, controller, options?.cancelCheck)
+    } finally {
+      this.releaseRequestController(requestId)
+    }
+  }
+
+  private async bingSearchInternal(
+    query: string,
+    resultCount: number,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<BingSearchResponse> {
+    try {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      const encodedQuery = encodeURIComponent(query)
+      const primaryUrl = `https://www.bing.com/search?q=${encodedQuery}&setlang=zh-hans`
+      const primaryResponse = await this.bingSearchByUrl(primaryUrl, query, resultCount, runtime, controller, cancelCheck)
+
+      if (this.isCancelled(controller, cancelCheck)) {
+        return new BingSearchResponse(false, query, [], '请求已取消')
+      }
+
+      // 若主域解析失败或结果为空，至少重试一次备用入口
+      const needRetry = !primaryResponse.success || primaryResponse.results.length === 0
+      if (!needRetry) {
+        return primaryResponse
+      }
+
+      const fallbackUrl = `https://cn.bing.com/search?q=${encodedQuery}`
+      const fallbackResponse = await this.bingSearchByUrl(fallbackUrl, query, resultCount, runtime, controller, cancelCheck)
+      if (fallbackResponse.success && fallbackResponse.results.length > 0) {
+        return fallbackResponse
+      }
+
+      if (!primaryResponse.success && fallbackResponse.success) {
+        return fallbackResponse
+      }
+
+      return primaryResponse.success ? primaryResponse : fallbackResponse
+    } catch (error) {
+      return new BingSearchResponse(false, query, [], `Bing 搜索失败: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private async bingSearchByUrl(
+    searchUrl: string,
+    query: string,
+    resultCount: number,
+    runtime: SearchRuntimeConfigSnapshot,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<BingSearchResponse> {
+    if (this.isCancelled(controller, cancelCheck)) {
+      return new BingSearchResponse(false, query, [], '请求已取消')
+    }
+
+    // 反指纹: 带上 Referer + 搜索 cookie, 覆盖默认的 brotli 编码 (HarmonyOS http kit 对 br 解码不稳)
+    const bingHeaders: Record<string, string> = {
+      'Referer': 'https://www.bing.com/',
+      'Cookie': 'SRCHHPGUSR=ULSR=1',
+      'Accept-Encoding': 'gzip, deflate',
+      'Accept-Charset': 'utf-8'
+    }
+    const response = await this.httpService.get(
+      searchUrl,
+      bingHeaders,
+      this.buildHttpOptions(runtime.timeout, controller)
+    )
+
+    if (!response.success) {
+      return new BingSearchResponse(false, query, [], response.errorMessage)
+    }
+
+    if (this.isCancelled(controller, cancelCheck)) {
+      return new BingSearchResponse(false, query, [], '请求已取消')
+    }
+
+    const results = this.parseBingSearchResults(response.data, this.normalizeResultCount(resultCount))
+    return new BingSearchResponse(true, query, results, '')
+  }
+
+  // 解析 Bing 搜索结果页 HTML（多策略，增强鲁棒性）
+  private parseBingSearchResults(html: string, maxCount: number): SearchResultItem[] {
+    const results: SearchResultItem[] = []
+    const seenUrls: Map<string, boolean> = new Map()
+
+    this.collectResultsFromBAlgoBlocks(html, maxCount, results, seenUrls)
+    if (results.length < maxCount) {
+      this.collectResultsFromHeadingLinks(html, maxCount, results, seenUrls)
+    }
+
+    return results
+  }
+
+  private collectResultsFromBAlgoBlocks(
+    html: string,
+    maxCount: number,
+    output: SearchResultItem[],
+    seenUrls: Map<string, boolean>
+  ): void {
+    const algoRegex = /<li[^>]*class=["'][^"']*b_algo[^"']*["'][^>]*>([\s\S]*?)<\/li>/gi
+    let match = algoRegex.exec(html)
+
+    while (match !== null && output.length < maxCount) {
+      const block = match[1]
+      const parsed = this.parseResultFromBlock(block)
+      if (parsed !== null) {
+        const normalizedUrl = parsed.url.trim()
+        if (!seenUrls.has(normalizedUrl)) {
+          seenUrls.set(normalizedUrl, true)
+          output.push(parsed)
+        }
+      }
+      match = algoRegex.exec(html)
+    }
+  }
+
+  private collectResultsFromHeadingLinks(
+    html: string,
+    maxCount: number,
+    output: SearchResultItem[],
+    seenUrls: Map<string, boolean>
+  ): void {
+    const headingRegex = /<h2[^>]*>[\s\S]*?<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>[\s\S]*?<\/h2>/gi
+    let match = headingRegex.exec(html)
+
+    while (match !== null && output.length < maxCount) {
+      const url = match[1]
+      const title = this.stripHtmlTags(match[2]).trim()
+
+      if (title !== '' && !this.isBingInternalUrl(url)) {
+        const normalizedUrl = url.trim()
+        if (!seenUrls.has(normalizedUrl)) {
+          seenUrls.set(normalizedUrl, true)
+          const snippet = this.extractSnippetNearMatch(html, match.index)
+          output.push(new SearchResultItem(title, normalizedUrl, snippet))
+        }
+      }
+
+      match = headingRegex.exec(html)
+    }
+  }
+
+  private parseResultFromBlock(block: string): SearchResultItem | null {
+    const titleMatch = /<h2[^>]*>([\s\S]*?)<\/h2>/i.exec(block)
+    if (!titleMatch) {
+      return null
+    }
+
+    const titleBlock = titleMatch[1]
+    const linkMatch = /<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i.exec(titleBlock)
+    if (!linkMatch) {
+      return null
+    }
+
+    const url = linkMatch[1]
+    const title = this.stripHtmlTags(linkMatch[2]).trim()
+    if (title === '' || this.isBingInternalUrl(url)) {
+      return null
+    }
+
+    let snippetMatch = /<div[^>]*class=["'][^"']*b_caption[^"']*["'][^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i.exec(block)
+    if (!snippetMatch) {
+      snippetMatch = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(block)
+    }
+
+    const snippet = snippetMatch ? this.stripHtmlTags(snippetMatch[1]).trim() : ''
+    return new SearchResultItem(title, url.trim(), snippet)
+  }
+
+  private extractSnippetNearMatch(html: string, startIndex: number): string {
+    const safeStart = startIndex >= 0 ? startIndex : 0
+    const safeEnd = Math.min(html.length, safeStart + 1000)
+    const segment = html.substring(safeStart, safeEnd)
+    const snippetMatch = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(segment)
+    if (!snippetMatch) {
+      return ''
+    }
+    return this.normalizeSnippet(this.stripHtmlTags(snippetMatch[1]).trim())
+  }
+
+  private isBingInternalUrl(url: string): boolean {
+    const lower = url.toLowerCase()
+    return lower.includes('bing.com') || lower.startsWith('/search') || lower.startsWith('/?')
+  }
+
+  // 移除 HTML 标签
+  private stripHtmlTags(text: string): string {
+    return text
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  // ========== URL 抓取功能 ==========
+  // 抓取网页内容
+  async fetchUrlContent(url: string, options?: WebSearchExecutionOptions): Promise<WebSearchResult> {
+    const runtime = options?.runtimeConfig !== undefined ? options.runtimeConfig : await this.getRuntimeConfigSnapshot()
+    const requestId = options?.requestId !== undefined ? options.requestId : ''
+    const controller = this.acquireRequestController(requestId)
+
+    try {
+      const descriptor = getSearchEngineRegistry().getById(runtime.searchEngine)
+      if (descriptor !== undefined && descriptor.supportsScrape) {
+        const apiKeyPrefKey = getSearchEngineRegistry().getApiKeyPrefKey(runtime.searchEngine)
+        const hasApiKey = apiKeyPrefKey === '' || runtime.getConfig(apiKeyPrefKey) !== ''
+
+        if (hasApiKey) {
+          const scrapeHandler = this.scrapeHandlers.get(runtime.searchEngine)
+          if (scrapeHandler !== undefined) {
+            const result = await scrapeHandler(url, runtime, controller, options?.cancelCheck)
+            if (result.success || this.isCancelled(controller, options?.cancelCheck)) {
+              return result
+            }
+            // 抓取失败，fallback 到本地
+            console.warn('WebSearchService',
+              `[${descriptor.label}] Scrape failed, fallback to local: ${result.errorMessage}`)
+            const localResult = await this.fetchUrlContentInternal(url, runtime.timeout, controller, options?.cancelCheck)
+            if (localResult.success) {
+              localResult.sourceName = `${descriptor.label}失败后 URL抓取`
+              return localResult
+            }
+            return new WebSearchResult(
+              false,
+              this.normalizeContentUrl(url),
+              '',
+              '',
+              `${descriptor.label} 失败: ${result.errorMessage}; 本地 URL 抓取失败: ${localResult.errorMessage}`,
+              undefined,
+              descriptor.label
+            )
+          }
+        }
+      }
+
+      return await this.fetchUrlContentInternal(url, runtime.timeout, controller, options?.cancelCheck)
+    } finally {
+      this.releaseRequestController(requestId)
+    }
+  }
+
+  private async fetchUrlContentInternal(
+    url: string,
+    timeout: number,
+    controller: HttpRequestController | null,
+    cancelCheck?: () => boolean
+  ): Promise<WebSearchResult> {
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledWebResult(url)
+    }
+
+    if (!this.isValidUrl(url)) {
+      return new WebSearchResult(false, url, '', '', 'URL 格式无效')
+    }
+
+    const fullUrl = this.normalizeContentUrl(url)
+
+    const response = await this.httpService.get(
+      fullUrl,
+      {},
+      this.buildHttpOptions(timeout, controller)
+    )
+
+    if (!response.success) {
+      if (this.isCancelled(controller, cancelCheck)) {
+        return this.buildCancelledWebResult(fullUrl)
+      }
+      return new WebSearchResult(false, fullUrl, '', '', response.errorMessage)
+    }
+
+    if (this.isCancelled(controller, cancelCheck)) {
+      return this.buildCancelledWebResult(fullUrl)
+    }
+
+    const parsed = this.parseHtmlContent(response.data)
+    if (parsed.content.trim() === '') {
+      return new WebSearchResult(false, fullUrl, parsed.title, '', '本地 URL 抓取未提取到网页正文', undefined, 'URL抓取')
+    }
+    return new WebSearchResult(true, fullUrl, parsed.title, parsed.content, '', undefined, 'URL抓取')
+  }
+
+  private normalizeContentUrl(url: string): string {
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return 'https://' + url
+    }
+    return url
+  }
+
+  // 解析 HTML 提取正文
+  private parseHtmlContent(html: string): HtmlParseResult {
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i)
+    const title = titleMatch ? titleMatch[1].trim() : '未知标题'
+
+    const cleanHtml = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+      .replace(/<br\s*\/?>/gi, '\n')
+
+    const contentMatches = cleanHtml.match(/<(p|h[1-6]|li|td|th|span)[^>]*>([\s\S]*?)<\/\1>/gi)
+
+    let content = ''
+    if (contentMatches) {
+      content = contentMatches
+        .map((match: string): string => match
+          .replace(/<[^>]+>/g, '')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
+          .replace(/\n+/g, '\n')
+          .trim())
+        .filter((text: string): boolean => {
+          if (text.length > 10) {
+            return true
+          }
+          if (/(℃|°|AQI|PM2\.5|\d+\s*-\s*\d+)/i.test(text)) {
+            return true
+          }
+          return false
+        })
+        .join('\n')
+    }
+
+    const maxContentLength = 8000
+    if (content.length > maxContentLength) {
+      content = content.substring(0, maxContentLength) + '...'
+    }
+
+    return new HtmlParseResult(title, content)
+  }
+
+  // 验证 URL 格式
+  isValidUrl(text: string): boolean {
+    const urlPattern = /^https?:\/\/[\w\-.]+(:\d+)?(\/[\w\-._~:/?#[\]@!$&'()*+,;=]*)?$|^[\w\-.]+(:\d+)?(\/[\w\-._~:/?#[\]@!$&'()*+,;=]*)?$/
+    return urlPattern.test(text.trim())
+  }
+
+  // 从文本中提取 URL
+  extractUrl(text: string): string | null {
+    const trimmed = text.trim()
+
+    const httpPattern = /^https?:\/\/[^\s]+/
+    const httpMatch = trimmed.match(httpPattern)
+    if (httpMatch) {
+      return httpMatch[0]
+    }
+
+    const domainPattern = /^[\w\-]+\.[\w\-]+(:\d+)?(\/[\w\-._~:/?#[\]@!$&'()*+,;=]*)?/
+    const domainMatch = trimmed.match(domainPattern)
+    if (domainMatch) {
+      return domainMatch[0]
+    }
+
+    return null
+  }
+}
+
+export function getWebSearchService(): WebSearchService {
+  return WebSearchService.getInstance()
+}

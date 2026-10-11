@@ -1,0 +1,148 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#FAF8F3"
+    },
+    {
+      "name": "primary",
+      "value": "#4E6F9E"
+    },
+    {
+      "name": "primary_light",
+      "value": "#D8E2EE"
+    },
+    {
+      "name": "background",
+      "value": "#FAF8F3"
+    },
+    {
+      "name": "surface",
+      "value": "#FFFDF8"
+    },
+    {
+      "name": "text_primary",
+      "value": "#24211C"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#6F6A60"
+    },
+    {
+      "name": "text_tertiary",
+      "value": "#8A8178"
+    },
+    {
+      "name": "divider",
+      "value": "#DED8CC"
+    },
+    {
+      "name": "brand_openai",
+      "value": "#202123"
+    },
+    {
+      "name": "brand_anthropic",
+      "value": "#D97757"
+    },
+    {
+      "name": "brand_azure",
+      "value": "#0078D4"
+    },
+    {
+      "name": "brand_deepseek",
+      "value": "#4E46DC"
+    },
+    {
+      "name": "brand_google",
+      "value": "#4285F4"
+    },
+    {
+      "name": "brand_custom",
+      "value": "#6B7280"
+    },
+    {
+      "name": "status_success",
+      "value": "#22C55E"
+    },
+    {
+      "name": "status_error",
+      "value": "#EF4444"
+    },
+    {
+      "name": "chat_user_bubble",
+      "value": "#52688A"
+    },
+    {
+      "name": "chat_ai_bubble",
+      "value": "#FFFDF8"
+    },
+    {
+      "name": "code_background",
+      "value": "#F3EFE8"
+    },
+    {
+      "name": "markdown_title",
+      "value": "#24211C"
+    },
+    {
+      "name": "markdown_text",
+      "value": "#3D3830"
+    },
+    {
+      "name": "markdown_quote_bg",
+      "value": "#F3EFE8"
+    },
+    {
+      "name": "markdown_link",
+      "value": "#4E6F9E"
+    },
+    {
+      "name": "markdown_link_bg",
+      "value": "#00000000"
+    },
+    {
+      "name": "markdown_code_bg",
+      "value": "#F3EFE8"
+    },
+    {
+      "name": "markdown_code_text",
+      "value": "#8F5E45"
+    },
+    {
+      "name": "markdown_table_bg",
+      "value": "#FFFDF8"
+    },
+    {
+      "name": "markdown_table_header_bg",
+      "value": "#F3EFE8"
+    },
+    {
+      "name": "markdown_table_alt_bg",
+      "value": "#FAF7F0"
+    },
+    {
+      "name": "markdown_table_border",
+      "value": "#DED8CC"
+    },
+    {
+      "name": "toolbar_btn_bg",
+      "value": "#08000000"
+    },
+    {
+      "name": "bubble_border",
+      "value": "#0F000000"
+    },
+    {
+      "name": "top_navigation_blur_origin",
+      "value": "#00FAF8F3"
+    },
+    {
+      "name": "top_navigation_blur_scrolled",
+      "value": "#E6FAF8F3"
+    },
+    {
+      "name": "model_icon_bg",
+      "value": "#F5F5F5"
+    }
+  ]
+}

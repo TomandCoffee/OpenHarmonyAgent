@@ -1,0 +1,3806 @@
+import { relationalStore } from '@kit.ArkData'
+import { Context } from '@kit.AbilityKit'
+import {
+  ChatMessage,
+  ChatSession,
+  MessageRole,
+  ModelProvider,
+  MessageAttachment,
+  AttachmentType,
+  SearchReference,
+  SessionTitleSource
+} from '../models/ChatModels'
+import { Assistant, DEFAULT_ASSISTANT_ID, createDefaultAssistant } from '../models/AssistantModels'
+import { GeneratedMedia, GeneratedMediaType } from '../models/ImageGenerationModels'
+import { deserializeMessageParts, serializeMessageParts } from '../models/MessageParts'
+import { ensureMessageParts, buildMessagePartsFromLegacy } from '../utils/ChatMessagePartsHelper'
+import { DEFAULT_PRIMARY_COLOR } from '../config/ThemeDefaults'
+import { generateDefaultTextIcon } from '../utils/IconGeneratorUtils'
+import { isPresetProvider, getPresetProviderById } from '../config/PresetProviders'
+import { AppError, AppErrorCode, toErrorDetail } from '../models/AppError'
+import { AppStorageKeys } from '../config/AppStorageKeys'
+import { setAppUiStateValue } from '../state/AppUiState'
+
+// 数据库配置
+const DB_CONFIG: relationalStore.StoreConfig = {
+  name: 'chatbox.db',
+  securityLevel: relationalStore.SecurityLevel.S1
+}
+const DB_BATCH_CHUNK_SIZE = 200
+
+// 表名常量
+export class TableNames {
+  static readonly SESSIONS: string = 'chat_sessions'
+  static readonly MESSAGES: string = 'messages'
+	  static readonly PROVIDERS: string = 'providers'
+	  static readonly ATTACHMENTS: string = 'message_attachments'
+	  static readonly TOOL_EVENTS: string = 'tool_events'
+	  static readonly ASSISTANTS: string = 'assistants'
+  static readonly GENERATED_MEDIA: string = 'generated_media'
+  static readonly TOKEN_USAGE_EVENTS: string = 'token_usage_events'
+	}
+
+// 模型数据接口（用于 JSON 序列化，兼容扩展格式）
+interface ModelJsonData {
+  id: string
+  name: string
+  contextLength: number
+  isEnabled: boolean
+  isRecommended: boolean
+  // 扩展字段（可选，用于向后兼容）
+  modelType?: string
+  inputMode?: string
+  outputMode?: string
+  capabilities?: CapabilitiesJsonData
+  capabilitiesUserModified?: boolean
+}
+
+// 能力配置 JSON 数据
+interface CapabilitiesJsonData {
+  supportsTools: boolean
+  supportsReasoning: boolean
+  supportsWebSearch: boolean
+  supportsVision: boolean
+  supportsStreaming: boolean
+}
+
+// 参数配置 JSON 数据(已废弃,2026/05 后所有采样参数已移到助手层,新写入不再带 parameters 字段)
+
+// 搜索引用 JSON 数据接口（用于序列化）
+interface SearchReferenceJsonData {
+  id: string
+  title: string
+  url: string
+  snippet: string
+  timestamp: number
+}
+
+interface DraftAttachmentJsonData {
+  id: string
+  type: string
+  name: string
+  filePath: string
+  mimeType: string
+  size: number
+  processState?: string
+  parseEngine?: string
+  parsedText?: string
+  parseError?: string
+}
+
+// 数据库服务 - 单例模式
+export class DatabaseService {
+  private static instance: DatabaseService | null = null
+  private rdbStore: relationalStore.RdbStore | null = null
+  private isInitialized: boolean = false
+  private initPromise: Promise<void> | null = null
+  private legacySummaryRepairPromise: Promise<void> | null = null
+  private pendingLegacySummaryRepairIds: string[] = []
+
+  private constructor() {
+  }
+
+  static getInstance(): DatabaseService {
+    if (DatabaseService.instance === null) {
+      DatabaseService.instance = new DatabaseService()
+    }
+    return DatabaseService.instance
+  }
+
+  async initialize(context: Context): Promise<void> {
+    if (this.isInitialized) {
+      return
+    }
+    if (this.initPromise !== null) {
+      await this.initPromise
+      return
+    }
+    this.initPromise = this.doInitialize(context)
+    try {
+      await this.initPromise
+    } finally {
+      this.initPromise = null
+    }
+  }
+
+  private async doInitialize(context: Context): Promise<void> {
+    try {
+      this.rdbStore = await relationalStore.getRdbStore(context, DB_CONFIG)
+      await this.createTables()
+      this.isInitialized = true
+    } catch (error) {
+      console.error('DatabaseService', `Failed to initialize database: ${JSON.stringify(error)}`)
+      throw new AppError(
+        AppErrorCode.DATABASE_INIT_FAILED,
+        '数据库初始化失败',
+        toErrorDetail(error as Object),
+        false
+      )
+    }
+  }
+
+  private async waitForInitialization(): Promise<void> {
+    // 如果已经初始化完成，直接返回
+    if (this.isInitialized) {
+      return
+    }
+    // 如果正在初始化，等待初始化完成
+    if (this.initPromise !== null) {
+      await this.initPromise
+      return
+    }
+    // 如果 initPromise 为 null 但 isInitialized 为 false，说明初始化还未开始
+    // 使用轮询等待机制，最长等待 5 秒
+    const maxWaitTime = 5000
+    const pollInterval = 50
+    let waited = 0
+    while (!this.isInitialized && waited < maxWaitTime) {
+      await new Promise<void>((resolve) => setTimeout(resolve, pollInterval))
+      waited += pollInterval
+      // 如果初始化已经开始，直接等待其完成
+      if (this.initPromise !== null) {
+        await this.initPromise
+        return
+      }
+    }
+    if (!this.isInitialized) {
+      console.warn('DatabaseService', '等待数据库初始化超时，数据加载可能失败')
+    }
+  }
+
+  private async createTables(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+
+    // 创建会话表
+    const createSessionsTable = `
+      CREATE TABLE IF NOT EXISTS ${TableNames.SESSIONS} (
+        id TEXT PRIMARY KEY,
+	        title TEXT,
+	        model_id TEXT,
+	        provider_id TEXT,
+	        assistant_id TEXT DEFAULT 'default',
+	        created_at INTEGER,
+        updated_at INTEGER,
+        is_favorite INTEGER DEFAULT 0,
+        last_message_preview TEXT DEFAULT '',
+        message_count INTEGER DEFAULT 0,
+        draft_text TEXT DEFAULT '',
+        draft_attachments_json TEXT DEFAULT '',
+        suggested_questions_json TEXT DEFAULT '',
+        title_source TEXT DEFAULT 'manual',
+        sync_version INTEGER DEFAULT 0,
+        last_modified INTEGER DEFAULT 0,
+        sync_status TEXT DEFAULT 'synced',
+        device_id TEXT DEFAULT ''
+	      )
+	    `
+
+	    const createAssistantsTable = `
+	      CREATE TABLE IF NOT EXISTS ${TableNames.ASSISTANTS} (
+	        id TEXT PRIMARY KEY,
+	        name TEXT,
+	        avatar_symbol TEXT,
+	        color TEXT,
+	        system_prompt TEXT,
+	        default_provider_id TEXT,
+	        default_model_id TEXT,
+	        default_model_name TEXT,
+	        temperature_enabled INTEGER DEFAULT 0,
+	        temperature REAL DEFAULT 0.7,
+	        top_p_enabled INTEGER DEFAULT 0,
+	        top_p REAL DEFAULT 1.0,
+	        presence_penalty_enabled INTEGER DEFAULT 0,
+	        presence_penalty REAL DEFAULT 0,
+	        frequency_penalty_enabled INTEGER DEFAULT 0,
+	        frequency_penalty REAL DEFAULT 0,
+	        reasoning_level_preference TEXT DEFAULT '',
+	        enabled_tool_ids_json TEXT DEFAULT '',
+	        is_default INTEGER DEFAULT 0,
+	        created_at INTEGER,
+	        updated_at INTEGER,
+	        sort_order INTEGER DEFAULT 0
+	      )
+	    `
+
+    // 创建消息表
+    const createMessagesTable = `
+      CREATE TABLE IF NOT EXISTS ${TableNames.MESSAGES} (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        role TEXT,
+        content TEXT,
+        model_name TEXT,
+        timestamp INTEGER,
+        reasoning_content TEXT,
+        reasoning_signature_blob TEXT DEFAULT '',
+        parts_json TEXT DEFAULT '',
+        prompt_tokens INTEGER DEFAULT 0,
+        completion_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        FOREIGN KEY (session_id) REFERENCES ${TableNames.SESSIONS}(id)
+      )
+    `
+
+    // 创建服务商配置表
+    const createProvidersTable = `
+      CREATE TABLE IF NOT EXISTS ${TableNames.PROVIDERS} (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        type TEXT,
+        api_style TEXT,
+        openai_transport TEXT DEFAULT 'chat_completions',
+        api_key TEXT,
+        requires_api_key INTEGER DEFAULT 1,
+        base_url TEXT,
+        is_enabled INTEGER,
+        models_json TEXT,
+        icon_symbol TEXT,
+        brand_color TEXT,
+        sort_order INTEGER DEFAULT 0,
+        is_preset INTEGER DEFAULT 0,
+        icon_path TEXT DEFAULT '',
+        custom_headers_json TEXT DEFAULT ''
+      )
+    `
+
+    // 创建附件表
+    const createAttachmentsTable = `
+      CREATE TABLE IF NOT EXISTS ${TableNames.ATTACHMENTS} (
+        id TEXT PRIMARY KEY,
+        message_id TEXT,
+        type TEXT,
+        name TEXT,
+        file_path TEXT,
+        mime_type TEXT,
+        size INTEGER,
+        process_state TEXT DEFAULT 'idle',
+        parse_engine TEXT DEFAULT '',
+        parsed_text TEXT DEFAULT '',
+        parse_error TEXT DEFAULT '',
+        FOREIGN KEY (message_id) REFERENCES ${TableNames.MESSAGES}(id)
+      )
+    `
+
+    // 创建工具事件表
+    const createToolEventsTable = `
+      CREATE TABLE IF NOT EXISTS ${TableNames.TOOL_EVENTS} (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        message_id TEXT,
+        tool_call_id TEXT,
+        tool_name TEXT,
+        tool_display_name TEXT DEFAULT '',
+        source_label TEXT DEFAULT '',
+        source_type TEXT DEFAULT '',
+        permission_level TEXT DEFAULT 'read',
+        tool_arguments TEXT,
+        tool_result TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at INTEGER,
+        completed_at INTEGER,
+        FOREIGN KEY (session_id) REFERENCES ${TableNames.SESSIONS}(id),
+        FOREIGN KEY (message_id) REFERENCES ${TableNames.MESSAGES}(id)
+      )
+    `
+
+    const createGeneratedMediaTable = `
+      CREATE TABLE IF NOT EXISTS ${TableNames.GENERATED_MEDIA} (
+        id TEXT PRIMARY KEY,
+        type TEXT,
+        prompt TEXT,
+        provider_id TEXT,
+        provider_name TEXT,
+        model_id TEXT,
+        model_name TEXT,
+        file_path TEXT,
+        mime_type TEXT,
+        aspect_ratio TEXT,
+        source_paths_json TEXT,
+        request_options_json TEXT DEFAULT '',
+        actual_options_json TEXT DEFAULT '',
+        revised_prompt TEXT DEFAULT '',
+        created_at INTEGER
+      )
+    `
+
+    // Token 用量账本:只追加,一行=一次生成(流式收割点写入一条)。
+    // 与会话/消息表解耦,重新生成或删除消息都不回收已发生的真实消耗,用于"实际累计消耗"口径的 token 统计。
+    const createTokenUsageEventsTable = `
+      CREATE TABLE IF NOT EXISTS ${TableNames.TOKEN_USAGE_EVENTS} (
+        id TEXT PRIMARY KEY,
+        session_id TEXT DEFAULT '',
+        message_id TEXT DEFAULT '',
+        provider_id TEXT DEFAULT '',
+        model_id TEXT DEFAULT '',
+        model_name TEXT DEFAULT '',
+        prompt_tokens INTEGER DEFAULT 0,
+        completion_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        kind TEXT DEFAULT 'chat',
+        created_at INTEGER
+      )
+    `
+    try {
+      await this.rdbStore.executeSql(createSessionsTable)
+	      await this.rdbStore.executeSql(createMessagesTable)
+	      await this.rdbStore.executeSql(createAssistantsTable)
+      await this.rdbStore.executeSql(createProvidersTable)
+      await this.rdbStore.executeSql(createAttachmentsTable)
+      await this.rdbStore.executeSql(createToolEventsTable)
+      await this.rdbStore.executeSql(createGeneratedMediaTable)
+      await this.rdbStore.executeSql(
+        `CREATE INDEX IF NOT EXISTS idx_generated_media_created_at ON ${TableNames.GENERATED_MEDIA}(created_at DESC)`
+      )
+      await this.rdbStore.executeSql(createTokenUsageEventsTable)
+      await this.rdbStore.executeSql(
+        `CREATE INDEX IF NOT EXISTS idx_token_usage_events_created_at ON ${TableNames.TOKEN_USAGE_EVENTS}(created_at DESC)`
+      )
+      // 尝试添加 sort_order 字段（如果表已存在但没有该字段）
+      await this.addSortOrderColumnIfNeeded()
+      // 尝试添加 reasoning_content 字段（用于推理模型）
+      await this.addReasoningContentColumnIfNeeded()
+      // 尝试添加 reasoning_signature_blob 字段(用于 OpenAI Responses 跨轮保持推理状态)
+      await this.addReasoningSignatureBlobColumnIfNeeded()
+      // 尝试添加 parts_json 字段(消息的有序 parts 持久化)
+      await this.addMessagePartsJsonColumnIfNeeded()
+      // 尝试添加 is_preset 和 icon_path 字段（用于供应商图标管理）
+      await this.addProviderIconColumnsIfNeeded()
+      await this.addApiPathColumnIfNeeded()
+      await this.addOpenAITransportColumnIfNeeded()
+      await this.addProviderCustomHeadersColumnIfNeeded()
+      await this.addProviderRequiresApiKeyColumnIfNeeded()
+      await this.addGeneratedMediaOptionColumnsIfNeeded()
+      await this.addAttachmentParseColumnsIfNeeded()
+      // 尝试添加同步相关字段（为 WebDAV 同步预留）
+      await this.addSyncColumnsIfNeeded()
+      // 尝试添加会话元信息字段（用于会话列表增强）
+      await this.addSessionMetaColumnsIfNeeded()
+	      // 尝试添加草稿字段（用于会话级草稿恢复）
+	      await this.addSessionDraftColumnsIfNeeded()
+	      await this.addSessionAssistantColumnIfNeeded()
+      await this.addSessionSuggestedQuestionsColumnIfNeeded()
+      await this.addSessionTitleSourceColumnIfNeeded()
+	      // 尝试添加搜索引用相关字段（用于联网搜索）
+	      await this.addSearchColumnsIfNeeded()
+      // 尝试添加工具事件元数据字段（用于通用 tools/MCP）
+      await this.addToolEventMetaColumnsIfNeeded()
+      // 尝试添加消息 model_id 字段（用于图标匹配）
+      await this.addMessageModelIdColumnIfNeeded()
+      // 尝试添加消息 token 用量字段(prompt/completion/total,用于使用统计)
+      await this.addMessageTokenColumnsIfNeeded()
+      // 尝试添加助手采样参数列(top_p / presence_penalty / frequency_penalty)
+      await this.addAssistantSamplingColumnsIfNeeded()
+	      // 迁移现有供应商数据
+	      await this.migrateExistingProviders()
+	      await this.ensureDefaultAssistant()
+      // 迁移历史消息: 为 parts_json 为空的助手消息填充 parts
+      await this.migrateMessagePartsIfNeeded()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to create tables: ${JSON.stringify(error)}`)
+      throw new AppError(
+        AppErrorCode.DATABASE_SCHEMA_INIT_FAILED,
+        '数据库表结构初始化失败',
+        toErrorDetail(error as Object),
+        false
+      )
+    }
+  }
+
+  // 添加 sort_order 字段（用于数据库升级）
+  private async addSortOrderColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN sort_order INTEGER DEFAULT 0`)
+    } catch (error) {
+      // 如果字段已存在，会抛出错误，忽略即可
+      console.info('DatabaseService', 'sort_order column may already exist')
+    }
+  }
+
+  // 添加 reasoning_content 字段（用于推理模型）
+  private async addReasoningContentColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN reasoning_content TEXT DEFAULT ''`)
+    } catch (error) {
+      // 如果字段已存在，会抛出错误，忽略即可
+      console.info('DatabaseService', 'reasoning_content column may already exist')
+    }
+  }
+
+  // 添加 reasoning_signature_blob 字段(用于 OpenAI Responses 跨轮保持推理状态)
+  private async addReasoningSignatureBlobColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN reasoning_signature_blob TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'reasoning_signature_blob column may already exist')
+    }
+  }
+
+  // 添加 parts_json 字段(消息有序 parts 的 JSON 持久化)
+  private async addMessagePartsJsonColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN parts_json TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'parts_json column may already exist')
+    }
+  }
+
+  // 添加消息 token 用量字段(prompt_tokens / completion_tokens / total_tokens,用于使用统计)
+  private async addMessageTokenColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN prompt_tokens INTEGER DEFAULT 0`)
+    } catch (_error) {
+      console.info('DatabaseService', 'prompt_tokens column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN completion_tokens INTEGER DEFAULT 0`)
+    } catch (_error) {
+      console.info('DatabaseService', 'completion_tokens column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN total_tokens INTEGER DEFAULT 0`)
+    } catch (_error) {
+      console.info('DatabaseService', 'total_tokens column may already exist')
+    }
+  }
+
+  private async addGeneratedMediaOptionColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.GENERATED_MEDIA} ADD COLUMN request_options_json TEXT DEFAULT ''`)
+    } catch (_error) {
+      console.info('DatabaseService', 'request_options_json column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.GENERATED_MEDIA} ADD COLUMN actual_options_json TEXT DEFAULT ''`)
+    } catch (_error) {
+      console.info('DatabaseService', 'actual_options_json column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.GENERATED_MEDIA} ADD COLUMN revised_prompt TEXT DEFAULT ''`)
+    } catch (_error) {
+      console.info('DatabaseService', 'revised_prompt column may already exist')
+    }
+  }
+
+  // 迁移历史消息: 为 parts_json 为空的助手消息从旧字段合成 parts 并持久化
+  private async migrateMessagePartsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+      predicates.equalTo('role', 'assistant')
+      predicates.equalTo('parts_json', '')
+      const resultSet = await this.rdbStore.query(predicates)
+      let count = 0
+      try {
+        while (resultSet.goToNextRow()) {
+          const message = this.buildChatMessageFromResultSet(resultSet)
+          if (message.content.trim() === '' && message.reasoningContent.trim() === '' &&
+            message.searchReferences.length === 0) {
+            continue
+          }
+          const parts = buildMessagePartsFromLegacy(message)
+          if (parts.length === 0) {
+            continue
+          }
+          const partsJson = serializeMessageParts(parts)
+          const updateBucket: relationalStore.ValuesBucket = { parts_json: partsJson }
+          const updatePredicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+          updatePredicates.equalTo('id', message.id)
+          await this.rdbStore.update(updateBucket, updatePredicates)
+          count++
+        }
+      } finally {
+        resultSet.close()
+      }
+      if (count > 0) {
+        console.info('DatabaseService', `Migrated parts for ${count} messages`)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to migrate message parts: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 添加 is_preset 和 icon_path 字段（用于供应商图标管理）
+  private async addProviderIconColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN is_preset INTEGER DEFAULT 0`)
+    } catch (error) {
+      console.info('DatabaseService', 'is_preset column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN icon_path TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'icon_path column may already exist')
+    }
+    // 添加图标类型相关字段
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN icon_type TEXT DEFAULT 'svg'`)
+    } catch (error) {
+      console.info('DatabaseService', 'icon_type column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN text_icon TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'text_icon column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN text_icon_bg_color TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'text_icon_bg_color column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN custom_image_path TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'custom_image_path column may already exist')
+    }
+  }
+
+  // 迁移现有供应商数据（为图标类型字段设置默认值）
+  private async migrateExistingProviders(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      // 查询所有供应商
+      const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+      const resultSet = await this.rdbStore.query(predicates)
+
+      while (resultSet.goToNextRow()) {
+        const id = resultSet.getString(resultSet.getColumnIndex('id'))
+        const type = resultSet.getString(resultSet.getColumnIndex('type'))
+        let iconType = ''
+        try {
+          iconType = resultSet.getString(resultSet.getColumnIndex('icon_type'))
+        } catch (e) {
+          iconType = ''
+        }
+        let requiresApiKey = true
+        try {
+          requiresApiKey = resultSet.getLong(resultSet.getColumnIndex('requires_api_key')) === 1
+        } catch (e) {
+          requiresApiKey = true
+        }
+
+        if ((id === 'ollama' || type === 'ollama' || type === 'lmstudio') && requiresApiKey) {
+          const updatePredicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+          updatePredicates.equalTo('id', id)
+          const valueBucket: relationalStore.ValuesBucket = {
+            'requires_api_key': 0
+          }
+          await this.rdbStore.update(valueBucket, updatePredicates)
+          requiresApiKey = false
+        }
+
+        // 预设供应商：强制迁移为 TEXT 类型
+        if (isPresetProvider(id)) {
+          const preset = getPresetProviderById(id)
+          if (preset !== null && (iconType === '' || iconType === 'svg')) {
+            const updatePredicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+            updatePredicates.equalTo('id', id)
+            const valueBucket: relationalStore.ValuesBucket = {
+              'icon_type': 'text',
+              'icon_path': '',
+              'text_icon': preset.textIcon,
+              'text_icon_bg_color': preset.textIconBgColor
+            }
+            await this.rdbStore.update(valueBucket, updatePredicates)
+          }
+          continue
+        }
+
+        // 非预设供应商：保持原有逻辑
+        if (iconType === '' || iconType === 'svg') {
+          const iconPath = resultSet.getString(resultSet.getColumnIndex('icon_path'))
+          const name = resultSet.getString(resultSet.getColumnIndex('name'))
+
+          if (iconPath !== '' && iconPath !== null) {
+            const updatePredicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+            updatePredicates.equalTo('id', id)
+            const valueBucket: relationalStore.ValuesBucket = {
+              'icon_type': 'svg'
+            }
+            await this.rdbStore.update(valueBucket, updatePredicates)
+          } else {
+            const config = generateDefaultTextIcon(name)
+            const updatePredicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+            updatePredicates.equalTo('id', id)
+            const valueBucket: relationalStore.ValuesBucket = {
+              'icon_type': 'text',
+              'text_icon': config.text,
+              'text_icon_bg_color': config.bgColor
+            }
+            await this.rdbStore.update(valueBucket, updatePredicates)
+          }
+        }
+      }
+
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to migrate providers: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 添加 api_path 字段（用于自定义 API 路径）
+  private async addApiPathColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN api_path TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'api_path column may already exist')
+    }
+  }
+
+  private async addProviderRequiresApiKeyColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN requires_api_key INTEGER DEFAULT 1`)
+    } catch (error) {
+      console.info('DatabaseService', 'requires_api_key column may already exist')
+    }
+  }
+
+  // 添加同步相关字段（为 WebDAV 同步预留）
+  private async addSyncColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN sync_version INTEGER DEFAULT 0`)
+    } catch (error) {
+      console.info('DatabaseService', 'sync_version column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN last_modified INTEGER DEFAULT 0`)
+    } catch (error) {
+      console.info('DatabaseService', 'last_modified column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN sync_status TEXT DEFAULT 'synced'`)
+    } catch (error) {
+      console.info('DatabaseService', 'sync_status column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN device_id TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'device_id column may already exist')
+    }
+  }
+
+  // 添加会话元信息字段（用于会话列表增强）
+  private async addSessionMetaColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN is_favorite INTEGER DEFAULT 0`)
+    } catch (error) {
+      console.info('DatabaseService', 'is_favorite column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN last_message_preview TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'last_message_preview column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN message_count INTEGER DEFAULT 0`)
+    } catch (error) {
+      console.info('DatabaseService', 'message_count column may already exist')
+    }
+  }
+
+	  private async addSessionDraftColumnsIfNeeded(): Promise<void> {
+	    if (this.rdbStore === null) {
+	      return
+	    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN draft_text TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'draft_text column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(
+        `ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN draft_attachments_json TEXT DEFAULT ''`
+      )
+    } catch (error) {
+      console.info('DatabaseService', 'draft_attachments_json column may already exist')
+	    }
+	  }
+
+	  private async addSessionAssistantColumnIfNeeded(): Promise<void> {
+	    if (this.rdbStore === null) {
+	      return
+	    }
+	    try {
+	      await this.rdbStore.executeSql(
+	        `ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN assistant_id TEXT DEFAULT '${DEFAULT_ASSISTANT_ID}'`
+	      )
+	    } catch (error) {
+	      console.info('DatabaseService', 'assistant_id column may already exist')
+	    }
+	    try {
+	      await this.rdbStore.executeSql(
+	        `UPDATE ${TableNames.SESSIONS} SET assistant_id = '${DEFAULT_ASSISTANT_ID}' WHERE assistant_id IS NULL OR assistant_id = ''`
+	      )
+	    } catch (error) {
+	      console.info('DatabaseService', 'assistant_id backfill skipped')
+	    }
+	  }
+
+  private async addSessionSuggestedQuestionsColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(
+        `ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN suggested_questions_json TEXT DEFAULT ''`
+      )
+    } catch (error) {
+      console.info('DatabaseService', 'suggested_questions_json column may already exist')
+    }
+  }
+
+  private async addSessionTitleSourceColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(
+        `ALTER TABLE ${TableNames.SESSIONS} ADD COLUMN title_source TEXT DEFAULT '${SessionTitleSource.MANUAL}'`
+      )
+    } catch (error) {
+      console.info('DatabaseService', 'title_source column may already exist')
+    }
+  }
+
+  private async addAttachmentParseColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.ATTACHMENTS} ADD COLUMN process_state TEXT DEFAULT 'idle'`)
+    } catch (error) {
+      console.info('DatabaseService', 'process_state column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.ATTACHMENTS} ADD COLUMN parse_engine TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'parse_engine column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.ATTACHMENTS} ADD COLUMN parsed_text TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'parsed_text column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.ATTACHMENTS} ADD COLUMN parse_error TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'parse_error column may already exist')
+    }
+  }
+
+	  private assistantToValueBucket(assistant: Assistant, includeId: boolean = true): relationalStore.ValuesBucket {
+	    const now = Date.now()
+	    if (assistant.updatedAt <= 0) {
+	      assistant.updatedAt = now
+	    }
+	    if (assistant.createdAt <= 0) {
+	      assistant.createdAt = now
+	    }
+	    const valueBucket: relationalStore.ValuesBucket = {
+	      name: assistant.name,
+	      avatar_symbol: assistant.avatarSymbol,
+	      color: assistant.color,
+	      system_prompt: assistant.systemPrompt,
+	      default_provider_id: assistant.defaultProviderId,
+	      default_model_id: assistant.defaultModelId,
+	      default_model_name: assistant.defaultModelName,
+	      temperature_enabled: assistant.temperatureEnabled ? 1 : 0,
+	      temperature: assistant.temperature,
+	      top_p_enabled: assistant.topPEnabled ? 1 : 0,
+	      top_p: assistant.topP,
+	      presence_penalty_enabled: assistant.presencePenaltyEnabled ? 1 : 0,
+	      presence_penalty: assistant.presencePenalty,
+	      frequency_penalty_enabled: assistant.frequencyPenaltyEnabled ? 1 : 0,
+	      frequency_penalty: assistant.frequencyPenalty,
+	      enabled_tool_ids_json: JSON.stringify(assistant.enabledToolIds || []),
+	      context_message_count: assistant.contextMessageCount || 0,
+	      max_output_tokens: assistant.maxOutputTokens || 0,
+	      is_default: assistant.isDefault ? 1 : 0,
+	      created_at: assistant.createdAt,
+	      updated_at: assistant.updatedAt,
+	      sort_order: assistant.sortOrder
+	    }
+	    if (includeId) {
+	      valueBucket.id = assistant.id
+	    }
+	    return valueBucket
+	  }
+
+	  private buildAssistantFromResultSet(resultSet: relationalStore.ResultSet): Assistant {
+	    const assistant = new Assistant(
+	      this.safeGetString(resultSet, 'id'),
+	      this.safeGetString(resultSet, 'name')
+	    )
+	    assistant.avatarSymbol = this.safeGetString(resultSet, 'avatar_symbol', 'AI')
+	    assistant.color = this.safeGetString(resultSet, 'color', DEFAULT_PRIMARY_COLOR)
+	    assistant.systemPrompt = this.safeGetString(resultSet, 'system_prompt')
+	    assistant.defaultProviderId = this.safeGetString(resultSet, 'default_provider_id')
+	    assistant.defaultModelId = this.safeGetString(resultSet, 'default_model_id')
+	    assistant.defaultModelName = this.safeGetString(resultSet, 'default_model_name')
+	    try {
+	      assistant.temperatureEnabled = resultSet.getLong(resultSet.getColumnIndex('temperature_enabled')) === 1
+	    } catch (error) {
+	      assistant.temperatureEnabled = false
+	    }
+	    try {
+	      assistant.temperature = resultSet.getDouble(resultSet.getColumnIndex('temperature'))
+	    } catch (error) {
+	      assistant.temperature = 0.7
+	    }
+	    try {
+	      assistant.topPEnabled = resultSet.getLong(resultSet.getColumnIndex('top_p_enabled')) === 1
+	    } catch (error) {
+	      assistant.topPEnabled = false
+	    }
+	    try {
+	      assistant.topP = resultSet.getDouble(resultSet.getColumnIndex('top_p'))
+	    } catch (error) {
+	      assistant.topP = 1.0
+	    }
+	    try {
+	      assistant.presencePenaltyEnabled = resultSet.getLong(resultSet.getColumnIndex('presence_penalty_enabled')) === 1
+	    } catch (error) {
+	      assistant.presencePenaltyEnabled = false
+	    }
+	    try {
+	      assistant.presencePenalty = resultSet.getDouble(resultSet.getColumnIndex('presence_penalty'))
+	    } catch (error) {
+	      assistant.presencePenalty = 0
+	    }
+	    try {
+	      assistant.frequencyPenaltyEnabled = resultSet.getLong(resultSet.getColumnIndex('frequency_penalty_enabled')) === 1
+	    } catch (error) {
+	      assistant.frequencyPenaltyEnabled = false
+	    }
+	    try {
+	      assistant.frequencyPenalty = resultSet.getDouble(resultSet.getColumnIndex('frequency_penalty'))
+	    } catch (error) {
+	      assistant.frequencyPenalty = 0
+	    }
+	    try {
+	      const raw = this.safeGetString(resultSet, 'enabled_tool_ids_json')
+	      if (raw.length > 0) {
+	        const parsed = JSON.parse(raw) as string[]
+	        assistant.enabledToolIds = Array.isArray(parsed) ? parsed : []
+	      } else {
+	        assistant.enabledToolIds = []
+	      }
+	    } catch (error) {
+	      assistant.enabledToolIds = []
+	    }
+	    try {
+	      assistant.contextMessageCount = resultSet.getLong(resultSet.getColumnIndex('context_message_count'))
+	    } catch (error) {
+	      assistant.contextMessageCount = 0
+	    }
+	    try {
+	      assistant.maxOutputTokens = resultSet.getLong(resultSet.getColumnIndex('max_output_tokens'))
+	    } catch (error) {
+	      assistant.maxOutputTokens = 0
+	    }
+	    try {
+	      assistant.isDefault = resultSet.getLong(resultSet.getColumnIndex('is_default')) === 1
+	    } catch (error) {
+	      assistant.isDefault = assistant.id === DEFAULT_ASSISTANT_ID
+	    }
+	    try {
+	      assistant.createdAt = resultSet.getLong(resultSet.getColumnIndex('created_at'))
+	    } catch (error) {
+	      assistant.createdAt = Date.now()
+	    }
+	    try {
+	      assistant.updatedAt = resultSet.getLong(resultSet.getColumnIndex('updated_at'))
+	    } catch (error) {
+	      assistant.updatedAt = assistant.createdAt
+	    }
+	    try {
+	      assistant.sortOrder = resultSet.getLong(resultSet.getColumnIndex('sort_order'))
+	    } catch (error) {
+	      assistant.sortOrder = assistant.isDefault ? 0 : assistant.createdAt
+	    }
+	    if (assistant.id === DEFAULT_ASSISTANT_ID) {
+	      assistant.isDefault = true
+	    }
+	    return assistant
+	  }
+
+	  private async ensureDefaultAssistant(): Promise<void> {
+	    if (this.rdbStore === null) {
+	      return
+	    }
+	    const existing = await this.queryAssistantByIdNoWait(DEFAULT_ASSISTANT_ID)
+	    if (existing !== null) {
+	      if (!existing.isDefault) {
+	        existing.isDefault = true
+	        const predicates = new relationalStore.RdbPredicates(TableNames.ASSISTANTS)
+	        predicates.equalTo('id', DEFAULT_ASSISTANT_ID)
+	        try {
+	          await this.rdbStore.update(this.assistantToValueBucket(existing, false), predicates)
+	        } catch (error) {
+	          console.error('DatabaseService', `Failed to update default assistant: ${JSON.stringify(error)}`)
+	        }
+	      }
+	      return
+	    }
+	    try {
+	      await this.rdbStore.insert(TableNames.ASSISTANTS, this.assistantToValueBucket(createDefaultAssistant()))
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to create default assistant: ${JSON.stringify(error)}`)
+	    }
+	  }
+
+  // 添加搜索引用相关字段（用于联网搜索）
+  private async addSearchColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN search_query TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'search_query column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN search_engine TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'search_engine column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN search_source TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'search_source column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN search_references TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'search_references column may already exist')
+    }
+  }
+
+  // 添加 model_id 字段到消息表（用于图标匹配）
+  private async addMessageModelIdColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.MESSAGES} ADD COLUMN model_id TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'messages model_id column may already exist')
+    }
+  }
+
+  // 添加助手采样参数列(温度之外的 top_p / presence_penalty / frequency_penalty)
+  // 旧库初始只有 temperature_enabled / temperature,这里把另外三对开关 + 数值列补齐。
+  private async addAssistantSamplingColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    const columns: string[] = [
+      `top_p_enabled INTEGER DEFAULT 0`,
+      `top_p REAL DEFAULT 1.0`,
+      `presence_penalty_enabled INTEGER DEFAULT 0`,
+      `presence_penalty REAL DEFAULT 0`,
+      `frequency_penalty_enabled INTEGER DEFAULT 0`,
+      `frequency_penalty REAL DEFAULT 0`,
+      `reasoning_level_preference TEXT DEFAULT ''`,
+      `enabled_tool_ids_json TEXT DEFAULT ''`,
+      `context_message_count INTEGER DEFAULT 0`,
+      `max_output_tokens INTEGER DEFAULT 0`
+    ]
+    for (const def of columns) {
+      try {
+        await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.ASSISTANTS} ADD COLUMN ${def}`)
+      } catch (error) {
+        // 列已存在会抛错,忽略
+      }
+    }
+  }
+
+  private normalizePreview(content: string): string {
+    if (content === '') {
+      return ''
+    }
+    const normalized = content.replace(/\s+/g, ' ').trim()
+    if (normalized.length === 0) {
+      return ''
+    }
+    if (normalized.length <= 48) {
+      return normalized
+    }
+    return normalized.substring(0, 48) + '...'
+  }
+
+  private buildDraftTitle(content: string): string {
+    const normalized = content.replace(/\s+/g, ' ').trim()
+    if (normalized.length === 0) {
+      return '新对话'
+    }
+    if (normalized.length <= 20) {
+      return normalized
+    }
+    return normalized.substring(0, 20) + '...'
+  }
+
+  private buildDraftPreview(content: string, attachments: MessageAttachment[]): string {
+    const preview = this.normalizePreview(content)
+    if (preview !== '') {
+      return preview
+    }
+    if (attachments.length === 0) {
+      return ''
+    }
+    return attachments[0].name !== '' ? attachments[0].name : ''
+  }
+
+  private serializeDraftAttachments(attachments: MessageAttachment[]): string {
+    if (attachments.length === 0) {
+      return ''
+    }
+    const serialized: DraftAttachmentJsonData[] = []
+    for (let i = 0; i < attachments.length; i++) {
+      serialized.push({
+        id: attachments[i].id,
+        type: attachments[i].type,
+        name: attachments[i].name,
+        filePath: attachments[i].filePath,
+        mimeType: attachments[i].mimeType,
+        size: attachments[i].size,
+        processState: attachments[i].processState,
+        parseEngine: attachments[i].parseEngine,
+        parsedText: attachments[i].parsedText,
+        parseError: attachments[i].parseError
+      })
+    }
+    return JSON.stringify(serialized)
+  }
+
+  private parseDraftAttachments(raw: string): MessageAttachment[] {
+    if (raw === '') {
+      return []
+    }
+    try {
+      const parsed = JSON.parse(raw) as DraftAttachmentJsonData[]
+      const attachments: MessageAttachment[] = []
+      for (let i = 0; i < parsed.length; i++) {
+        const attachment = new MessageAttachment(
+          parsed[i].id,
+          parsed[i].type === AttachmentType.IMAGE ? AttachmentType.IMAGE : AttachmentType.FILE,
+          parsed[i].name,
+          parsed[i].filePath,
+          parsed[i].mimeType,
+          parsed[i].size
+        )
+        attachment.processState = parsed[i].processState ?? attachment.processState
+        attachment.parseEngine = parsed[i].parseEngine ?? ''
+        attachment.parsedText = parsed[i].parsedText ?? ''
+        attachment.parseError = parsed[i].parseError ?? ''
+        attachments.push(attachment)
+      }
+      return attachments
+    } catch (error) {
+      console.error('DatabaseService', `Failed to parse draft attachments: ${JSON.stringify(error)}`)
+      return []
+    }
+  }
+
+  private serializeSuggestedQuestions(questions: string[]): string {
+    if (questions.length === 0) {
+      return ''
+    }
+    const normalized: string[] = []
+    for (let i = 0; i < questions.length && normalized.length < 3; i++) {
+      const question = questions[i].trim()
+      if (question === '') {
+        continue
+      }
+      if (normalized.indexOf(question) >= 0) {
+        continue
+      }
+      normalized.push(question)
+    }
+    return normalized.length > 0 ? JSON.stringify(normalized) : ''
+  }
+
+  private parseSuggestedQuestions(raw: string): string[] {
+    if (raw === '') {
+      return []
+    }
+    try {
+      const parsed = JSON.parse(raw) as string[]
+      const questions: string[] = []
+      for (let i = 0; i < parsed.length && questions.length < 3; i++) {
+        const question = parsed[i].trim()
+        if (question === '' || questions.indexOf(question) >= 0) {
+          continue
+        }
+        questions.push(question)
+      }
+      return questions
+    } catch (error) {
+      console.error('DatabaseService', `Failed to parse suggested questions: ${JSON.stringify(error)}`)
+      return []
+    }
+  }
+
+  private normalizeSessionTitleSource(value: string): SessionTitleSource {
+    if (value === SessionTitleSource.PLACEHOLDER) {
+      return SessionTitleSource.PLACEHOLDER
+    }
+    if (value === SessionTitleSource.AI) {
+      return SessionTitleSource.AI
+    }
+    return SessionTitleSource.MANUAL
+  }
+
+  private async getMessageSessionId(messageId: string): Promise<string> {
+    if (this.rdbStore === null) {
+      return ''
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+    predicates.equalTo('id', messageId)
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      if (resultSet.goToNextRow()) {
+        const sessionId = resultSet.getString(resultSet.getColumnIndex('session_id'))
+        resultSet.close()
+        return sessionId
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get message session id: ${JSON.stringify(error)}`)
+    }
+    return ''
+  }
+
+  private async refreshSessionSummary(sessionId: string, notifyListRefresh: boolean = true): Promise<void> {
+    if (this.rdbStore === null || sessionId === '') {
+      return
+    }
+
+    let messageCount = 0
+    let latestTimestamp = 0
+    let latestPreview = ''
+
+    const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+    predicates.equalTo('session_id', sessionId)
+    predicates.orderByDesc('timestamp')
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      while (resultSet.goToNextRow()) {
+        messageCount = messageCount + 1
+        if (messageCount === 1) {
+          latestTimestamp = resultSet.getLong(resultSet.getColumnIndex('timestamp'))
+          latestPreview = this.normalizePreview(resultSet.getString(resultSet.getColumnIndex('content')) || '')
+        }
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to refresh session summary: ${JSON.stringify(error)}`)
+      return
+    }
+
+    let valueBucket: relationalStore.ValuesBucket
+    if (latestTimestamp > 0) {
+      valueBucket = {
+        message_count: messageCount,
+        last_message_preview: latestPreview,
+        updated_at: latestTimestamp
+      }
+    } else {
+      valueBucket = {
+        message_count: messageCount,
+        last_message_preview: latestPreview
+      }
+    }
+    const updatePredicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    updatePredicates.equalTo('id', sessionId)
+    try {
+      await this.rdbStore.update(valueBucket, updatePredicates)
+      if (notifyListRefresh) {
+        setAppUiStateValue(AppStorageKeys.SESSION_LIST_REFRESH_AT, Date.now())
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update session summary: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private scheduleLegacySummaryRepair(sessionIds: string[]): void {
+    for (let i = 0; i < sessionIds.length; i++) {
+      this.addUniqueSessionId(this.pendingLegacySummaryRepairIds, sessionIds[i])
+    }
+    if (this.pendingLegacySummaryRepairIds.length === 0 || this.legacySummaryRepairPromise !== null) {
+      return
+    }
+    this.legacySummaryRepairPromise = this.runLegacySummaryRepairQueue()
+    this.legacySummaryRepairPromise.finally(() => {
+      this.legacySummaryRepairPromise = null
+      if (this.pendingLegacySummaryRepairIds.length > 0) {
+        this.scheduleLegacySummaryRepair([])
+      }
+    })
+  }
+
+  private async runLegacySummaryRepairQueue(): Promise<void> {
+    let repaired = false
+    while (this.pendingLegacySummaryRepairIds.length > 0) {
+      const sessionId = this.pendingLegacySummaryRepairIds[0]
+      this.pendingLegacySummaryRepairIds.splice(0, 1)
+      if (sessionId === undefined || sessionId === '') {
+        continue
+      }
+      await this.refreshSessionSummary(sessionId, false)
+      repaired = true
+    }
+    if (repaired) {
+      setAppUiStateValue(AppStorageKeys.SESSION_LIST_REFRESH_AT, Date.now())
+    }
+  }
+
+	  private addUniqueSessionId(list: string[], sessionId: string): void {
+	    if (sessionId === '') {
+	      return
+    }
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] === sessionId) {
+        return
+      }
+    }
+	    list.push(sessionId)
+	  }
+
+	  // ============ 助手操作 ============
+
+	  private async queryAssistantByIdNoWait(assistantId: string): Promise<Assistant | null> {
+	    if (this.rdbStore === null || assistantId === '') {
+	      return null
+	    }
+	    const predicates = new relationalStore.RdbPredicates(TableNames.ASSISTANTS)
+	    predicates.equalTo('id', assistantId)
+	    try {
+	      const resultSet = await this.rdbStore.query(predicates)
+	      if (resultSet.goToNextRow()) {
+	        const assistant = this.buildAssistantFromResultSet(resultSet)
+	        resultSet.close()
+	        return assistant
+	      }
+	      resultSet.close()
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to get assistant: ${JSON.stringify(error)}`)
+	    }
+	    return null
+	  }
+
+	  private async getNextAssistantSortOrder(): Promise<number> {
+	    if (this.rdbStore === null) {
+	      return 1
+	    }
+	    const predicates = new relationalStore.RdbPredicates(TableNames.ASSISTANTS)
+	    predicates.orderByDesc('sort_order')
+	    try {
+	      const resultSet = await this.rdbStore.query(predicates)
+	      let nextSortOrder = 1
+	      if (resultSet.goToNextRow()) {
+	        nextSortOrder = resultSet.getLong(resultSet.getColumnIndex('sort_order')) + 1
+	      }
+	      resultSet.close()
+	      return nextSortOrder <= 0 ? 1 : nextSortOrder
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to get next assistant sort order: ${JSON.stringify(error)}`)
+	      return 1
+	    }
+	  }
+
+	  async getAllAssistants(): Promise<Assistant[]> {
+	    await this.waitForInitialization()
+	    if (this.rdbStore === null) {
+	      return []
+	    }
+	    const assistants: Assistant[] = []
+	    const predicates = new relationalStore.RdbPredicates(TableNames.ASSISTANTS)
+	    predicates.orderByAsc('sort_order')
+	    try {
+	      const resultSet = await this.rdbStore.query(predicates)
+	      while (resultSet.goToNextRow()) {
+	        assistants.push(this.buildAssistantFromResultSet(resultSet))
+	      }
+	      resultSet.close()
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to get assistants: ${JSON.stringify(error)}`)
+	    }
+	    if (assistants.length === 0) {
+	      const fallback = createDefaultAssistant()
+	      await this.createAssistant(fallback)
+	      assistants.push(fallback)
+	    }
+	    return assistants
+	  }
+
+	  async getAssistant(assistantId: string): Promise<Assistant | null> {
+	    await this.waitForInitialization()
+	    return await this.queryAssistantByIdNoWait(assistantId)
+	  }
+
+	  async createAssistant(assistant: Assistant): Promise<void> {
+	    await this.waitForInitialization()
+	    if (this.rdbStore === null) {
+	      return
+	    }
+	    if (assistant.id === '') {
+	      assistant.id = Date.now().toString() + Math.random().toString(36).substring(2, 9)
+	    }
+	    if (assistant.id === DEFAULT_ASSISTANT_ID) {
+	      assistant.isDefault = true
+	    } else if (assistant.sortOrder <= 0) {
+	      assistant.sortOrder = await this.getNextAssistantSortOrder()
+	    }
+	    const now = Date.now()
+	    if (assistant.createdAt <= 0) {
+	      assistant.createdAt = now
+	    }
+	    assistant.updatedAt = now
+	    try {
+	      await this.rdbStore.insert(TableNames.ASSISTANTS, this.assistantToValueBucket(assistant))
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to create assistant: ${JSON.stringify(error)}`)
+	    }
+	  }
+
+	  async saveAssistant(assistant: Assistant): Promise<void> {
+	    await this.waitForInitialization()
+	    if (this.rdbStore === null || assistant.id === '') {
+	      return
+	    }
+	    if (assistant.id === DEFAULT_ASSISTANT_ID) {
+	      assistant.isDefault = true
+	    }
+	    assistant.updatedAt = Date.now()
+	    const predicates = new relationalStore.RdbPredicates(TableNames.ASSISTANTS)
+	    predicates.equalTo('id', assistant.id)
+	    try {
+	      const existing = await this.queryAssistantByIdNoWait(assistant.id)
+	      if (existing === null) {
+	        await this.rdbStore.insert(TableNames.ASSISTANTS, this.assistantToValueBucket(assistant))
+	      } else {
+	        await this.rdbStore.update(this.assistantToValueBucket(assistant, false), predicates)
+	      }
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to save assistant: ${JSON.stringify(error)}`)
+	    }
+	  }
+
+	  async deleteAssistant(assistantId: string): Promise<boolean> {
+	    await this.waitForInitialization()
+	    if (this.rdbStore === null || assistantId === '' || assistantId === DEFAULT_ASSISTANT_ID) {
+	      return false
+	    }
+	    try {
+	      const sessionValueBucket: relationalStore.ValuesBucket = {
+	        assistant_id: DEFAULT_ASSISTANT_ID
+	      }
+	      const sessionPredicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+	      sessionPredicates.equalTo('assistant_id', assistantId)
+	      await this.rdbStore.update(sessionValueBucket, sessionPredicates)
+
+	      const predicates = new relationalStore.RdbPredicates(TableNames.ASSISTANTS)
+	      predicates.equalTo('id', assistantId)
+	      await this.rdbStore.delete(predicates)
+	      setAppUiStateValue(AppStorageKeys.SESSION_LIST_REFRESH_AT, Date.now())
+	      return true
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to delete assistant: ${JSON.stringify(error)}`)
+	      return false
+	    }
+	  }
+
+	  async getAssistantSessionCount(assistantId: string): Promise<number> {
+	    await this.waitForInitialization()
+	    if (this.rdbStore === null || assistantId === '') {
+	      return 0
+	    }
+	    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+	    predicates.equalTo('assistant_id', assistantId)
+	    try {
+	      const resultSet = await this.rdbStore.query(predicates)
+	      let count = 0
+	      while (resultSet.goToNextRow()) {
+	        count++
+	      }
+	      resultSet.close()
+	      return count
+	    } catch (error) {
+	      console.error('DatabaseService', `Failed to count assistant sessions: ${JSON.stringify(error)}`)
+	      return 0
+	    }
+	  }
+
+	  async saveAssistantSortOrders(assistants: Assistant[]): Promise<void> {
+	    await this.waitForInitialization()
+	    if (this.rdbStore === null) {
+	      return
+	    }
+	    for (let i = 0; i < assistants.length; i++) {
+	      const assistant = assistants[i]
+	      const sortOrder = i
+	      assistant.sortOrder = sortOrder
+	      const predicates = new relationalStore.RdbPredicates(TableNames.ASSISTANTS)
+	      predicates.equalTo('id', assistant.id)
+	      const valueBucket: relationalStore.ValuesBucket = {
+	        sort_order: sortOrder
+	      }
+	      try {
+	        await this.rdbStore.update(valueBucket, predicates)
+	      } catch (error) {
+	        console.error('DatabaseService', `Failed to save assistant order: ${JSON.stringify(error)}`)
+	      }
+	    }
+	    setAppUiStateValue(AppStorageKeys.SESSION_LIST_REFRESH_AT, Date.now())
+	  }
+
+	  // ============ 会话操作 ============
+
+  // 创建新会话
+  async createSession(session: ChatSession): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: session.id,
+	      title: session.title,
+	      model_id: session.modelId,
+	      provider_id: session.providerId,  // 使用会话的 providerId 字段
+	      assistant_id: session.assistantId !== '' ? session.assistantId : DEFAULT_ASSISTANT_ID,
+	      created_at: session.createdAt,
+      updated_at: session.updatedAt,
+      is_favorite: session.isFavorite ? 1 : 0,
+      last_message_preview: session.lastMessagePreview,
+      message_count: session.messageCount,
+      draft_text: session.draftText,
+      draft_attachments_json: this.serializeDraftAttachments(session.draftAttachments),
+      suggested_questions_json: this.serializeSuggestedQuestions(session.suggestedQuestions),
+      title_source: session.titleSource
+    }
+    try {
+      await this.rdbStore.insert(TableNames.SESSIONS, valueBucket)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to create session: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 更新会话
+  async updateSession(session: ChatSession): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+	      title: session.title,
+	      model_id: session.modelId,
+		      provider_id: session.providerId,
+		      assistant_id: session.assistantId !== '' ? session.assistantId : DEFAULT_ASSISTANT_ID,
+		      updated_at: Date.now(),
+          title_source: session.titleSource
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.equalTo('id', session.id)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update session: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private async addOpenAITransportColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(
+        `ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN openai_transport TEXT DEFAULT 'chat_completions'`
+      )
+    } catch (error) {
+      console.info('DatabaseService', 'openai_transport column may already exist')
+    }
+  }
+
+  private async addProviderCustomHeadersColumnIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.PROVIDERS} ADD COLUMN custom_headers_json TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'custom_headers_json column may already exist')
+    }
+  }
+
+  private async addToolEventMetaColumnsIfNeeded(): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.TOOL_EVENTS} ADD COLUMN tool_display_name TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'tool_display_name column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.TOOL_EVENTS} ADD COLUMN source_label TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'source_label column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.TOOL_EVENTS} ADD COLUMN source_type TEXT DEFAULT ''`)
+    } catch (error) {
+      console.info('DatabaseService', 'source_type column may already exist')
+    }
+    try {
+      await this.rdbStore.executeSql(`ALTER TABLE ${TableNames.TOOL_EVENTS} ADD COLUMN permission_level TEXT DEFAULT 'read'`)
+    } catch (error) {
+      console.info('DatabaseService', 'permission_level column may already exist')
+    }
+  }
+
+  // 仅更新会话当前模型选择（不修改 updated_at，避免切模型时打乱会话排序）
+  async updateSessionModelSelection(sessionId: string, modelId: string, providerId: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null || sessionId === '') {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      model_id: modelId,
+      provider_id: providerId
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.equalTo('id', sessionId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update session model selection: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 仅更新会话标题（不修改 updated_at，避免改变会话时间排序）
+  async updateSessionTitle(
+    sessionId: string,
+    title: string,
+    titleSource: SessionTitleSource = SessionTitleSource.MANUAL
+  ): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      title: title,
+      title_source: titleSource
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.equalTo('id', sessionId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update session title: ${JSON.stringify(error)}`)
+    }
+  }
+
+  async updateSessionDraft(sessionId: string, draftText: string, draftAttachments: MessageAttachment[]): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null || sessionId === '') {
+      return
+    }
+
+    let messageCount = 0
+    let titleSource = SessionTitleSource.MANUAL
+    const queryPredicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    queryPredicates.equalTo('id', sessionId)
+    try {
+      const resultSet = await this.rdbStore.query(queryPredicates)
+      if (resultSet.goToNextRow()) {
+        try {
+          messageCount = resultSet.getLong(resultSet.getColumnIndex('message_count'))
+        } catch (e) {
+          messageCount = 0
+        }
+        titleSource = this.normalizeSessionTitleSource(
+          this.safeGetString(resultSet, 'title_source', SessionTitleSource.MANUAL)
+        )
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to query session draft meta: ${JSON.stringify(error)}`)
+      return
+    }
+
+    const valueBucket: relationalStore.ValuesBucket = {
+      draft_text: draftText,
+      draft_attachments_json: this.serializeDraftAttachments(draftAttachments)
+    }
+    if (messageCount === 0 && titleSource !== SessionTitleSource.MANUAL) {
+      valueBucket.title = this.buildDraftTitle(draftText)
+      valueBucket.title_source = SessionTitleSource.PLACEHOLDER
+      valueBucket.last_message_preview = this.buildDraftPreview(draftText, draftAttachments)
+      valueBucket.updated_at = Date.now()
+    }
+
+    const updatePredicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    updatePredicates.equalTo('id', sessionId)
+    try {
+      await this.rdbStore.update(valueBucket, updatePredicates)
+      setAppUiStateValue(AppStorageKeys.SESSION_LIST_REFRESH_AT, Date.now())
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update session draft: ${JSON.stringify(error)}`)
+    }
+  }
+
+  async updateSessionSuggestedQuestions(sessionId: string, questions: string[]): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null || sessionId === '') {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      suggested_questions_json: this.serializeSuggestedQuestions(questions)
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.equalTo('id', sessionId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update suggested questions: ${JSON.stringify(error)}`)
+    }
+  }
+
+  async toggleSessionFavorite(sessionId: string): Promise<boolean> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return false
+    }
+
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.equalTo('id', sessionId)
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      if (!resultSet.goToNextRow()) {
+        resultSet.close()
+        return false
+      }
+      let currentValue = false
+      try {
+        currentValue = resultSet.getLong(resultSet.getColumnIndex('is_favorite')) === 1
+      } catch (e) {
+        currentValue = false
+      }
+      resultSet.close()
+
+      const nextValue = !currentValue
+      const valueBucket: relationalStore.ValuesBucket = {
+        is_favorite: nextValue ? 1 : 0
+      }
+      await this.rdbStore.update(valueBucket, predicates)
+      return nextValue
+    } catch (error) {
+      console.error('DatabaseService', `Failed to toggle session favorite: ${JSON.stringify(error)}`)
+      return false
+    }
+  }
+
+  // 更新会话时间戳（用于导入时恢复原始时间）
+  async updateSessionTimestamps(sessionId: string, createdAt: number, updatedAt: number): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      created_at: createdAt,
+      updated_at: updatedAt
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.equalTo('id', sessionId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update session timestamps: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 删除会话及其消息
+  async deleteSession(sessionId: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      const messageIds: string[] = []
+      const queryPredicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+      queryPredicates.equalTo('session_id', sessionId)
+      const resultSet = await this.rdbStore.query(queryPredicates)
+      try {
+        while (resultSet.goToNextRow()) {
+          messageIds.push(resultSet.getString(resultSet.getColumnIndex('id')))
+        }
+      } finally {
+        resultSet.close()
+      }
+
+      // 删除会话关联工具事件和附件记录。附件文件本身仍按现有策略保留，避免误删复用文件。
+      const toolEventPredicates = new relationalStore.RdbPredicates(TableNames.TOOL_EVENTS)
+      toolEventPredicates.equalTo('session_id', sessionId)
+      await this.rdbStore.delete(toolEventPredicates)
+
+      if (messageIds.length > 0) {
+        const chunkSize = 200
+        for (let start = 0; start < messageIds.length; start += chunkSize) {
+          const chunk = messageIds.slice(start, start + chunkSize)
+          const attachmentPredicates = new relationalStore.RdbPredicates(TableNames.ATTACHMENTS)
+          attachmentPredicates.in('message_id', chunk)
+          await this.rdbStore.delete(attachmentPredicates)
+        }
+      }
+
+      // 删除消息
+      const messagePredicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+      messagePredicates.equalTo('session_id', sessionId)
+      await this.rdbStore.delete(messagePredicates)
+
+      // 删除会话
+      const sessionPredicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+      sessionPredicates.equalTo('id', sessionId)
+      await this.rdbStore.delete(sessionPredicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to delete session: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 获取所有会话
+  async getAllSessions(repairLegacySummary: boolean = true): Promise<ChatSession[]> {
+    try {
+      await this.waitForInitialization()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to wait for database initialization: ${JSON.stringify(error)}`)
+      return []
+    }
+    if (this.rdbStore === null) {
+      return []
+    }
+    const sessions: ChatSession[] = []
+    const legacySummaryRepairIds: string[] = []
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.orderByDesc('updated_at')
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      while (resultSet.goToNextRow()) {
+        // 获取 provider_id 列索引，兼容旧数据库（可能不存在该列）
+	        let providerId = ''
+	        try {
+	          const providerIdIndex = resultSet.getColumnIndex('provider_id')
+	          if (providerIdIndex >= 0) {
+	            providerId = resultSet.getString(providerIdIndex)
+	          }
+	        } catch (e) {
+	          // 列不存在，使用默认值
+	        }
+	        const assistantId = this.safeGetString(resultSet, 'assistant_id', DEFAULT_ASSISTANT_ID)
+
+	        const session = new ChatSession(
+	          resultSet.getString(resultSet.getColumnIndex('id')),
+	          resultSet.getString(resultSet.getColumnIndex('title')),
+	          resultSet.getString(resultSet.getColumnIndex('model_id')),
+	          providerId,
+	          assistantId !== '' ? assistantId : DEFAULT_ASSISTANT_ID
+	        )
+        session.createdAt = resultSet.getLong(resultSet.getColumnIndex('created_at'))
+        session.updatedAt = resultSet.getLong(resultSet.getColumnIndex('updated_at'))
+        try {
+          session.isFavorite = resultSet.getLong(resultSet.getColumnIndex('is_favorite')) === 1
+        } catch (e) {
+          session.isFavorite = false
+        }
+        try {
+          session.lastMessagePreview = resultSet.getString(resultSet.getColumnIndex('last_message_preview')) || ''
+        } catch (e) {
+          session.lastMessagePreview = ''
+        }
+        try {
+          session.messageCount = resultSet.getLong(resultSet.getColumnIndex('message_count'))
+        } catch (e) {
+          session.messageCount = 0
+        }
+        try {
+          session.draftText = resultSet.getString(resultSet.getColumnIndex('draft_text')) || ''
+        } catch (e) {
+          session.draftText = ''
+        }
+        try {
+          session.draftAttachments = this.parseDraftAttachments(
+            resultSet.getString(resultSet.getColumnIndex('draft_attachments_json')) || ''
+          )
+        } catch (e) {
+          session.draftAttachments = []
+        }
+        session.suggestedQuestions = this.parseSuggestedQuestions(
+          this.safeGetString(resultSet, 'suggested_questions_json')
+        )
+        session.titleSource = this.normalizeSessionTitleSource(
+          this.safeGetString(resultSet, 'title_source', SessionTitleSource.MANUAL)
+        )
+        sessions.push(session)
+      }
+      resultSet.close()
+
+      if (repairLegacySummary) {
+        // 兼容旧数据：回填放到后台队列里，避免首页首屏被历史修复任务卡住
+        for (let i = 0; i < sessions.length; i++) {
+          if (sessions[i].messageCount === 0 &&
+            sessions[i].lastMessagePreview === '' &&
+            sessions[i].updatedAt > sessions[i].createdAt) {
+            this.addUniqueSessionId(legacySummaryRepairIds, sessions[i].id)
+          }
+        }
+        this.scheduleLegacySummaryRepair(legacySummaryRepairIds)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get sessions: ${JSON.stringify(error)}`)
+    }
+    return sessions
+  }
+
+  // 获取单个会话
+  async getSession(sessionId: string): Promise<ChatSession | null> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return null
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.SESSIONS)
+    predicates.equalTo('id', sessionId)
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      if (resultSet.goToNextRow()) {
+        // 获取 provider_id 列索引，兼容旧数据库（可能不存在该列）
+	        let providerId = ''
+	        try {
+	          const providerIdIndex = resultSet.getColumnIndex('provider_id')
+	          if (providerIdIndex >= 0) {
+	            providerId = resultSet.getString(providerIdIndex)
+	          }
+	        } catch (e) {
+	          // 列不存在，使用默认值
+	        }
+	        const assistantId = this.safeGetString(resultSet, 'assistant_id', DEFAULT_ASSISTANT_ID)
+
+	        const session = new ChatSession(
+	          resultSet.getString(resultSet.getColumnIndex('id')),
+	          resultSet.getString(resultSet.getColumnIndex('title')),
+	          resultSet.getString(resultSet.getColumnIndex('model_id')),
+	          providerId,
+	          assistantId !== '' ? assistantId : DEFAULT_ASSISTANT_ID
+	        )
+        session.createdAt = resultSet.getLong(resultSet.getColumnIndex('created_at'))
+        session.updatedAt = resultSet.getLong(resultSet.getColumnIndex('updated_at'))
+        try {
+          session.isFavorite = resultSet.getLong(resultSet.getColumnIndex('is_favorite')) === 1
+        } catch (e) {
+          session.isFavorite = false
+        }
+        try {
+          session.lastMessagePreview = resultSet.getString(resultSet.getColumnIndex('last_message_preview')) || ''
+        } catch (e) {
+          session.lastMessagePreview = ''
+        }
+        try {
+          session.messageCount = resultSet.getLong(resultSet.getColumnIndex('message_count'))
+        } catch (e) {
+          session.messageCount = 0
+        }
+        try {
+          session.draftText = resultSet.getString(resultSet.getColumnIndex('draft_text')) || ''
+        } catch (e) {
+          session.draftText = ''
+        }
+        try {
+          session.draftAttachments = this.parseDraftAttachments(
+            resultSet.getString(resultSet.getColumnIndex('draft_attachments_json')) || ''
+          )
+        } catch (e) {
+          session.draftAttachments = []
+        }
+        session.suggestedQuestions = this.parseSuggestedQuestions(
+          this.safeGetString(resultSet, 'suggested_questions_json')
+        )
+        session.titleSource = this.normalizeSessionTitleSource(
+          this.safeGetString(resultSet, 'title_source', SessionTitleSource.MANUAL)
+        )
+        resultSet.close()
+        return session
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get session: ${JSON.stringify(error)}`)
+    }
+    return null
+  }
+
+  // ============ 消息操作 ============
+
+  private buildSearchReferencesJson(message: ChatMessage): string {
+    if (message.searchReferences.length === 0) {
+      return ''
+    }
+
+    const refsArray: SearchReferenceJsonData[] = []
+    for (let i = 0; i < message.searchReferences.length; i++) {
+      const ref = message.searchReferences[i]
+      refsArray.push({
+        id: ref.id,
+        title: ref.title,
+        url: ref.url,
+        snippet: ref.snippet,
+        timestamp: ref.timestamp
+      })
+    }
+    return JSON.stringify(refsArray)
+  }
+
+  private buildMessageValueBucket(sessionId: string, message: ChatMessage): relationalStore.ValuesBucket {
+    ensureMessageParts(message)
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: message.id,
+      session_id: sessionId,
+      role: message.role,
+      content: message.content,
+      model_name: message.modelName,
+      model_id: message.modelId || '',
+      timestamp: message.timestamp,
+      reasoning_content: message.reasoningContent,
+      reasoning_signature_blob: message.reasoningSignatureBlob || '',
+      parts_json: serializeMessageParts(message.parts),
+      search_query: message.searchQuery || '',
+      search_engine: message.searchEngine || '',
+      search_source: message.searchSource || '',
+      search_references: this.buildSearchReferencesJson(message),
+      prompt_tokens: message.promptTokens || 0,
+      completion_tokens: message.completionTokens || 0,
+      total_tokens: message.totalTokens || 0
+    }
+    return valueBucket
+  }
+
+  private async batchInsertValueBuckets(
+    tableName: string,
+    valueBuckets: relationalStore.ValuesBucket[]
+  ): Promise<void> {
+    if (this.rdbStore === null || valueBuckets.length === 0) {
+      return
+    }
+
+    for (let start = 0; start < valueBuckets.length; start += DB_BATCH_CHUNK_SIZE) {
+      const chunk = valueBuckets.slice(start, start + DB_BATCH_CHUNK_SIZE)
+      await this.rdbStore.batchInsert(tableName, chunk)
+    }
+  }
+
+  private async insertValueBucketsIndividually(
+    tableName: string,
+    valueBuckets: relationalStore.ValuesBucket[],
+    errorLabel: string
+  ): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+
+    for (let i = 0; i < valueBuckets.length; i++) {
+      try {
+        await this.rdbStore.insert(tableName, valueBuckets[i])
+      } catch (error) {
+        console.error('DatabaseService', `${errorLabel}: ${JSON.stringify(error)}`)
+      }
+    }
+  }
+
+  private buildAttachmentValueBuckets(
+    messageId: string,
+    attachments: MessageAttachment[]
+  ): relationalStore.ValuesBucket[] {
+    const valueBuckets: relationalStore.ValuesBucket[] = []
+    for (let i = 0; i < attachments.length; i++) {
+      valueBuckets.push(this.buildAttachmentValueBucket(messageId, attachments[i]))
+    }
+    return valueBuckets
+  }
+
+  // 添加消息
+  async addMessage(sessionId: string, message: ChatMessage, refreshSummary: boolean = true): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket = this.buildMessageValueBucket(sessionId, message)
+    try {
+      await this.rdbStore.insert(TableNames.MESSAGES, valueBucket)
+
+      // 保存附件
+      if (message.attachments.length > 0) {
+        for (let i = 0; i < message.attachments.length; i++) {
+          const attachment = message.attachments[i]
+          await this.addAttachment(message.id, attachment)
+        }
+      }
+
+      // 同步会话摘要、计数和更新时间
+      if (refreshSummary) {
+        await this.refreshSessionSummary(sessionId)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to add message: ${JSON.stringify(error)}`)
+    }
+  }
+
+  async addMessages(sessionId: string, messages: ChatMessage[], refreshSummary: boolean = true): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null || messages.length === 0) {
+      return
+    }
+
+    const messageBuckets: relationalStore.ValuesBucket[] = []
+    const attachmentBuckets: relationalStore.ValuesBucket[] = []
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i]
+      messageBuckets.push(this.buildMessageValueBucket(sessionId, message))
+      if (message.attachments.length > 0) {
+        const buckets = this.buildAttachmentValueBuckets(message.id, message.attachments)
+        for (let j = 0; j < buckets.length; j++) {
+          attachmentBuckets.push(buckets[j])
+        }
+      }
+    }
+
+    try {
+      await this.batchInsertValueBuckets(TableNames.MESSAGES, messageBuckets)
+      await this.batchInsertValueBuckets(TableNames.ATTACHMENTS, attachmentBuckets)
+      if (refreshSummary) {
+        await this.refreshSessionSummary(sessionId)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to add messages: ${JSON.stringify(error)}`)
+      throw new Error(`Failed to add messages: ${JSON.stringify(error)}`)
+    }
+  }
+
+  async updateMessageParts(messageId: string, partsJson: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null || partsJson.trim() === '') {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      parts_json: partsJson
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+    predicates.equalTo('id', messageId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update message parts: ${JSON.stringify(error)}`)
+    }
+  }
+
+  async refreshSessionSummaryForSession(sessionId: string): Promise<void> {
+    await this.waitForInitialization()
+    await this.refreshSessionSummary(sessionId)
+  }
+
+  private buildAttachmentValueBucket(messageId: string, attachment: MessageAttachment): relationalStore.ValuesBucket {
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: attachment.id,
+      message_id: messageId,
+      type: attachment.type,
+      name: attachment.name,
+      file_path: attachment.filePath,
+      mime_type: attachment.mimeType,
+      size: attachment.size,
+      process_state: attachment.processState,
+      parse_engine: attachment.parseEngine,
+      parsed_text: attachment.parsedText,
+      parse_error: attachment.parseError
+    }
+    return valueBucket
+  }
+
+  // 添加附件
+  private async addAttachment(messageId: string, attachment: MessageAttachment): Promise<void> {
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket = this.buildAttachmentValueBucket(messageId, attachment)
+    try {
+      await this.rdbStore.insert(TableNames.ATTACHMENTS, valueBucket)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to add attachment: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 获取消息的附件
+  private async getAttachments(messageId: string): Promise<MessageAttachment[]> {
+    if (this.rdbStore === null) {
+      return []
+    }
+    const attachments: MessageAttachment[] = []
+    const predicates = new relationalStore.RdbPredicates(TableNames.ATTACHMENTS)
+    predicates.equalTo('message_id', messageId)
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      while (resultSet.goToNextRow()) {
+        const typeStr = resultSet.getString(resultSet.getColumnIndex('type'))
+        const attachmentType = typeStr === 'image' ? AttachmentType.IMAGE : AttachmentType.FILE
+        const attachment = new MessageAttachment(
+          resultSet.getString(resultSet.getColumnIndex('id')),
+          attachmentType,
+          resultSet.getString(resultSet.getColumnIndex('name')),
+          resultSet.getString(resultSet.getColumnIndex('file_path')),
+          resultSet.getString(resultSet.getColumnIndex('mime_type')),
+          resultSet.getLong(resultSet.getColumnIndex('size'))
+        )
+        this.applyAttachmentParseFields(resultSet, attachment)
+        attachments.push(attachment)
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get attachments: ${JSON.stringify(error)}`)
+    }
+    return attachments
+  }
+
+  private async getAttachmentsByMessageIds(messageIds: string[]): Promise<Map<string, MessageAttachment[]>> {
+    const attachmentsMap = new Map<string, MessageAttachment[]>()
+    if (this.rdbStore === null || messageIds.length === 0) {
+      return attachmentsMap
+    }
+
+    const chunkSize = 200
+    for (let start = 0; start < messageIds.length; start += chunkSize) {
+      const chunk = messageIds.slice(start, start + chunkSize)
+      const predicates = new relationalStore.RdbPredicates(TableNames.ATTACHMENTS)
+      predicates.in('message_id', chunk)
+
+      try {
+        const resultSet = await this.rdbStore.query(predicates)
+        while (resultSet.goToNextRow()) {
+          const typeStr = resultSet.getString(resultSet.getColumnIndex('type'))
+          const attachmentType = typeStr === 'image' ? AttachmentType.IMAGE : AttachmentType.FILE
+          const messageId = resultSet.getString(resultSet.getColumnIndex('message_id'))
+          const attachment = new MessageAttachment(
+            resultSet.getString(resultSet.getColumnIndex('id')),
+            attachmentType,
+            resultSet.getString(resultSet.getColumnIndex('name')),
+            resultSet.getString(resultSet.getColumnIndex('file_path')),
+            resultSet.getString(resultSet.getColumnIndex('mime_type')),
+            resultSet.getLong(resultSet.getColumnIndex('size'))
+          )
+          this.applyAttachmentParseFields(resultSet, attachment)
+          const existing = attachmentsMap.get(messageId)
+          if (existing !== undefined) {
+            existing.push(attachment)
+          } else {
+            attachmentsMap.set(messageId, [attachment])
+          }
+        }
+        resultSet.close()
+      } catch (error) {
+        console.error('DatabaseService', `Failed to batch get attachments: ${JSON.stringify(error)}`)
+      }
+    }
+
+    return attachmentsMap
+  }
+
+  private buildChatMessageFromResultSet(resultSet: relationalStore.ResultSet): ChatMessage {
+    const roleStr = this.safeGetString(resultSet, 'role')
+    let role: MessageRole = MessageRole.USER
+    if (roleStr === 'assistant') {
+      role = MessageRole.ASSISTANT
+    } else if (roleStr === 'system') {
+      role = MessageRole.SYSTEM
+    }
+    const message = new ChatMessage(
+      this.safeGetString(resultSet, 'id'),
+      role,
+      this.safeGetString(resultSet, 'content'),
+      this.safeGetString(resultSet, 'model_name')
+    )
+    message.modelId = this.safeGetString(resultSet, 'model_id')
+    message.timestamp = this.safeGetLong(resultSet, 'timestamp')
+    message.reasoningContent = this.safeGetString(resultSet, 'reasoning_content')
+    message.reasoningSignatureBlob = this.safeGetString(resultSet, 'reasoning_signature_blob')
+    message.parts = deserializeMessageParts(this.safeGetString(resultSet, 'parts_json'))
+    message.searchQuery = this.safeGetString(resultSet, 'search_query')
+    message.searchEngine = this.safeGetString(resultSet, 'search_engine')
+    message.searchSource = this.safeGetString(resultSet, 'search_source')
+    // Token 用量(旧消息无此列,safeGetLong 回退 0)
+    message.promptTokens = this.safeGetLong(resultSet, 'prompt_tokens')
+    message.completionTokens = this.safeGetLong(resultSet, 'completion_tokens')
+    message.totalTokens = this.safeGetLong(resultSet, 'total_tokens')
+
+    try {
+      const searchReferencesJson = this.safeGetString(resultSet, 'search_references')
+      if (searchReferencesJson.length > 0) {
+        const refsArray = JSON.parse(searchReferencesJson) as SearchReferenceJsonData[]
+        for (let i = 0; i < refsArray.length; i++) {
+          const refData = refsArray[i]
+          const ref = new SearchReference(
+            refData.id,
+            refData.title,
+            refData.url,
+            refData.snippet
+          )
+          ref.timestamp = refData.timestamp
+          message.searchReferences.push(ref)
+        }
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to parse search references: ${JSON.stringify(error)}`)
+    }
+    return message
+  }
+
+  private async populateAttachmentsForMessages(messages: ChatMessage[]): Promise<void> {
+    if (messages.length === 0) {
+      return
+    }
+    const messageIds: string[] = []
+    for (let i = 0; i < messages.length; i++) {
+      messageIds.push(messages[i].id)
+    }
+    const attachmentsMap = await this.getAttachmentsByMessageIds(messageIds)
+    for (let i = 0; i < messages.length; i++) {
+      const attachments = attachmentsMap.get(messages[i].id)
+      messages[i].attachments = attachments !== undefined ? attachments : []
+    }
+  }
+
+  private async queryMessagesByPredicates(
+    predicates: relationalStore.RdbPredicates,
+    limit: number = 0
+  ): Promise<ChatMessage[]> {
+    const messages: ChatMessage[] = []
+    if (this.rdbStore === null) {
+      return messages
+    }
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      try {
+        while (resultSet.goToNextRow()) {
+          if (limit > 0 && messages.length >= limit) {
+            break
+          }
+          messages.push(this.buildChatMessageFromResultSet(resultSet))
+        }
+      } finally {
+        resultSet.close()
+      }
+      await this.populateAttachmentsForMessages(messages)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to query messages: ${JSON.stringify(error)}`)
+    }
+    return messages
+  }
+
+  // 获取会话的所有消息
+  async getMessages(sessionId: string): Promise<ChatMessage[]> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return []
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+    predicates.equalTo('session_id', sessionId)
+    predicates.orderByAsc('timestamp')
+    return await this.queryMessagesByPredicates(predicates)
+  }
+
+  // 删除消息
+  async deleteMessage(messageId: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const sessionId = await this.getMessageSessionId(messageId)
+    try {
+      // 先删除附件记录（不删除文件，可能被重新生成复用）
+      const attachmentPredicates = new relationalStore.RdbPredicates(TableNames.ATTACHMENTS)
+      attachmentPredicates.equalTo('message_id', messageId)
+      await this.rdbStore.delete(attachmentPredicates)
+
+      const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+      predicates.equalTo('id', messageId)
+      await this.rdbStore.delete(predicates)
+
+      if (sessionId !== '') {
+        await this.refreshSessionSummary(sessionId)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to delete message: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 批量删除消息
+  async deleteMessagesByIds(messageIds: string[]): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    if (messageIds.length === 0) {
+      return
+    }
+    try {
+      const touchedSessionIds: string[] = []
+      for (let i = 0; i < messageIds.length; i++) {
+        const sessionId = await this.getMessageSessionId(messageIds[i])
+        this.addUniqueSessionId(touchedSessionIds, sessionId)
+
+        // 先删除附件记录（不删除文件，可能被重新生成复用）
+        const attachmentPredicates = new relationalStore.RdbPredicates(TableNames.ATTACHMENTS)
+        attachmentPredicates.equalTo('message_id', messageIds[i])
+        await this.rdbStore.delete(attachmentPredicates)
+
+        const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+        predicates.equalTo('id', messageIds[i])
+        await this.rdbStore.delete(predicates)
+      }
+      for (let i = 0; i < touchedSessionIds.length; i++) {
+        await this.refreshSessionSummary(touchedSessionIds[i])
+      }
+      console.info('DatabaseService', `Deleted ${messageIds.length} messages with attachments`)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to delete messages: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 更新消息内容
+  async updateMessageContent(messageId: string, content: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      content: content
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+    predicates.equalTo('id', messageId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+
+      const sessionId = await this.getMessageSessionId(messageId)
+      if (sessionId !== '') {
+        await this.refreshSessionSummary(sessionId)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update message: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 更新消息附件
+  async updateMessageAttachments(messageId: string, attachments: MessageAttachment[]): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      // 1. 先删除该消息的所有附件
+      const deletePredicates = new relationalStore.RdbPredicates(TableNames.ATTACHMENTS)
+      deletePredicates.equalTo('message_id', messageId)
+      await this.rdbStore.delete(deletePredicates)
+
+      // 2. 插入新的附件
+      for (let i = 0; i < attachments.length; i++) {
+        const attachment = attachments[i]
+        const valueBucket = this.buildAttachmentValueBucket(messageId, attachment)
+        await this.rdbStore.insert(TableNames.ATTACHMENTS, valueBucket)
+      }
+      console.info('DatabaseService', `Updated attachments for message ${messageId}: ${attachments.length} attachments`)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update message attachments: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // ============ 生成图片图库 ============
+
+  async insertGeneratedMedia(media: GeneratedMedia): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: media.id,
+      type: media.type,
+      prompt: media.prompt,
+      provider_id: media.providerId,
+      provider_name: media.providerName,
+      model_id: media.modelId,
+      model_name: media.modelName,
+      file_path: media.filePath,
+      mime_type: media.mimeType,
+      aspect_ratio: media.aspectRatio,
+      source_paths_json: media.sourcePathsJson,
+      request_options_json: media.requestOptionsJson,
+      actual_options_json: media.actualOptionsJson,
+      revised_prompt: media.revisedPrompt,
+      created_at: media.createdAt
+    }
+    try {
+      const predicates = new relationalStore.RdbPredicates(TableNames.GENERATED_MEDIA)
+      predicates.equalTo('id', media.id)
+      const resultSet = await this.rdbStore.query(predicates)
+      const exists = resultSet.goToNextRow()
+      resultSet.close()
+      if (exists) {
+        await this.rdbStore.update(valueBucket, predicates)
+      } else {
+        await this.rdbStore.insert(TableNames.GENERATED_MEDIA, valueBucket)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to insert generated media: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 追加一条 token 用量账本事件(只追加,不更新/去重)。
+  // 调用方在流式收割点每轮写入一条,event.id 由上层用 generateId() 保证唯一。
+  async insertTokenUsageEvent(event: TokenUsageEvent): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: event.id,
+      session_id: event.sessionId,
+      message_id: event.messageId,
+      provider_id: event.providerId,
+      model_id: event.modelId,
+      model_name: event.modelName,
+      prompt_tokens: event.promptTokens,
+      completion_tokens: event.completionTokens,
+      total_tokens: event.totalTokens,
+      kind: event.kind,
+      created_at: event.createdAt
+    }
+    try {
+      await this.rdbStore.insert(TableNames.TOKEN_USAGE_EVENTS, valueBucket)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to insert token usage event: ${JSON.stringify(error)}`)
+    }
+  }
+
+  async getGeneratedMediaList(limit: number = 200): Promise<GeneratedMedia[]> {
+    await this.waitForInitialization()
+    const result: GeneratedMedia[] = []
+    if (this.rdbStore === null) {
+      return result
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.GENERATED_MEDIA)
+    predicates.orderByDesc('created_at')
+    if (limit > 0) {
+      predicates.limitAs(limit)
+    }
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      while (resultSet.goToNextRow()) {
+        result.push(this.buildGeneratedMediaFromResultSet(resultSet))
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get generated media: ${JSON.stringify(error)}`)
+    }
+    return result
+  }
+
+  async deleteGeneratedMedia(id: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null || id === '') {
+      return
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.GENERATED_MEDIA)
+    predicates.equalTo('id', id)
+    try {
+      await this.rdbStore.delete(predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to delete generated media: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private buildGeneratedMediaFromResultSet(resultSet: relationalStore.ResultSet): GeneratedMedia {
+    const media = new GeneratedMedia()
+    media.id = this.safeGetString(resultSet, 'id')
+    media.type = this.safeGetString(resultSet, 'type')
+    media.prompt = this.safeGetString(resultSet, 'prompt')
+    media.providerId = this.safeGetString(resultSet, 'provider_id')
+    media.providerName = this.safeGetString(resultSet, 'provider_name')
+    media.modelId = this.safeGetString(resultSet, 'model_id')
+    media.modelName = this.safeGetString(resultSet, 'model_name')
+    media.filePath = this.safeGetString(resultSet, 'file_path')
+    media.mimeType = this.safeGetString(resultSet, 'mime_type', 'image/png')
+    media.aspectRatio = this.safeGetString(resultSet, 'aspect_ratio')
+    media.sourcePathsJson = this.safeGetString(resultSet, 'source_paths_json')
+    media.requestOptionsJson = this.safeGetString(resultSet, 'request_options_json')
+    media.actualOptionsJson = this.safeGetString(resultSet, 'actual_options_json')
+    media.revisedPrompt = this.safeGetString(resultSet, 'revised_prompt')
+    try {
+      media.createdAt = resultSet.getLong(resultSet.getColumnIndex('created_at'))
+    } catch (_error) {
+      media.createdAt = 0
+    }
+    return media
+  }
+
+  // ============ 服务商操作 ============
+
+  // 保存服务商配置
+  async saveProvider(provider: ModelProvider, insertAtFront: boolean = false): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+
+    // 将 models 数组转换为 JSON 字符串（使用扩展格式）
+    const modelsArray: ModelJsonData[] = []
+    for (let i = 0; i < provider.models.length; i++) {
+      const model = provider.models[i]
+
+      // 构建能力配置对象
+      const capabilitiesData: CapabilitiesJsonData = {
+        supportsTools: model.capabilities.supportsTools,
+        supportsReasoning: model.capabilities.supportsReasoning,
+        supportsWebSearch: model.capabilities.supportsWebSearch,
+        supportsVision: model.capabilities.supportsVision,
+        supportsStreaming: model.capabilities.supportsStreaming
+      }
+
+      // 构建模型数据对象
+      const modelObj: ModelJsonData = {
+        id: model.id,
+        name: model.name,
+        contextLength: model.contextLength,
+        isEnabled: model.isEnabled,
+        isRecommended: model.isRecommended,
+        modelType: model.modelType,
+        inputMode: model.inputMode,
+        outputMode: model.outputMode,
+        capabilities: capabilitiesData,
+        capabilitiesUserModified: model.capabilitiesUserModified
+      }
+      modelsArray.push(modelObj)
+    }
+    const modelsJson = JSON.stringify(modelsArray)
+
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: provider.id,
+      name: provider.name,
+      type: provider.type,
+      api_style: provider.apiStyle,
+      openai_transport: provider.openaiTransport,
+      api_key: provider.apiKey,
+      requires_api_key: provider.requiresApiKey ? 1 : 0,
+      base_url: provider.baseUrl,
+      is_enabled: provider.isConnected ? 1 : 0,
+      models_json: modelsJson,
+      icon_symbol: provider.iconSymbol,
+      brand_color: '',
+      is_preset: provider.isPreset ? 1 : 0,
+      icon_path: provider.iconPath,
+      api_path: provider.apiPath,
+      custom_headers_json: provider.customHeadersJson,
+      icon_type: provider.iconType,
+      text_icon: provider.textIcon,
+      text_icon_bg_color: provider.textIconBgColor,
+      custom_image_path: provider.customImagePath
+    }
+
+    try {
+      // 先检查是否存在
+      const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+      predicates.equalTo('id', provider.id)
+      const resultSet = await this.rdbStore.query(predicates)
+      const exists = resultSet.goToNextRow()
+      resultSet.close()
+
+      if (exists) {
+        await this.rdbStore.update(valueBucket, predicates)
+      } else {
+        valueBucket.sort_order = insertAtFront ? 0 : await this.getNextProviderSortOrder()
+        if (insertAtFront) {
+          await this.rdbStore.executeSql(`UPDATE ${TableNames.PROVIDERS} SET sort_order = sort_order + 1`)
+        }
+        await this.rdbStore.insert(TableNames.PROVIDERS, valueBucket)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to save provider: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private async getNextProviderSortOrder(): Promise<number> {
+    if (this.rdbStore === null) {
+      return 0
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+    predicates.orderByDesc('sort_order')
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      let nextSortOrder = 0
+      if (resultSet.goToNextRow()) {
+        nextSortOrder = resultSet.getLong(resultSet.getColumnIndex('sort_order')) + 1
+      }
+      resultSet.close()
+      return nextSortOrder
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get next provider sort order: ${JSON.stringify(error)}`)
+      return 0
+    }
+  }
+
+  // 获取所有服务商配置
+  async getAllProviders(): Promise<ProviderConfig[]> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return []
+    }
+    const providers: ProviderConfig[] = []
+    const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+    predicates.orderByAsc('sort_order')
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      while (resultSet.goToNextRow()) {
+        // 安全读取 is_preset 字段
+        let isPreset = false
+        try {
+          isPreset = resultSet.getLong(resultSet.getColumnIndex('is_preset')) === 1
+        } catch (e) {
+          isPreset = false
+        }
+        // 安全读取 icon_path 字段
+        let iconPath = ''
+        try {
+          iconPath = resultSet.getString(resultSet.getColumnIndex('icon_path'))
+        } catch (e) {
+          iconPath = ''
+        }
+        // 安全读取 api_path 字段
+        let apiPath = ''
+        try {
+          apiPath = resultSet.getString(resultSet.getColumnIndex('api_path'))
+        } catch (e) {
+          apiPath = ''
+        }
+        let openaiTransport = 'chat_completions'
+        try {
+          openaiTransport = resultSet.getString(resultSet.getColumnIndex('openai_transport'))
+        } catch (e) {
+          openaiTransport = 'chat_completions'
+        }
+        // 安全读取图标类型相关字段
+        let iconType = 'svg'
+        try {
+          iconType = resultSet.getString(resultSet.getColumnIndex('icon_type'))
+        } catch (e) {
+          iconType = 'svg'
+        }
+        let textIcon = ''
+        try {
+          textIcon = resultSet.getString(resultSet.getColumnIndex('text_icon'))
+        } catch (e) {
+          textIcon = ''
+        }
+        let textIconBgColor = ''
+        try {
+          textIconBgColor = resultSet.getString(resultSet.getColumnIndex('text_icon_bg_color'))
+        } catch (e) {
+          textIconBgColor = ''
+        }
+        let customImagePath = ''
+        try {
+          customImagePath = resultSet.getString(resultSet.getColumnIndex('custom_image_path'))
+        } catch (e) {
+          customImagePath = ''
+        }
+        let customHeadersJson = ''
+        try {
+          customHeadersJson = resultSet.getString(resultSet.getColumnIndex('custom_headers_json'))
+        } catch (e) {
+          customHeadersJson = ''
+        }
+        let requiresApiKey = true
+        try {
+          requiresApiKey = resultSet.getLong(resultSet.getColumnIndex('requires_api_key')) === 1
+        } catch (e) {
+          requiresApiKey = true
+        }
+
+        const config: ProviderConfig = {
+          id: resultSet.getString(resultSet.getColumnIndex('id')),
+          name: resultSet.getString(resultSet.getColumnIndex('name')),
+          type: resultSet.getString(resultSet.getColumnIndex('type')),
+          apiStyle: resultSet.getString(resultSet.getColumnIndex('api_style')),
+          openaiTransport: openaiTransport,
+          apiKey: resultSet.getString(resultSet.getColumnIndex('api_key')),
+          requiresApiKey: requiresApiKey,
+          baseUrl: resultSet.getString(resultSet.getColumnIndex('base_url')),
+          isEnabled: resultSet.getLong(resultSet.getColumnIndex('is_enabled')) === 1,
+          modelsJson: resultSet.getString(resultSet.getColumnIndex('models_json')),
+          iconSymbol: resultSet.getString(resultSet.getColumnIndex('icon_symbol')),
+          sortOrder: resultSet.getLong(resultSet.getColumnIndex('sort_order')),
+          isPreset: isPreset,
+          iconPath: iconPath,
+          apiPath: apiPath,
+          customHeadersJson: customHeadersJson,
+          iconType: iconType,
+          textIcon: textIcon,
+          textIconBgColor: textIconBgColor,
+          customImagePath: customImagePath
+        }
+        providers.push(config)
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get providers: ${JSON.stringify(error)}`)
+    }
+    return providers
+  }
+
+  // 删除服务商配置
+  async deleteProvider(providerId: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+    predicates.equalTo('id', providerId)
+    try {
+      await this.rdbStore.delete(predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to delete provider: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 更新服务商启用状态
+  async updateProviderEnabled(providerId: string, isEnabled: boolean): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      is_enabled: isEnabled ? 1 : 0
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+    predicates.equalTo('id', providerId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update provider enabled status: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 更新服务商 baseUrl
+  async updateProviderBaseUrl(providerId: string, baseUrl: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      base_url: baseUrl
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+    predicates.equalTo('id', providerId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update provider baseUrl: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 获取单个服务商的 API Key
+  async getProviderApiKey(providerId: string): Promise<string> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return ''
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+    predicates.equalTo('id', providerId)
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      if (resultSet.goToNextRow()) {
+        const apiKey = resultSet.getString(resultSet.getColumnIndex('api_key'))
+        resultSet.close()
+        return apiKey
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get API key: ${JSON.stringify(error)}`)
+    }
+    return ''
+  }
+
+  // 更新供应商排序顺序
+  async updateProviderSortOrder(providerId: string, sortOrder: number): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    const valueBucket: relationalStore.ValuesBucket = {
+      sort_order: sortOrder
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+    predicates.equalTo('id', providerId)
+    try {
+      await this.rdbStore.update(valueBucket, predicates)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update provider sort order: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // 批量更新供应商排序顺序
+  async updateProvidersOrder(providerIds: string[]): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+    try {
+      for (let i = 0; i < providerIds.length; i++) {
+        const valueBucket: relationalStore.ValuesBucket = {
+          sort_order: i
+        }
+        const predicates = new relationalStore.RdbPredicates(TableNames.PROVIDERS)
+        predicates.equalTo('id', providerIds[i])
+        await this.rdbStore.update(valueBucket, predicates)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to update providers order: ${JSON.stringify(error)}`)
+    }
+  }
+
+  // ============ 工具事件操作 ============
+
+  // 保存工具事件
+  async saveToolEvent(
+    sessionId: string,
+    messageId: string,
+    toolCallId: string,
+    toolName: string,
+    toolDisplayName: string,
+    sourceLabel: string,
+    sourceType: string,
+    permissionLevel: string,
+    toolArguments: string,
+    toolResult: string,
+    status: string
+  ): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+
+    const eventId = `${toolCallId}_${Date.now()}`
+    const now = Date.now()
+
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: eventId,
+      session_id: sessionId,
+      message_id: messageId,
+      tool_call_id: toolCallId,
+      tool_name: toolName,
+      tool_display_name: toolDisplayName,
+      source_label: sourceLabel,
+      source_type: sourceType,
+      permission_level: permissionLevel,
+      tool_arguments: toolArguments,
+      tool_result: toolResult,
+      status: status,
+      created_at: now,
+      completed_at: status === 'pending' ? 0 : now
+    }
+
+    try {
+      await this.rdbStore.insert(TableNames.TOOL_EVENTS, valueBucket)
+      console.info('DatabaseService', `Tool event saved: ${eventId}`)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to save tool event: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private buildToolEventDataFromResultSet(resultSet: relationalStore.ResultSet): ToolEventData {
+    const eventData: ToolEventData = {
+      id: this.safeGetString(resultSet, 'id'),
+      sessionId: this.safeGetString(resultSet, 'session_id'),
+      messageId: this.safeGetString(resultSet, 'message_id'),
+      toolCallId: this.safeGetString(resultSet, 'tool_call_id'),
+      toolName: this.safeGetString(resultSet, 'tool_name'),
+      toolDisplayName: this.safeGetString(resultSet, 'tool_display_name'),
+      sourceLabel: this.safeGetString(resultSet, 'source_label'),
+      sourceType: this.safeGetString(resultSet, 'source_type'),
+      permissionLevel: this.safeGetString(resultSet, 'permission_level', 'read'),
+      toolArguments: this.safeGetString(resultSet, 'tool_arguments'),
+      toolResult: this.safeGetString(resultSet, 'tool_result'),
+      status: this.safeGetString(resultSet, 'status'),
+      createdAt: this.safeGetLong(resultSet, 'created_at'),
+      completedAt: this.safeGetLong(resultSet, 'completed_at')
+    }
+    return eventData
+  }
+
+  private async queryToolEventsByMessageIds(messageIds: string[]): Promise<ToolEventData[]> {
+    const events: ToolEventData[] = []
+    if (this.rdbStore === null || messageIds.length === 0) {
+      return events
+    }
+
+    for (let start = 0; start < messageIds.length; start += DB_BATCH_CHUNK_SIZE) {
+      const chunk = messageIds.slice(start, start + DB_BATCH_CHUNK_SIZE)
+      const predicates = new relationalStore.RdbPredicates(TableNames.TOOL_EVENTS)
+      predicates.in('message_id', chunk)
+      predicates.orderByAsc('created_at')
+
+      try {
+        const resultSet = await this.rdbStore.query(predicates)
+        while (resultSet.goToNextRow()) {
+          events.push(this.buildToolEventDataFromResultSet(resultSet))
+        }
+        resultSet.close()
+      } catch (error) {
+        console.error('DatabaseService', `Failed to batch get tool events: ${JSON.stringify(error)}`)
+      }
+    }
+
+    return events
+  }
+
+  private buildCopiedToolEventValueBucket(
+    event: ToolEventData,
+    targetSessionId: string,
+    targetMessageId: string,
+    eventIndex: number
+  ): relationalStore.ValuesBucket {
+    const sourceEventId = event.id !== '' ? event.id : `${event.toolCallId}_${eventIndex}`
+    const valueBucket: relationalStore.ValuesBucket = {
+      id: `${targetMessageId}_${sourceEventId}`,
+      session_id: targetSessionId,
+      message_id: targetMessageId,
+      tool_call_id: event.toolCallId,
+      tool_name: event.toolName,
+      tool_display_name: event.toolDisplayName,
+      source_label: event.sourceLabel,
+      source_type: event.sourceType,
+      permission_level: event.permissionLevel,
+      tool_arguments: event.toolArguments,
+      tool_result: event.toolResult,
+      status: event.status,
+      created_at: event.createdAt,
+      completed_at: event.completedAt
+    }
+    return valueBucket
+  }
+
+  // 获取消息相关的工具事件
+  async getToolEvents(messageId: string): Promise<ToolEventData[]> {
+    await this.waitForInitialization()
+    return await this.queryToolEventsByMessageIds([messageId])
+  }
+
+  async copyToolEventsForMessage(
+    sourceMessageId: string,
+    targetSessionId: string,
+    targetMessageId: string
+  ): Promise<void> {
+    const sourceToTargetMessageIds = new Map<string, string>()
+    sourceToTargetMessageIds.set(sourceMessageId, targetMessageId)
+    await this.copyToolEventsForMessages(sourceToTargetMessageIds, targetSessionId)
+  }
+
+  async copyToolEventsForMessages(
+    sourceToTargetMessageIds: Map<string, string>,
+    targetSessionId: string
+  ): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null || sourceToTargetMessageIds.size === 0) {
+      return
+    }
+
+    const events = await this.queryToolEventsByMessageIds(Array.from(sourceToTargetMessageIds.keys()))
+    if (events.length === 0 || this.rdbStore === null) {
+      return
+    }
+
+    const valueBuckets: relationalStore.ValuesBucket[] = []
+    for (let i = 0; i < events.length; i++) {
+      const event = events[i]
+      const targetMessageId = sourceToTargetMessageIds.get(event.messageId)
+      if (targetMessageId === undefined) {
+        continue
+      }
+      valueBuckets.push(this.buildCopiedToolEventValueBucket(event, targetSessionId, targetMessageId, i))
+    }
+
+    if (valueBuckets.length === 0) {
+      return
+    }
+
+    try {
+      await this.batchInsertValueBuckets(TableNames.TOOL_EVENTS, valueBuckets)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to batch copy tool events: ${JSON.stringify(error)}`)
+      await this.insertValueBucketsIndividually(
+        TableNames.TOOL_EVENTS,
+        valueBuckets,
+        'Failed to copy tool event'
+      )
+    }
+  }
+
+  // 获取会话的所有工具事件
+  async getToolEventsBySession(sessionId: string): Promise<ToolEventData[]> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return []
+    }
+
+    const events: ToolEventData[] = []
+    const predicates = new relationalStore.RdbPredicates(TableNames.TOOL_EVENTS)
+    predicates.equalTo('session_id', sessionId)
+    predicates.orderByAsc('created_at')
+
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      while (resultSet.goToNextRow()) {
+        events.push(this.buildToolEventDataFromResultSet(resultSet))
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get tool events by session: ${JSON.stringify(error)}`)
+    }
+
+    return events
+  }
+
+  // 获取最近的工具事件（按时间倒序）
+  async getRecentToolEvents(limit: number = 20): Promise<ToolEventData[]> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return []
+    }
+
+    const events: ToolEventData[] = []
+    const predicates = new relationalStore.RdbPredicates(TableNames.TOOL_EVENTS)
+    predicates.orderByDesc('created_at')
+
+    try {
+      const resultSet = await this.rdbStore.query(predicates)
+      let count = 0
+      while (resultSet.goToNextRow()) {
+        if (count >= limit) {
+          break
+        }
+        events.push(this.buildToolEventDataFromResultSet(resultSet))
+        count = count + 1
+      }
+      resultSet.close()
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get recent tool events: ${JSON.stringify(error)}`)
+    }
+
+    return events
+  }
+
+  // 删除消息相关的工具事件
+  async deleteToolEvents(messageId: string): Promise<void> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return
+    }
+
+    const predicates = new relationalStore.RdbPredicates(TableNames.TOOL_EVENTS)
+    predicates.equalTo('message_id', messageId)
+
+    try {
+      await this.rdbStore.delete(predicates)
+      console.info('DatabaseService', `Tool events deleted for message: ${messageId}`)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to delete tool events: ${JSON.stringify(error)}`)
+    }
+  }
+
+  private safeGetString(resultSet: relationalStore.ResultSet, columnName: string, defaultValue: string = ''): string {
+    try {
+      return resultSet.getString(resultSet.getColumnIndex(columnName))
+    } catch (_error) {
+      return defaultValue
+    }
+  }
+
+  private safeGetLong(resultSet: relationalStore.ResultSet, columnName: string, defaultValue: number = 0): number {
+    try {
+      return resultSet.getLong(resultSet.getColumnIndex(columnName))
+    } catch (_error) {
+      return defaultValue
+    }
+  }
+
+  private applyAttachmentParseFields(resultSet: relationalStore.ResultSet, attachment: MessageAttachment): void {
+    attachment.processState = this.safeGetString(resultSet, 'process_state', attachment.processState)
+    attachment.parseEngine = this.safeGetString(resultSet, 'parse_engine')
+    attachment.parsedText = this.safeGetString(resultSet, 'parsed_text')
+    attachment.parseError = this.safeGetString(resultSet, 'parse_error')
+  }
+
+  // ==================== 使用统计聚合查询 ====================
+
+  private applyUsageRange(
+    predicates: relationalStore.RdbPredicates,
+    field: string,
+    rangeStartMs: number
+  ): void {
+    if (rangeStartMs > 0) {
+      predicates.greaterThanOrEqualTo(field, rangeStartMs)
+    }
+  }
+
+  private async countRows(
+    tableName: string,
+    rangeField: string,
+    rangeStartMs: number
+  ): Promise<number> {
+    if (this.rdbStore === null) {
+      return 0
+    }
+    const predicates = new relationalStore.RdbPredicates(tableName)
+    this.applyUsageRange(predicates, rangeField, rangeStartMs)
+    let resultSet: relationalStore.ResultSet
+    try {
+      resultSet = await this.rdbStore.query(predicates, ['id'])
+    } catch (error) {
+      console.error('DatabaseService', `Failed to count rows: ${JSON.stringify(error)}`)
+      return 0
+    }
+    try {
+      let count = 0
+      try {
+        while (resultSet.goToNextRow()) {
+          count += 1
+        }
+      } catch (error) {
+        console.error('DatabaseService', `Failed to iterate row count: ${JSON.stringify(error)}`)
+        return 0
+      }
+      return count
+    } finally {
+      try {
+        resultSet.close()
+      } catch (error) {
+        console.error('DatabaseService', `Failed to close row count result set: ${JSON.stringify(error)}`)
+      }
+    }
+  }
+
+  private isValidUsageModelName(modelName: string): boolean {
+    const normalized = modelName.trim()
+    return normalized !== '' && normalized !== '未知模型' && normalized !== 'Unknown Model'
+  }
+
+  private buildLocalDayKey(timestamp: number): string {
+    const date = new Date(timestamp)
+    const year = date.getFullYear().toString()
+    const month = (date.getMonth() + 1).toString().padStart(2, '0')
+    const day = date.getDate().toString().padStart(2, '0')
+    return `${year}-${month}-${day}`
+  }
+
+  private async collectMessageUsageRows(rangeStartMs: number): Promise<UsageMessageRow[]> {
+    const rows: UsageMessageRow[] = []
+    if (this.rdbStore === null) {
+      return rows
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.MESSAGES)
+    this.applyUsageRange(predicates, 'timestamp', rangeStartMs)
+    let resultSet: relationalStore.ResultSet
+    try {
+      resultSet = await this.rdbStore.query(predicates,
+        ['role', 'model_name', 'model_id', 'timestamp'])
+    } catch (error) {
+      console.error('DatabaseService', `Failed to collect message usage rows: ${JSON.stringify(error)}`)
+      return rows
+    }
+    try {
+      try {
+        while (resultSet.goToNextRow()) {
+          rows.push({
+            role: this.safeGetString(resultSet, 'role'),
+            modelName: this.safeGetString(resultSet, 'model_name'),
+            modelId: this.safeGetString(resultSet, 'model_id'),
+            timestamp: this.safeGetLong(resultSet, 'timestamp')
+          })
+        }
+      } catch (error) {
+        console.error('DatabaseService', `Failed to iterate message usage rows: ${JSON.stringify(error)}`)
+      }
+    } finally {
+      try {
+        resultSet.close()
+      } catch (error) {
+        console.error('DatabaseService', `Failed to close message usage result set: ${JSON.stringify(error)}`)
+      }
+    }
+    return rows
+  }
+
+  // 拉取 token 用量账本行(按 created_at 范围过滤),内存聚合。
+  // 账本只追加,故这里读到的是"实际累计消耗",不受消息删除/重新生成影响。
+  private async collectTokenUsageEventRows(rangeStartMs: number): Promise<TokenUsageEventRow[]> {
+    const rows: TokenUsageEventRow[] = []
+    if (this.rdbStore === null) {
+      return rows
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.TOKEN_USAGE_EVENTS)
+    this.applyUsageRange(predicates, 'created_at', rangeStartMs)
+    let resultSet: relationalStore.ResultSet
+    try {
+      resultSet = await this.rdbStore.query(predicates,
+        ['message_id', 'model_name', 'model_id', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'created_at'])
+    } catch (error) {
+      console.error('DatabaseService', `Failed to collect token usage event rows: ${JSON.stringify(error)}`)
+      return rows
+    }
+    try {
+      try {
+        while (resultSet.goToNextRow()) {
+          rows.push({
+            messageId: this.safeGetString(resultSet, 'message_id'),
+            modelName: this.safeGetString(resultSet, 'model_name'),
+            modelId: this.safeGetString(resultSet, 'model_id'),
+            promptTokens: this.safeGetLong(resultSet, 'prompt_tokens'),
+            completionTokens: this.safeGetLong(resultSet, 'completion_tokens'),
+            totalTokens: this.safeGetLong(resultSet, 'total_tokens'),
+            createdAt: this.safeGetLong(resultSet, 'created_at')
+          })
+        }
+      } catch (error) {
+        console.error('DatabaseService', `Failed to iterate token usage event rows: ${JSON.stringify(error)}`)
+      }
+    } finally {
+      try {
+        resultSet.close()
+      } catch (error) {
+        console.error('DatabaseService', `Failed to close token usage event result set: ${JSON.stringify(error)}`)
+      }
+    }
+    return rows
+  }
+
+  private buildModelUsageRankingFromRows(rows: UsageMessageRow[], limit: number): ModelUsageRankingItem[] {
+    const stats = new Map<string, ModelUsageRankingItem>()
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]
+      if (row.role !== MessageRole.ASSISTANT || !this.isValidUsageModelName(row.modelName)) {
+        continue
+      }
+      const modelName = row.modelName.trim()
+      const existing = stats.get(modelName)
+      if (existing !== undefined) {
+        existing.count += 1
+        if (existing.modelId === '' && row.modelId.trim() !== '') {
+          existing.modelId = row.modelId.trim()
+        }
+      } else {
+        stats.set(modelName, {
+          modelName: modelName,
+          modelId: row.modelId.trim(),
+          count: 1
+        })
+      }
+    }
+    const items = Array.from(stats.values())
+    items.sort((a: ModelUsageRankingItem, b: ModelUsageRankingItem): number => {
+      if (b.count !== a.count) {
+        return b.count - a.count
+      }
+      return a.modelName.localeCompare(b.modelName)
+    })
+    const safeLimit = limit > 0 ? limit : 10
+    return items.slice(0, safeLimit)
+  }
+
+  // 获取总览统计数据(总会话/总消息/独立模型数/活跃天数)
+  // rangeStartMs: 0 表示全部时间;>0 表示从该时间戳开始统计
+  async getUsageOverview(rangeStartMs: number = 0): Promise<UsageOverviewStats> {
+    await this.waitForInitialization()
+    const result: UsageOverviewStats = {
+      sessionCount: 0,
+      messageCount: 0,
+      distinctModelCount: 0,
+      activeDayCount: 0,
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      tokenMessageCount: 0
+    }
+    if (this.rdbStore === null) {
+      return result
+    }
+    try {
+      const rows = await this.collectMessageUsageRows(rangeStartMs)
+      const modelNames = new Map<string, boolean>()
+      const activeDays = new Map<string, boolean>()
+      result.messageCount = rows.length
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        if (row.role === MessageRole.ASSISTANT && this.isValidUsageModelName(row.modelName)) {
+          modelNames.set(row.modelName.trim(), true)
+        }
+        if (row.timestamp > 0) {
+          activeDays.set(this.buildLocalDayKey(row.timestamp), true)
+        }
+      }
+      result.distinctModelCount = modelNames.size
+      result.activeDayCount = activeDays.size
+      // Token 口径=实际累计消耗:取自只追加的账本(不随消息删除/重新生成回收),与会话态指标解耦。
+      // tokenMessageCount 用账本中去重后的 message_id 数,作为"平均每条回复"的分母。
+      const eventRows = await this.collectTokenUsageEventRows(rangeStartMs)
+      const tokenMessageIds = new Map<string, boolean>()
+      for (let i = 0; i < eventRows.length; i++) {
+        const eventRow = eventRows[i]
+        if (eventRow.totalTokens <= 0) {
+          continue
+        }
+        result.totalTokens += eventRow.totalTokens
+        result.inputTokens += eventRow.promptTokens
+        result.outputTokens += eventRow.completionTokens
+        if (eventRow.messageId !== '') {
+          tokenMessageIds.set(eventRow.messageId, true)
+        }
+      }
+      result.tokenMessageCount = tokenMessageIds.size
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get usage overview: ${JSON.stringify(error)}`)
+    }
+    try {
+      result.sessionCount = await this.countRows(TableNames.SESSIONS, 'updated_at', rangeStartMs)
+    } catch (error) {
+      console.error('DatabaseService', `Failed to count usage sessions: ${JSON.stringify(error)}`)
+    }
+    return result
+  }
+
+  // 获取模型调用排行
+  // 仅统计 role='assistant' 且 model_name 有效的消息;按 model_name 分组(同名模型在不同 provider 视为同一项)
+  async getModelUsageRanking(rangeStartMs: number = 0, limit: number = 10): Promise<ModelUsageRankingItem[]> {
+    await this.waitForInitialization()
+    const items: ModelUsageRankingItem[] = []
+    if (this.rdbStore === null) {
+      return items
+    }
+    const safeLimit = limit > 0 ? limit : 10
+    try {
+      const ranking = this.buildModelUsageRankingFromRows(await this.collectMessageUsageRows(rangeStartMs), safeLimit)
+      for (let i = 0; i < ranking.length; i++) {
+        items.push(ranking[i])
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get model usage ranking: ${JSON.stringify(error)}`)
+    }
+    return items
+  }
+
+  private buildTokenModelRankingFromEventRows(rows: TokenUsageEventRow[], limit: number): TokenModelRankingItem[] {
+    const stats = new Map<string, TokenModelRankingItem>()
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]
+      if (row.totalTokens <= 0 || !this.isValidUsageModelName(row.modelName)) {
+        continue
+      }
+      const modelName = row.modelName.trim()
+      const existing = stats.get(modelName)
+      if (existing !== undefined) {
+        existing.totalTokens += row.totalTokens
+        existing.inputTokens += row.promptTokens
+        existing.outputTokens += row.completionTokens
+        if (existing.modelId === '' && row.modelId.trim() !== '') {
+          existing.modelId = row.modelId.trim()
+        }
+      } else {
+        stats.set(modelName, {
+          modelName: modelName,
+          modelId: row.modelId.trim(),
+          totalTokens: row.totalTokens,
+          inputTokens: row.promptTokens,
+          outputTokens: row.completionTokens
+        })
+      }
+    }
+    const items = Array.from(stats.values())
+    items.sort((a: TokenModelRankingItem, b: TokenModelRankingItem): number => {
+      if (b.totalTokens !== a.totalTokens) {
+        return b.totalTokens - a.totalTokens
+      }
+      return a.modelName.localeCompare(b.modelName)
+    })
+    const safeLimit = limit > 0 ? limit : 10
+    return items.slice(0, safeLimit)
+  }
+
+  // 获取 Token 消耗模型排行(账本求和,按 model_name 分组,口径同模型调用排行;total_tokens 降序)
+  async getTokenModelRanking(rangeStartMs: number = 0, limit: number = 10): Promise<TokenModelRankingItem[]> {
+    await this.waitForInitialization()
+    const items: TokenModelRankingItem[] = []
+    if (this.rdbStore === null) {
+      return items
+    }
+    const safeLimit = limit > 0 ? limit : 10
+    try {
+      const ranking = this.buildTokenModelRankingFromEventRows(await this.collectTokenUsageEventRows(rangeStartMs), safeLimit)
+      for (let i = 0; i < ranking.length; i++) {
+        items.push(ranking[i])
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get token model ranking: ${JSON.stringify(error)}`)
+    }
+    return items
+  }
+
+  // 把 (dayKey -> 值) 的 Map 整理成最近 dayCount 天的连续序列(本地时区,缺失天补 0)
+  private buildContinuousDailyTrend(valueByDay: Map<string, number>, dayCount: number): DailyUsagePoint[] {
+    const points: DailyUsagePoint[] = []
+    const now = new Date()
+    // 以本地零点为基准向前回溯,保证桶键与 buildLocalDayKey 一致
+    const baseMs = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+    const dayMs = 24 * 60 * 60 * 1000
+    for (let i = dayCount - 1; i >= 0; i--) {
+      const dayKey = this.buildLocalDayKey(baseMs - i * dayMs)
+      const value = valueByDay.get(dayKey)
+      points.push({ day: dayKey, value: value !== undefined ? value : 0 })
+    }
+    return points
+  }
+
+  // 获取最近 dayCount 天的每日 Token 用量趋势(本地时区分桶,账本 total_tokens 求和)
+  async getTokenDailyTrend(dayCount: number = 30): Promise<DailyUsagePoint[]> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return []
+    }
+    const safeDayCount = dayCount > 0 ? dayCount : 30
+    const sinceMs = Date.now() - safeDayCount * 24 * 60 * 60 * 1000
+    const valueByDay = new Map<string, number>()
+    try {
+      const rows = await this.collectTokenUsageEventRows(sinceMs)
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        if (row.totalTokens <= 0 || row.createdAt <= 0) {
+          continue
+        }
+        const dayKey = this.buildLocalDayKey(row.createdAt)
+        valueByDay.set(dayKey, (valueByDay.get(dayKey) ?? 0) + row.totalTokens)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get token daily trend: ${JSON.stringify(error)}`)
+    }
+    return this.buildContinuousDailyTrend(valueByDay, safeDayCount)
+  }
+
+  // ==================== 生图统计聚合查询 ====================
+
+  // 拉取 generated_media 的轻量统计行(按 created_at 范围过滤),内存聚合
+  private async collectGeneratedMediaUsageRows(rangeStartMs: number): Promise<MediaUsageRow[]> {
+    const rows: MediaUsageRow[] = []
+    if (this.rdbStore === null) {
+      return rows
+    }
+    const predicates = new relationalStore.RdbPredicates(TableNames.GENERATED_MEDIA)
+    this.applyUsageRange(predicates, 'created_at', rangeStartMs)
+    let resultSet: relationalStore.ResultSet
+    try {
+      resultSet = await this.rdbStore.query(predicates, ['type', 'model_name', 'model_id', 'created_at'])
+    } catch (error) {
+      console.error('DatabaseService', `Failed to collect generated media rows: ${JSON.stringify(error)}`)
+      return rows
+    }
+    try {
+      try {
+        while (resultSet.goToNextRow()) {
+          rows.push({
+            type: this.safeGetString(resultSet, 'type'),
+            modelName: this.safeGetString(resultSet, 'model_name'),
+            modelId: this.safeGetString(resultSet, 'model_id'),
+            createdAt: this.safeGetLong(resultSet, 'created_at')
+          })
+        }
+      } catch (error) {
+        console.error('DatabaseService', `Failed to iterate generated media rows: ${JSON.stringify(error)}`)
+      }
+    } finally {
+      try {
+        resultSet.close()
+      } catch (error) {
+        console.error('DatabaseService', `Failed to close generated media result set: ${JSON.stringify(error)}`)
+      }
+    }
+    return rows
+  }
+
+  // 生图总览:总张数 / 文生图张数 / 改图张数 / 使用过的独立模型数
+  // 口径说明:generated_media 一行=一张图(无批次字段),统计的是"张数"而非"生成次数"
+  async getImageGenerationStats(rangeStartMs: number = 0): Promise<ImageGenerationStats> {
+    await this.waitForInitialization()
+    const result: ImageGenerationStats = {
+      total: 0,
+      generateCount: 0,
+      editCount: 0,
+      distinctModelCount: 0
+    }
+    if (this.rdbStore === null) {
+      return result
+    }
+    try {
+      const rows = await this.collectGeneratedMediaUsageRows(rangeStartMs)
+      const modelNames = new Map<string, boolean>()
+      result.total = rows.length
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        if (row.type === GeneratedMediaType.IMAGE_EDIT) {
+          result.editCount += 1
+        } else {
+          result.generateCount += 1
+        }
+        if (this.isValidUsageModelName(row.modelName)) {
+          modelNames.set(row.modelName.trim(), true)
+        }
+      }
+      result.distinctModelCount = modelNames.size
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get image generation stats: ${JSON.stringify(error)}`)
+    }
+    return result
+  }
+
+  // 生图模型排行(按张数,复用 ModelUsageRankingItem.count = 图片张数)
+  async getImageModelRanking(rangeStartMs: number = 0, limit: number = 10): Promise<ModelUsageRankingItem[]> {
+    await this.waitForInitialization()
+    const items: ModelUsageRankingItem[] = []
+    if (this.rdbStore === null) {
+      return items
+    }
+    const safeLimit = limit > 0 ? limit : 10
+    try {
+      const rows = await this.collectGeneratedMediaUsageRows(rangeStartMs)
+      const stats = new Map<string, ModelUsageRankingItem>()
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        if (!this.isValidUsageModelName(row.modelName)) {
+          continue
+        }
+        const modelName = row.modelName.trim()
+        const existing = stats.get(modelName)
+        if (existing !== undefined) {
+          existing.count += 1
+          if (existing.modelId === '' && row.modelId.trim() !== '') {
+            existing.modelId = row.modelId.trim()
+          }
+        } else {
+          stats.set(modelName, { modelName: modelName, modelId: row.modelId.trim(), count: 1 })
+        }
+      }
+      const ranked = Array.from(stats.values())
+      ranked.sort((a: ModelUsageRankingItem, b: ModelUsageRankingItem): number => {
+        if (b.count !== a.count) {
+          return b.count - a.count
+        }
+        return a.modelName.localeCompare(b.modelName)
+      })
+      const sliced = ranked.slice(0, safeLimit)
+      for (let i = 0; i < sliced.length; i++) {
+        items.push(sliced[i])
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get image model ranking: ${JSON.stringify(error)}`)
+    }
+    return items
+  }
+
+  // 最近 dayCount 天每日生图张数趋势(本地时区分桶,缺失天补 0)
+  async getImageDailyTrend(dayCount: number = 30): Promise<DailyUsagePoint[]> {
+    await this.waitForInitialization()
+    if (this.rdbStore === null) {
+      return []
+    }
+    const safeDayCount = dayCount > 0 ? dayCount : 30
+    const sinceMs = Date.now() - safeDayCount * 24 * 60 * 60 * 1000
+    const valueByDay = new Map<string, number>()
+    try {
+      const rows = await this.collectGeneratedMediaUsageRows(sinceMs)
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        if (row.createdAt <= 0) {
+          continue
+        }
+        const dayKey = this.buildLocalDayKey(row.createdAt)
+        valueByDay.set(dayKey, (valueByDay.get(dayKey) ?? 0) + 1)
+      }
+    } catch (error) {
+      console.error('DatabaseService', `Failed to get image daily trend: ${JSON.stringify(error)}`)
+    }
+    return this.buildContinuousDailyTrend(valueByDay, safeDayCount)
+  }
+}
+
+// 使用统计 - 总览数据
+export interface UsageOverviewStats {
+  sessionCount: number
+  messageCount: number
+  distinctModelCount: number
+  activeDayCount: number
+  totalTokens: number        // 总 token(仅有用量记录的助手消息)
+  inputTokens: number        // 输入 token 合计
+  outputTokens: number       // 输出 token 合计
+  tokenMessageCount: number  // 有 token 记录的助手消息数(用于算"平均每条")
+}
+
+// 使用统计 - 模型排行单项
+export interface ModelUsageRankingItem {
+  modelName: string
+  modelId: string
+  count: number
+}
+
+// 使用统计 - Token 消耗模型排行单项
+export interface TokenModelRankingItem {
+  modelName: string
+  modelId: string
+  totalTokens: number
+  inputTokens: number
+  outputTokens: number
+}
+
+// 使用统计 - 每日趋势单点(day=YYYY-MM-DD 本地时区)
+export interface DailyUsagePoint {
+  day: string
+  value: number
+}
+
+// 生图统计 - 总览数据
+export interface ImageGenerationStats {
+  total: number              // 总张数
+  generateCount: number      // 文生图张数
+  editCount: number          // 改图张数
+  distinctModelCount: number // 使用过的独立模型数
+}
+
+interface UsageMessageRow {
+  role: string
+  modelName: string
+  modelId: string
+  timestamp: number
+}
+
+// Token 用量账本 - 写入事件(只追加,一行=一次生成)
+export interface TokenUsageEvent {
+  id: string
+  sessionId: string
+  messageId: string
+  providerId: string
+  modelId: string
+  modelName: string
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  kind: string
+  createdAt: number
+}
+
+// Token 用量账本 - 读取投影行(聚合用)
+interface TokenUsageEventRow {
+  messageId: string
+  modelName: string
+  modelId: string
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  createdAt: number
+}
+
+interface MediaUsageRow {
+  type: string
+  modelName: string
+  modelId: string
+  createdAt: number
+}
+
+// 工具事件数据接口
+export interface ToolEventData {
+  id: string
+  sessionId: string
+  messageId: string
+  toolCallId: string
+  toolName: string
+  toolDisplayName: string
+  sourceLabel: string
+  sourceType: string
+  permissionLevel: string
+  toolArguments: string
+  toolResult: string
+  status: string
+  createdAt: number
+  completedAt: number
+}
+
+// 服务商配置接口
+export interface ProviderConfig {
+  id: string
+  name: string
+  type: string
+  apiStyle: string
+  openaiTransport: string
+  apiKey: string
+  requiresApiKey: boolean
+  baseUrl: string
+  isEnabled: boolean
+  modelsJson: string
+  iconSymbol: string
+  sortOrder: number
+  isPreset: boolean   // 是否为预设供应商
+  iconPath: string    // 图标文件路径
+  apiPath: string     // API 路径（可选）
+  customHeadersJson: string  // 自定义请求头 JSON
+  iconType: string    // 图标类型
+  textIcon: string    // 文字图标内容
+  textIconBgColor: string  // 文字图标背景色
+  customImagePath: string  // 自定义图片路径
+}
+
+// 导出单例实例获取方法
+export function getDatabaseService(): DatabaseService {
+  return DatabaseService.getInstance()
+}
