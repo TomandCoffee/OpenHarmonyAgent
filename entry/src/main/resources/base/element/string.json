@@ -361,14 +361,6 @@
       "value": "Get the latest invite link and QR code"
     },
     {
-      "name": "settings_support_development",
-      "value": "Sponsor Development"
-    },
-    {
-      "name": "settings_support_development_desc",
-      "value": "Voluntary support to keep Cube Chat growing"
-    },
-    {
       "name": "settings_privacy_policy",
       "value": "Privacy Policy"
     },
@@ -2007,74 +1999,6 @@
     {
       "name": "about_open_qq_group_failed",
       "value": "Unable to open QQ or the invite link. Please use the QR code to join."
-    },
-    {
-      "name": "sponsor_page_subtitle",
-      "value": "Your support keeps Cube Chat evolving"
-    },
-    {
-      "name": "sponsor_disclaimer",
-      "value": "All features remain free. Sponsorship is voluntary and unlocks nothing hidden."
-    },
-    {
-      "name": "sponsor_wechat_title",
-      "value": "WeChat Tip"
-    },
-    {
-      "name": "sponsor_wechat_desc",
-      "value": "Scan or long-press to recognize"
-    },
-    {
-      "name": "sponsor_wechat_save",
-      "value": "Save to album"
-    },
-    {
-      "name": "sponsor_wechat_saved",
-      "value": "Saved to album"
-    },
-    {
-      "name": "sponsor_wechat_save_failed",
-      "value": "Failed to save. Please try again."
-    },
-    {
-      "name": "sponsor_usage_title",
-      "value": "Your support goes to"
-    },
-    {
-      "name": "sponsor_usage_1",
-      "value": "API token costs across model providers"
-    },
-    {
-      "name": "sponsor_usage_2",
-      "value": "Server, domain, and beta-release infrastructure"
-    },
-    {
-      "name": "sponsor_usage_3",
-      "value": "Continuous iteration and bug fixes"
-    },
-    {
-      "name": "sponsor_perks_title",
-      "value": "Sponsor perks"
-    },
-    {
-      "name": "sponsor_perk_priority_title",
-      "value": "Priority response"
-    },
-    {
-      "name": "sponsor_perk_priority_desc",
-      "value": "Your feature requests and bug reports get fast-tracked"
-    },
-    {
-      "name": "sponsor_perk_resource_title",
-      "value": "Shared AI tokens"
-    },
-    {
-      "name": "sponsor_perk_resource_desc",
-      "value": "Occasional sharing of the author's personal AI service tokens for learning and testing"
-    },
-    {
-      "name": "sponsor_qq_hint",
-      "value": "💡 When tipping via WeChat, leave your QQ number or other contact info in the note. The author will reach out via the QQ group to grant perks (group number listed under About Cube Chat)."
     },
     {
       "name": "about_open_source",

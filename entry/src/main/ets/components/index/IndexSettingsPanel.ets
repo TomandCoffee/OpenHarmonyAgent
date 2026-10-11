@@ -51,7 +51,6 @@ export struct IndexSettingsPanel {
   @Event onOpenWebDAVSync: () => void = () => {}
   @Event onOpenUsageStats: () => void = () => {}
   @Event onOpenAbout: () => void = () => {}
-  @Event onOpenSupportDevelopment: () => void = () => {}
   @Event onOpenPrivacy: () => void = () => {}
   @Event onOpenInvitation: () => void = () => {}
   @Event onOpenReplayOnboarding: () => void = () => {}
@@ -235,13 +234,6 @@ export struct IndexSettingsPanel {
             icon: $r('sys.symbol.doc_text'),
             title: $r('app.string.settings_privacy_policy'),
             action: (): void => { this.onOpenPrivacy() }
-          } as SettingsListItemModel,
-          {
-            key: SettingsRouteName.SUPPORT_DEVELOPMENT,
-            icon: $r('sys.symbol.flower'),
-            title: $r('app.string.settings_support_development'),
-            subtitle: $r('app.string.settings_support_development_desc'),
-            action: (): void => { this.onOpenSupportDevelopment() }
           } as SettingsListItemModel
         ]
       } as SettingsGroupModel
