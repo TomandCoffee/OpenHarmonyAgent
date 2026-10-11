@@ -1965,40 +1965,16 @@
       "value": "Contact Us"
     },
     {
-      "name": "about_qq_group",
-      "value": "QQ Group"
-    },
-    {
-      "name": "about_qq_group_number",
-      "value": "752237762"
-    },
-    {
       "name": "about_github",
       "value": "GitHub"
     },
     {
       "name": "about_github_repo",
-      "value": "Cube Chat Open Source Repo"
+      "value": "TomandCoffee/OpenHarmonyAgent"
     },
     {
-      "name": "about_save_qrcode",
-      "value": "Save QR Code"
-    },
-    {
-      "name": "about_join_qq_group",
-      "value": "Open QQ to Join"
-    },
-    {
-      "name": "about_qrcode_saved",
-      "value": "QR code saved to album"
-    },
-    {
-      "name": "about_qrcode_save_failed",
-      "value": "Failed to save QR code"
-    },
-    {
-      "name": "about_open_qq_group_failed",
-      "value": "Unable to open QQ or the invite link. Please use the QR code to join."
+      "name": "about_open_link_failed",
+      "value": "Unable to open the link."
     },
     {
       "name": "about_open_source",

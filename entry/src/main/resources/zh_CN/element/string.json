@@ -1965,40 +1965,16 @@
       "value": "联系我们"
     },
     {
-      "name": "about_qq_group",
-      "value": "QQ 群"
-    },
-    {
-      "name": "about_qq_group_number",
-      "value": "752237762"
-    },
-    {
       "name": "about_github",
       "value": "GitHub"
     },
     {
       "name": "about_github_repo",
-      "value": "Cube Chat 开源仓库"
+      "value": "TomandCoffee/OpenHarmonyAgent"
     },
     {
-      "name": "about_save_qrcode",
-      "value": "保存二维码"
-    },
-    {
-      "name": "about_join_qq_group",
-      "value": "直接进群"
-    },
-    {
-      "name": "about_qrcode_saved",
-      "value": "二维码已保存到相册"
-    },
-    {
-      "name": "about_qrcode_save_failed",
-      "value": "二维码保存失败"
-    },
-    {
-      "name": "about_open_qq_group_failed",
-      "value": "无法打开 QQ 或群邀请链接，请使用二维码进群"
+      "name": "about_open_link_failed",
+      "value": "无法打开链接"
     },
     {
       "name": "about_open_source",
